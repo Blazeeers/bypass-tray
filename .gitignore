@@ -1,7 +1,12 @@
 .venv/
 __pycache__/
 *.pyc
+*.egg-info/
+build/
+dist/
 .idea/
 .vscode/
 Thumbs.db
 Desktop.ini
+# Ядро Xray копируется сюда при первом запуске (28 МБ), в репозиторий не нужно.
+bin/
