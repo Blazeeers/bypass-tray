@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bypass-tray"
+version = "0.2.0"
+description = "Windows-трей: статус и управление Happ / zapret / tg-ws-proxy"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "pystray>=0.19.5",
+    "Pillow>=10.0",
+    "psutil>=5.9",
+]
+
+[project.gui-scripts]
+# Запуск без окна консоли; ставится в .venv\Scripts\bypass-tray.exe
+bypass-tray = "bypass_tray.__main__:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
