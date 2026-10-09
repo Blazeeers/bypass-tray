@@ -423,6 +423,7 @@ class TrayApp:
             pystray.MenuItem(f"Прокси Xray: {proxy_text}", None, enabled=False),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Открыть панель", lambda icon, item: self.panel.open(), default=True),
+            pystray.MenuItem("Настройки…", lambda icon, item: self.panel.show_settings()),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("zapret", pystray.Menu(*zapret_items)),
             pystray.MenuItem("Стратегия zapret", pystray.Menu(*strategy_items)),
