@@ -4,12 +4,20 @@
 
 ```
 bypass-tray/
-├── run.bat / install.bat          # запуск и установка (venv)
+├── run.bat / install.bat          # запуск и установка (venv, для разработки)
+├── setup.bat                      # установка из исходников в один шаг
+├── build.bat                      # сборка dist\bypass-tray.exe (PyInstaller)
 ├── pyproject.toml                 # пакет + gui-лаунчер bypass-tray.exe
 ├── requirements.txt               # pystray, Pillow, psutil
+├── requirements-build.txt         # pyinstaller (только для сборки)
 ├── tests/smoke_test.py            # дымовые проверки (без разрушительных действий)
+├── packaging/                     # сборка .exe: launcher.py, make_icon.py, spec
+├── .github/workflows/             # сборка .exe на тег и прикрепление к релизу
 ├── src/bypass_tray/
-│   ├── __main__.py                # python -m bypass_tray [--status]
+│   ├── __main__.py                # python -m bypass_tray [--status]; мастер первого запуска
+│   ├── runtime.py                 # исходники или .exe: пути и запуск дочерних процессов
+│   ├── autostart.py               # ярлык в «Автозагрузке» (run.bat или .exe)
+│   ├── wizard.py                  # мастер первого запуска: только ссылка на подписку
 │   ├── app.py                     # трей: иконка, меню, цикл обновления статусов
 │   ├── ui.py                      # окно-панель (Tkinter)
 │   ├── widgets.py                 # карточки, индикаторы, кнопки (Canvas)
@@ -20,9 +28,33 @@ bypass-tray/
 │   ├── strategy.py                # auto-подбор стратегий: команда, замер, перебор
 │   ├── happ.py                    # профили Happ, маршруты, включение с откатом
 │   ├── updates.py                 # проверка релизов GitHub
+│   ├── components.py              # установка zapret и tg-ws-proxy из релизов
+│   ├── xray.py                    # клиент Xray: подписка, серверы, прокси
 │   └── config.py                  # конфиг/состояние, автопоиск путей
 └── docs/…
 ```
+
+## Установка «в один клик»
+
+Цель — на чистом Windows-ПК должно хватить «скачал `.exe` → запустил →
+вставил ссылку на подписку». Для этого:
+
+- **`bypass-tray.exe`** собирается PyInstaller в один файл (`packaging/`), в нём
+  Python, Tkinter и зависимости; консольное окно отключено. Сборка идёт в CI
+  (`.github/workflows/build-windows.yml`) на каждый тег `v*` и прикрепляется
+  к релизу.
+- **`runtime.py`** прячет различия «исходники / `.exe`»: постоянная папка
+  `%LOCALAPPDATA%\bypass-tray` (её не стирает временная распаковка `_MEIPASS`) и
+  запуск дочерних процессов (перебор стратегий, сторож Happ) — в `.exe` это сам
+  файл, в исходниках `python -m bypass_tray`.
+- **`wizard.py`** при первом запуске (нет `xray_subscription`) показывает окно:
+  поле ссылки, галочка автозапуска, «Подключить». Мастер сам ставит компоненты и
+  ядро Xray, включает автозапуск и поднимает прокси.
+- **`autostart.py`** кладёт ярлык в «Автозагрузку»: на `.exe` при сборке, на
+  `run.bat` при запуске из исходников.
+
+Ядро Xray больше не требует Happ: `xray.ensure_core` берёт его из Happ, если тот
+есть, иначе скачивает официальный релиз `XTLS/Xray-core`.
 
 ## Потоки
 

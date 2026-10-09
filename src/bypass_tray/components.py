@@ -8,11 +8,12 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import urllib.request
 import zipfile
 from pathlib import Path
+
+from . import runtime
 
 ZAPRET_REPO = "Flowseal/zapret-discord-youtube"
 TGWS_REPO = "Flowseal/tg-ws-proxy"
@@ -23,8 +24,8 @@ TGWS_ASSET = "TgWsProxy_windows.exe"
 
 
 def base_dir() -> Path:
-    local = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-    return Path(local) / "bypass-tray"
+    """Постоянная папка приложения (переживает перезапуск и обновление .exe)."""
+    return runtime.data_dir()
 
 
 def zapret_dir() -> Path:
