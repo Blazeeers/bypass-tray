@@ -17,6 +17,7 @@ from tkinter import ttk
 from PIL import ImageTk
 
 from . import actions, config, icons
+from .settings_ui import SettingsWindow
 from .theme import STATE_COLORS, Theme, resolve_dark
 from .widgets import Card, Divider, PillButton, StatusDot
 
@@ -54,6 +55,19 @@ class Panel:
 
     def close(self) -> None:
         self._queue.put("close")
+
+    def show_settings(self) -> None:
+        """Открыть настройки (можно вызывать из трея)."""
+        self._queue.put("settings")
+        self.open()
+
+    def _open_settings(self) -> None:
+        root = self._root
+        if root is None:
+            return
+        if getattr(self, "_settings", None) is None:
+            self._settings = SettingsWindow(root, self._theme, self.controller)
+        self._settings.open()
 
     # ---- жизненный цикл ----------------------------------------------------
     def _run(self) -> None:
@@ -116,6 +130,8 @@ class Panel:
                     root.attributes("-topmost", True)
                     root.after(300, lambda: root.attributes("-topmost", False))
                     root.focus_force()
+                if command == "settings":
+                    self._open_settings()
         except queue.Empty:
             pass
         except tk.TclError:
@@ -255,6 +271,9 @@ class Panel:
         self._pill_text = tk.Label(pill, text="", bg=theme.header,
                                    fg=theme.header_text, font=theme.font(10, "bold"))
         self._pill_text.pack(side="left")
+
+        PillButton(inner, theme, "Настройки", self._open_settings,
+                   kind="secondary", bg=theme.header).pack(side="right", padx=(0, 12))
 
     def _card(self, parent: tk.Misc, theme: Theme) -> tk.Frame:
         card = Card(parent, theme)
