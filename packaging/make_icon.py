@@ -21,7 +21,8 @@ def main() -> int:
     target = ROOT / "packaging" / "bypass-tray.ico"
     image = icons.make_app_icon(256)
     image.save(target, format="ICO", sizes=SIZES)
-    print(f"Иконка записана: {target}")
+    # ASCII, чтобы не падать на консоли с cp1252/cp866 (Windows CI).
+    print(f"icon written: {target}")
     return 0
 
 
