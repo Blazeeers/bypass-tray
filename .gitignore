@@ -8,5 +8,8 @@ dist/
 .vscode/
 Thumbs.db
 Desktop.ini
-# Ядро Xray копируется сюда при первом запуске (28 МБ), в репозиторий не нужно.
+# Ядро Xray теперь лежит в профиле пользователя (%LOCALAPPDATA%\bypass-tray\bin),
+# в репозиторий не попадает. Запись оставлена на случай старой раскладки.
 bin/
+# Иконка .ico генерируется сборкой (packaging/make_icon.py).
+packaging/bypass-tray.ico

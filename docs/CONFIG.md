@@ -29,7 +29,7 @@
 | Поле | Описание | По умолчанию |
 |---|---|---|
 | `xray_subscription` | Ссылка на подписку; отдаёт серверы `vless://` | ваша ссылка |
-| `xray_exe` | Путь к своему ядру Xray; пусто = `<проект>\bin\xray.exe` | автокопия |
+| `xray_exe` | Путь к своему ядру Xray; пусто = `%LOCALAPPDATA%\bypass-tray\bin\xray.exe` | автоподготовка |
 | `xray_port` | Локальный порт прокси (SOCKS и HTTP на одном порту) | `10818` |
 | `xray_system_proxy` | Прописывать прокси в систему, чтобы им пользовались браузеры | `true` |
 | `xray_extra_domains` | Дополнительные домены, которые тоже вести через прокси | `[]` |
@@ -55,8 +55,10 @@
 на следующем по скорости живом сервере (с уведомлением в трее).
 
 При первом подключении ядро Xray (`xray.exe`, `geoip.dat`, `geosite.dat`)
-копируется в `<проект>\bin` из папки Happ, поэтому дальше Happ не нужен вовсе.
-Прокси слушает только `127.0.0.1` и не требует прав администратора.
+готовится в `%LOCALAPPDATA%\bypass-tray\bin`: сначала берётся из папки Happ,
+а если Happ не установлен — скачивается официальный релиз `XTLS/Xray-core`
+(`Xray-windows-64.zip`). Поэтому Happ не обязателен. Прокси слушает только
+`127.0.0.1` и не требует прав администратора.
 
 Пример дополнительных страниц в туннель:
 
@@ -121,7 +123,7 @@ Loyalsoldier, которые Happ уже подгрузил).
 | zapret | `C:\Program Files\Zapret` (служба `zapret`, автозапуск) |
 | Happ | `C:\Program Files\FlyFrogLLC\Happ\Happ.exe` |
 | tg-ws-proxy | `C:\Users\Egor Egorov\Desktop\TgWsProxy_windows.exe` |
-| Автозапуск | ярлык `bypass-tray.lnk` в `shell:startup` → `run.bat` |
+| Автозапуск | ярлык `bypass-tray.lnk` в `shell:startup` → `run.bat` (в собранном `.exe` — на сам `.exe`) |
 
 ### Особенности zapret на этой машине
 

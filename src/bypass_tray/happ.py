@@ -23,11 +23,10 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import time
 from pathlib import Path
 
-from . import actions
+from . import actions, runtime
 
 #: Отсоединённый процесс-сторож (переживает закрытие родителя).
 DETACHED_PROCESS = 0x00000008
@@ -568,7 +567,7 @@ def arm_watchdog(seconds: float = 150.0) -> bool:
     except OSError:
         pass
     command = [
-        sys.executable, "-m", "bypass_tray", "--happ-watchdog",
+        *runtime.module_argv("--happ-watchdog"),
         "--seconds", str(int(seconds)), "--confirm", str(confirm),
     ]
     try:

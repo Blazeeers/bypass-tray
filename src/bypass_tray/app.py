@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sys
 import threading
 import time
 
@@ -12,7 +11,7 @@ try:
 except ImportError:  # pragma: no cover
     pystray = None
 
-from . import actions, config, happ, icons, status, strategy, updates, xray
+from . import actions, config, happ, icons, runtime, status, strategy, updates, xray
 from .theme import STATE_COLORS
 from .ui import Panel
 
@@ -543,7 +542,7 @@ class TrayApp:
         self._signature = None
 
         command = [
-            sys.executable, "-m", "bypass_tray", "--sweep-strategies",
+            *runtime.module_argv("--sweep-strategies"),
             "--out", str(result_path), "--report", str(progress_path),
         ]
         launched = actions.run_elevated(command)

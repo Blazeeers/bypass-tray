@@ -2,49 +2,27 @@
 
 `--sweep-strategies` — служебный режим: перебор стратегий zapret. Требует прав
 администратора и запускается приложением отдельным процессом с UAC.
+
+При обычном запуске (без аргументов) и отсутствии подписки VPN показывается
+мастер первого запуска: нужно только вставить ссылку — установку компонентов,
+ядра Xray, автозапуска и подключение мастер делает сам.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
 
-
-def enable_autostart() -> bool:
-    """Кладёт ярлык на run.bat в автозапуск (права администратора не нужны)."""
-    import os
-    import subprocess
-    from pathlib import Path
-
-    project = Path(__file__).resolve().parents[2]
-    run_bat = project / "run.bat"
-    if not run_bat.is_file():
-        return False
-    startup = Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" \
-        / "Programs" / "Startup"
-    if not startup.is_dir():
-        return False
-    target = startup / "bypass-tray.lnk"
-    script = (
-        "$s = (New-Object -ComObject WScript.Shell).CreateShortcut("
-        + repr(str(target)).replace("'", '"') + ");"
-        "$s.TargetPath = " + repr(str(run_bat)).replace("'", '"') + ";"
-        "$s.WorkingDirectory = " + repr(str(project)).replace("'", '"') + ";"
-        "$s.Description = 'bypass-tray';$s.Save()"
-    )
-    try:
-        subprocess.run(["powershell", "-NoProfile", "-Command", script],
-                       capture_output=True, timeout=30)
-        return target.is_file()
-    except Exception:  # noqa: BLE001
-        return False
+from . import runtime
 
 
 def run_setup(autostart: bool = True) -> int:
     """Установка в один шаг: компоненты, пути, автозапуск, запуск виджета."""
+    from . import autostart as autostart_module
     from . import components, config
 
     print("=" * 62)
@@ -72,7 +50,7 @@ def run_setup(autostart: bool = True) -> int:
     config.save_config(cfg)
 
     if autostart:
-        ok = enable_autostart()
+        ok = autostart_module.enable()
         print("\nАвтозапуск: " + ("включён" if ok else "не удалось включить"))
 
     print("\nЗапускаю виджет — он появится в трее.")
@@ -86,6 +64,7 @@ def run_setup(autostart: bool = True) -> int:
 
 
 def main() -> int:
+    runtime.ensure_streams()
     parser = argparse.ArgumentParser(prog="bypass-tray")
     parser.add_argument("--status", action="store_true",
                         help="напечатать текущий статус в JSON и выйти (для тестов)")
@@ -172,6 +151,19 @@ def main() -> int:
         progress_state["done"] = True
         write_progress()
         return 0
+
+    cfg = config.load_config()
+    # Первый запуск (подписка ещё не задана) — показываем мастер: от человека
+    # требуется только вставить ссылку. Служебные режимы выше сюда не доходят.
+    if not cfg.get("xray_subscription") and os.environ.get("BYPASS_TRAY_NO_WIZARD") != "1":
+        try:
+            from .wizard import SetupWizard
+
+            SetupWizard(cfg).run()
+        except Exception:  # noqa: BLE001
+            # Мастер — вспомогательный шаг; если он не смог открыться,
+            # приложение всё равно стартует в трее.
+            pass
 
     from .app import TrayApp
 

@@ -22,9 +22,10 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+import zipfile
 from pathlib import Path
 
-from . import actions, config
+from . import actions, config, runtime
 
 #: Ссылку на подписку каждый указывает свою в config.json — в репозитории её
 #: нет намеренно: это персональный ключ доступа.
@@ -38,6 +39,9 @@ CORE_SOURCES = (
     Path(r"C:\Program Files\FlyFrogLLC\Happ\core"),
     Path(r"C:\Program Files (x86)\FlyFrogLLC\Happ\core"),
 )
+#: Если Happ не установлен — скачиваем официальное ядро Xray с GitHub.
+CORE_REPO = "XTLS/Xray-core"
+CORE_ASSET = "Xray-windows-64.zip"
 
 #: Что ведём через прокси. YouTube и Discord здесь нет намеренно: их закрывает
 #: zapret, и через прокси они только потеряют в скорости.
@@ -74,7 +78,13 @@ _LOG_LIMIT = 4000
 
 
 def bin_dir() -> Path:
-    return Path(__file__).resolve().parents[2] / "bin"
+    """Постоянная папка ядра Xray в профиле пользователя.
+
+    Раньше ядро лежало рядом с исходниками (`<проект>\\bin`), но собранный
+    ``.exe`` распаковывается во временную папку, которая исчезает после выхода,
+    поэтому ядро храним в ``%LOCALAPPDATA%\\bypass-tray\\bin``.
+    """
+    return runtime.data_dir() / "bin"
 
 
 def xray_path() -> Path:
@@ -84,22 +94,51 @@ def xray_path() -> Path:
     return bin_dir() / "xray.exe"
 
 
-def ensure_core() -> Path | None:
-    """Готовит локальную копию ядра Xray (и гео-файлов)."""
+def _download_core(target: Path, progress=None) -> bool:
+    """Скачивает официальное ядро Xray с GitHub (если Happ не установлен)."""
+    from . import components
+
+    asset = components.latest_asset(CORE_REPO, suffixes=(".zip",), exact=CORE_ASSET)
+
+    def report(percent: int, done: int, total: int) -> None:
+        if progress is not None:
+            progress(f"Xray: {done} из {total} МБ", percent)
+
+    archive = target / asset["name"]
+    components.download(asset["url"], archive, report)
+    with zipfile.ZipFile(archive) as bundle:
+        bundle.extractall(target)
+    archive.unlink(missing_ok=True)
+    components._flatten(target)
+    return (target / "xray.exe").is_file()
+
+
+def ensure_core(progress=None) -> Path | None:
+    """Готовит локальную копию ядра Xray (и гео-файлов).
+
+    Порядок: уже скачанное → ядро из Happ → официальный релиз XTLS/Xray-core.
+    Последний вариант делает установку самодостаточной: Happ не нужен.
+    """
     target = bin_dir()
     target.mkdir(parents=True, exist_ok=True)
     missing = [name for name in CORE_FILES if not (target / name).is_file()]
     if missing:
         source = next((p for p in CORE_SOURCES if (p / "xray.exe").is_file()), None)
-        if source is None:
-            return None
-        for name in missing:
-            src = source / name
-            if src.is_file():
-                try:
-                    shutil.copy2(src, target / name)
-                except OSError:
-                    return None
+        if source is not None:
+            for name in missing:
+                src = source / name
+                if src.is_file():
+                    try:
+                        shutil.copy2(src, target / name)
+                    except OSError:
+                        pass
+        still_missing = [name for name in CORE_FILES if not (target / name).is_file()]
+        if still_missing:
+            try:
+                _download_core(target, progress)
+            except Exception as exc:  # noqa: BLE001
+                if progress is not None:
+                    progress(f"ядро Xray: {type(exc).__name__}", 0)
     candidate = target / "xray.exe"
     return candidate if candidate.is_file() else None
 
