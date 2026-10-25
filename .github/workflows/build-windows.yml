@@ -55,18 +55,18 @@ jobs:
 
       - name: Архив
         shell: pwsh
-        run: Compress-Archive -Path "dist/Обходы/*" -DestinationPath "dist/Обходы-windows.zip"
+        run: Compress-Archive -Path "dist/Обходы/*" -DestinationPath "dist/bypass-tray-windows.zip"
 
       - name: Артефакт сборки
         uses: actions/upload-artifact@v4
         with:
           name: bypass-tray-windows
-          path: dist/Обходы-windows.zip
+          path: dist/bypass-tray-windows.zip
           if-no-files-found: error
 
       - name: Прикрепить к релизу
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/Обходы-windows.zip
+          files: dist/bypass-tray-windows.zip
           generate_release_notes: true
