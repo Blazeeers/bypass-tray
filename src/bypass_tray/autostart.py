@@ -1,8 +1,8 @@
-"""Автозапуск приложения при входе в Windows.
+"""Автозапуск: ярлык на ``run.bat`` в папке «Автозагрузка» пользователя.
 
-Кладёт ярлык в пользовательскую папку «Автозагрузка» — права администратора не
-нужны. В собранном ``.exe`` ярлык указывает на сам файл, в исходниках — на
-``run.bat``.
+Права администратора не нужны: ярлык лежит в профиле пользователя. Создаётся
+через WScript.Shell (PowerShell), потому что чистого stdlib-способа сделать
+.lnk нет.
 """
 
 from __future__ import annotations
@@ -12,82 +12,87 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import runtime
-
-CREATE_NO_WINDOW = 0x08000000 if sys.platform.startswith("win") else 0
+from .actions import CREATE_NO_WINDOW
 
 
-def startup_dir() -> Path | None:
-    appdata = os.environ.get("APPDATA")
-    if not appdata:
-        return None
-    path = Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
-    return path if path.is_dir() else None
+def project_root() -> Path:
+    return Path(__file__).resolve().parents[2]
 
 
-def shortcut_path() -> Path | None:
-    directory = startup_dir()
-    return (directory / "bypass-tray.lnk") if directory else None
+def run_bat() -> Path:
+    return project_root() / "run.bat"
 
 
-def _ps(value: str) -> str:
-    """Строка в одинарных кавычках для PowerShell."""
-    return "'" + value.replace("'", "''") + "'"
+def link_path() -> Path:
+    base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+    return (Path(base) / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+            / "Startup" / "bypass-tray.lnk")
 
 
-def _launch_target() -> tuple[Path, Path] | None:
-    """(что запускать, рабочая папка) — ``.exe`` при сборке, иначе ``run.bat``."""
-    if runtime.is_frozen():
-        target = Path(runtime.executable())
-        return target, target.parent
-    project = runtime.project_dir()
-    if project is None:
-        return None
-    target = project / "run.bat"
-    if not target.is_file():
-        return None
-    return target, project
+def is_enabled() -> bool:
+    """Включён ли автозапуск (существует ли ярлык)."""
+    try:
+        return link_path().is_file()
+    except OSError:
+        return False
+
+
+def _ps_quote(value: str) -> str:
+    """Строка PowerShell в одинарных кавычках; апостроф внутри удваивается."""
+    return "'" + str(value).replace("'", "''") + "'"
 
 
 def enable() -> bool:
-    """Создаёт ярлык автозапуска. Возвращает True, если ярлык на месте."""
-    if not sys.platform.startswith("win"):
+    """Создаёт ярлык в автозагрузке. False — если не вышло.
+
+    Старый ярлык сначала удаляется: иначе после смены пути остался бы ярлык на
+    прежнее место, а проверка «ярлык есть» засчитывала бы чужой файл.
+    """
+    target = link_path()
+    if not target.parent.is_dir():
         return False
-    directory = startup_dir()
-    launch = _launch_target()
-    if directory is None or launch is None:
+    frozen = bool(getattr(sys, "frozen", False))
+    if frozen:
+        executable = Path(sys.executable).resolve()
+        if not executable.is_file():
+            return False
+        workdir = executable.parent
+    else:
+        executable = run_bat()
+        if not executable.is_file():
+            return False
+        workdir = project_root()
+    try:
+        target.unlink(missing_ok=True)
+    except OSError:
         return False
-    target, working = launch
-    link = directory / "bypass-tray.lnk"
     script = (
+        "$ErrorActionPreference = 'Stop';"
         "$s = (New-Object -ComObject WScript.Shell).CreateShortcut("
-        + _ps(str(link)) + ");"
-        "$s.TargetPath = " + _ps(str(target)) + ";"
-        "$s.WorkingDirectory = " + _ps(str(working)) + ";"
-        "$s.Description = 'bypass-tray';$s.Save()"
+        + _ps_quote(str(target)) + ");"
+        "$s.TargetPath = " + _ps_quote(str(executable)) + ";"
+        "$s.WorkingDirectory = " + _ps_quote(str(workdir)) + ";"
+        + ("$s.IconLocation = " + _ps_quote(str(executable) + ",0") + ";"
+           if frozen else "")
+        + "$s.Description = 'Обходы';$s.Save()"
     )
     try:
-        subprocess.run(["powershell", "-NoProfile", "-Command", script],
-                       capture_output=True, timeout=30, creationflags=CREATE_NO_WINDOW)
-        return link.is_file()
-    except Exception:  # noqa: BLE001
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True, timeout=30, creationflags=CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError):
         return False
+    if completed.returncode != 0:
+        return False
+    return target.is_file()
 
 
 def disable() -> bool:
-    link = shortcut_path()
-    if link is None:
-        return False
+    """Удаляет ярлык автозапуска. True — если ярлыка больше нет."""
+    target = link_path()
     try:
-        link.unlink()
+        target.unlink(missing_ok=True)
         return True
     except OSError:
-        return False
-
-
-def enabled() -> bool:
-    link = shortcut_path()
-    try:
-        return bool(link and link.is_file())
-    except OSError:
-        return False
+        return not target.exists()

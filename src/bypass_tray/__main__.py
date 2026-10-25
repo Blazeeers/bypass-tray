@@ -2,27 +2,41 @@
 
 `--sweep-strategies` — служебный режим: перебор стратегий zapret. Требует прав
 администратора и запускается приложением отдельным процессом с UAC.
-
-При обычном запуске (без аргументов) и отсутствии подписки VPN показывается
-мастер первого запуска: нужно только вставить ссылку — установку компонентов,
-ядра Xray, автозапуска и подключение мастер делает сам.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
 from pathlib import Path
 
-from . import runtime
+
+def _print_json(payload: dict) -> None:
+    """Печатает JSON для диагностики.
+
+    При перенаправлении вывода Python берёт локальную кодировку (cp1251 на
+    русской Windows), а в detail встречаются символы вроде «·». Поэтому stdout
+    переключается на UTF-8: на настоящей консоли это ничего не меняет,
+    а в файле/пайпе JSON остаётся читаемым и печать не падает.
+    """
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def enable_autostart() -> bool:
+    """Кладёт ярлык на run.bat в автозапуск (обёртка над autostart.enable)."""
+    from . import autostart
+
+    return autostart.enable()
 
 
 def run_setup(autostart: bool = True) -> int:
     """Установка в один шаг: компоненты, пути, автозапуск, запуск виджета."""
-    from . import autostart as autostart_module
     from . import components, config
 
     print("=" * 62)
@@ -49,8 +63,20 @@ def run_setup(autostart: bool = True) -> int:
         print(f"  tg-ws-proxy: не установлен ({tgws.get('error')})")
     config.save_config(cfg)
 
+    # Без записанных версий check_all не может понять, что устарело.
+    state_data = config.load_state()
+    installed = state_data.get("installed")
+    installed = dict(installed) if isinstance(installed, dict) else {}
+    if zapret.get("ok"):
+        installed["zapret"] = str(zapret.get("version") or "")
+    if tgws.get("ok"):
+        installed["tgws"] = str(tgws.get("version") or "")
+    installed.setdefault("xray", "")
+    state_data["installed"] = installed
+    config.save_state(state_data)
+
     if autostart:
-        ok = autostart_module.enable()
+        ok = enable_autostart()
         print("\nАвтозапуск: " + ("включён" if ok else "не удалось включить"))
 
     print("\nЗапускаю виджет — он появится в трее.")
@@ -59,12 +85,73 @@ def run_setup(autostart: bool = True) -> int:
 
     from .app import TrayApp
 
-    TrayApp().start()
+    mutex, first = _acquire_single_instance()
+    if not first:
+        return 0
+    try:
+        TrayApp().start()
+    finally:
+        _release_single_instance(mutex)
     return 0
 
 
+def _acquire_single_instance(kernel32=None, user32=None) -> tuple[object | None, bool]:
+    """Мьютекс на GUI-экземпляр; False — уже запущен."""
+    if sys.platform != "win32":
+        return None, True
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        if kernel32 is None:
+            kernel32 = ctypes.windll.kernel32
+        if user32 is None:
+            user32 = ctypes.windll.user32
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.CreateMutexW.argtypes = [
+            wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        handle = kernel32.CreateMutexW(None, False,
+                                       "Local\\Blazeeers.BypassTray")
+        if not handle:
+            return None, True
+        if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+            kernel32.CloseHandle(ctypes.c_void_p(handle))
+            try:
+                user32.MessageBoxW(0, "Обходы уже запущены", "Обходы", 0x40)
+            except Exception:  # noqa: BLE001
+                pass
+            return None, False
+        return handle, True
+    except Exception:  # noqa: BLE001
+        return None, True
+
+
+def _release_single_instance(handle) -> None:
+    if not handle or sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(handle))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _set_app_user_model_id() -> None:
+    """Свой AppUserModelID: иконка и группа панели задач Windows."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "Blazeeers.BypassTray")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def main() -> int:
-    runtime.ensure_streams()
+    _set_app_user_model_id()
     parser = argparse.ArgumentParser(prog="bypass-tray")
     parser.add_argument("--status", action="store_true",
                         help="напечатать текущий статус в JSON и выйти (для тестов)")
@@ -76,16 +163,18 @@ def main() -> int:
                         help="дополнительный файл с ходом перебора")
     parser.add_argument("--bats", default="",
                         help="список стратегий через ';' (по умолчанию — все general*.bat)")
-    parser.add_argument("--happ-watchdog", action="store_true",
-                        help="сторож: вернуть настройки Happ, если их не подтвердят")
-    parser.add_argument("--seconds", type=float, default=150.0,
-                        help="сколько секунд ждать подтверждения (сторож)")
-    parser.add_argument("--confirm", default="",
-                        help="файл-подтверждение для сторожа")
     parser.add_argument("--setup", action="store_true",
                         help="установить zapret и tg-ws-proxy, включить автозапуск и запустить виджет")
     parser.add_argument("--no-autostart", action="store_true",
                         help="при --setup не прописывать автозапуск")
+    parser.add_argument("--health", action="store_true",
+                        help="напечатать JSON проверки сервисов и выйти")
+    parser.add_argument("--route-audit", action="store_true",
+                        help="напечатать JSON аудита маршрутов доменов и выйти")
+    parser.add_argument("--apply", action="store_true",
+                        help="при --route-audit применить найденные маршруты")
+    parser.add_argument("--updates", action="store_true",
+                        help="напечатать JSON проверки обновлений и выйти")
     args = parser.parse_args()
 
     from . import config, status
@@ -93,20 +182,59 @@ def main() -> int:
     if args.setup:
         return run_setup(autostart=not args.no_autostart)
 
-    if args.happ_watchdog:
-        from . import happ
+    if args.health:
+        from . import health, xray
 
-        return happ.run_watchdog(args.seconds, args.confirm)
+        cfg = config.load_config()
+        try:
+            result = health.collect(cfg, status.collect(cfg), xray.status())
+        except Exception as exc:  # noqa: BLE001
+            result = {"checked": time.time(), "items": [], "verdict": "warn",
+                      "error": f"{type(exc).__name__}: {exc}"}
+        _print_json(result)
+        return 0
+
+    if args.route_audit:
+        from . import routes
+
+        cfg = config.load_config()
+        try:
+            result = routes.audit(cfg)
+            if args.apply:
+                routes.apply_audit(result, cfg)
+        except Exception as exc:  # noqa: BLE001
+            result = {"at": time.time(), "proxy": False, "items": [], "broken": [],
+                      "error": f"{type(exc).__name__}: {exc}"}
+        _print_json(result)
+        return 0
+
+    if args.updates:
+        from . import updates
+
+        cfg = config.load_config()
+        state = config.load_state()
+        try:
+            result = updates.check_all(cfg, state)
+        except Exception as exc:  # noqa: BLE001
+            result = {"checked": time.time(), "components": {}, "outdated": [],
+                      "error": f"{type(exc).__name__}: {exc}"}
+        config.save_state(state)
+        _print_json(result)
+        return 0
 
     if args.status:
-        print(json.dumps(status.collect(config.load_config()), ensure_ascii=False, indent=2))
+        _print_json(status.collect(config.load_config()))
         return 0
 
     if args.sweep_strategies:
         from . import strategy
 
         cfg = config.load_config()
-        zapret_dir = Path(cfg.get("zapret_dir") or "")
+        zapret_raw = str(cfg.get("zapret_dir") or "").strip()
+        if not zapret_raw:
+            print("Папка zapret не задана в конфиге.", flush=True)
+            return 2
+        zapret_dir = Path(zapret_raw)
         out = Path(args.out) if args.out else Path(config.config_dir() / "sweep-result.json")
         names = [n for n in args.bats.split(";") if n] or None
         report_path = Path(args.report) if args.report else None
@@ -152,22 +280,15 @@ def main() -> int:
         write_progress()
         return 0
 
-    cfg = config.load_config()
-    # Первый запуск (подписка ещё не задана) — показываем мастер: от человека
-    # требуется только вставить ссылку. Служебные режимы выше сюда не доходят.
-    if not cfg.get("xray_subscription") and os.environ.get("BYPASS_TRAY_NO_WIZARD") != "1":
-        try:
-            from .wizard import SetupWizard
-
-            SetupWizard(cfg).run()
-        except Exception:  # noqa: BLE001
-            # Мастер — вспомогательный шаг; если он не смог открыться,
-            # приложение всё равно стартует в трее.
-            pass
-
     from .app import TrayApp
 
-    TrayApp().start()
+    mutex, first = _acquire_single_instance()
+    if not first:
+        return 0
+    try:
+        TrayApp().start()
+    finally:
+        _release_single_instance(mutex)
     return 0
 
 

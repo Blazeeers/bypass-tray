@@ -1,4 +1,4 @@
-"""Действия: управление zapret (служба или .bat), tg-ws-proxy, Happ."""
+"""Действия: управление zapret (служба или .bat) и tg-ws-proxy."""
 
 from __future__ import annotations
 
@@ -201,7 +201,10 @@ def control_service(action: str, name: str = ZAPRET_SERVICE) -> str:
 
 def start_zapret(cfg: dict, bat: str | None = None) -> dict:
     """Запускает выбранный ``general*.bat`` (для установки без службы)."""
-    zapret_dir = Path(cfg.get("zapret_dir") or "")
+    raw_dir = str(cfg.get("zapret_dir") or "").strip()
+    if not raw_dir:
+        raise FileNotFoundError("Не задана папка zapret")
+    zapret_dir = Path(raw_dir)
     bat_name = bat or cfg.get("zapret_bat") or "general (ALT).bat"
     path = zapret_dir / bat_name
     if not path.is_file():
@@ -237,7 +240,10 @@ def restart_zapret(cfg: dict | None = None) -> dict:
 
 def open_service_bat(cfg: dict) -> bool:
     """Открывает ``service.bat`` от администратора — смена стратегии службы."""
-    zapret_dir = Path(cfg.get("zapret_dir") or "")
+    raw_dir = str(cfg.get("zapret_dir") or "").strip()
+    if not raw_dir:
+        raise FileNotFoundError("Не задана папка zapret")
+    zapret_dir = Path(raw_dir)
     path = zapret_dir / "service.bat"
     if not path.is_file():
         raise FileNotFoundError(f"Не найден service.bat: {path}")
@@ -264,16 +270,3 @@ def start_tgws(cfg: dict) -> bool:
 
 def stop_tgws() -> dict:
     return kill_process("TgWsProxy")
-
-
-# ---- Happ -----------------------------------------------------------------
-
-
-def open_happ(cfg: dict) -> None:
-    exe = cfg.get("happ_exe") or ""
-    if not exe or not Path(exe).is_file():
-        raise FileNotFoundError(f"Не найден Happ: {exe or '(путь не задан)'}")
-    if sys.platform.startswith("win"):
-        os.startfile(exe)  # type: ignore[attr-defined]
-    else:
-        _popen([exe])

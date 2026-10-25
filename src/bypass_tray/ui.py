@@ -1,29 +1,138 @@
-"""Окно-панель: карточки статусов, действия, стратегия, маршруты Happ.
+"""Окно-панель «Обходы»: VPN, сервисы, обновления, журнал и поведение.
 
 Окно живёт в собственном потоке (Tkinter требует, чтобы весь UI трогал только
-один поток). Связь с остальным приложением — через потокобезопасную очередь
-команд и периодический опрос ``controller.status`` из ``after``.
+один поток). Связь с приложением — через потокобезопасную очередь команд и
+периодический опрос контроллера из ``after``. Все действия выполняет
+контроллер в фоне, панель только просит и перерисовывается.
 """
 
 from __future__ import annotations
 
 import gc
 import queue
+import re
+import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox
 
 from PIL import ImageTk
 
-from . import actions, config, icons
-from .settings_ui import SettingsWindow
-from .theme import STATE_COLORS, Theme, resolve_dark
-from .widgets import Card, Divider, PillButton, StatusDot
+from . import icons
+from .settings_ui import SettingsPage
+from .theme import Theme, resolve_dark
+from .widgets import (
+    AnimatedSection, Card, Chip, Divider, HoverRow, IconButton, PillButton,
+    ScrollBody,
+)
 
-WINDOW_W = 640
-POLL_MS = 1500
+WINDOW_W = 720
+POLL_MS = 1000
 TICK_MS = 120
+#: Тело панели не выше этой доли высоты экрана.
+BODY_RATIO = 0.88
+CARD_GAP = 10
+PAD = 16
+
+#: Эмодзи и флаги из имён серверов: в интерфейсе их быть не должно.
+_EMOJI_RE = re.compile(
+    "[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F\u200D]"
+)
+_STATE_WORDS = {"ok": "ок", "warn": "внимание", "bad": "сбой", "off": "выкл"}
+
+SERVICES = (
+    ("zapret", "zapret · обход DPI", "zap"),
+    ("youtube", "YouTube", "youtube"),
+    ("discord", "Discord", "discord"),
+    ("deepseek", "DeepSeek API", "spark"),
+    ("tgwsproxy", "tg-ws-proxy", "telegram"),
+)
+
+
+def clean_server_name(name: str) -> str:
+    """Имя сервера без эмодзи и флагов — только текст."""
+    text = _EMOJI_RE.sub("", str(name or ""))
+    return " ".join(text.split()).strip(" ·-—")
+
+
+def _style_titlebar(root: tk.Misc, theme: Theme) -> None:
+    """Красит системную рамку и заголовок окна в цвет шапки (Windows 10/11).
+
+    Тёмная шапка есть в обеих схемах, поэтому и рамка всегда тёмная — иначе
+    светлая системная полоса выглядит чужой. Всё молча пропускается, если
+    DWM недоступен или атрибут не поддерживается версией Windows.
+    """
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import ctypes
+
+        hwnd = ctypes.windll.user32.GetParent(root.winfo_id()) or root.winfo_id()
+        if not hwnd:
+            return
+        dwm = ctypes.windll.dwmapi
+
+        def colorref(color: str) -> int:
+            value = str(color or "").lstrip("#")
+            red = int(value[0:2], 16)
+            green = int(value[2:4], 16)
+            blue = int(value[4:6], 16)
+            return red | (green << 8) | (blue << 16)
+
+        dark = ctypes.c_int(1)
+        dwm.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(dark), ctypes.sizeof(dark))
+        caption = ctypes.c_int(colorref(theme.header))
+        dwm.DwmSetWindowAttribute(hwnd, 35, ctypes.byref(caption), ctypes.sizeof(caption))
+        border = ctypes.c_int(colorref(theme.header))
+        dwm.DwmSetWindowAttribute(hwnd, 34, ctypes.byref(border), ctypes.sizeof(border))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _apply_titlebar(root: tk.Misc, theme: Theme) -> None:
+    """Применяет окраску рамки сразу и ещё раз, когда окно уже показано."""
+    try:
+        root.update_idletasks()
+    except tk.TclError:
+        pass
+    _style_titlebar(root, theme)
+    try:
+        root.after(0, lambda: _style_titlebar(root, theme))
+    except tk.TclError:
+        pass
+
+
+def format_uptime(seconds) -> str:
+    """Длительность в формате 56:34 / 1:02:03."""
+    try:
+        start = float(seconds)
+    except (TypeError, ValueError):
+        return "0:00"
+    if start <= 0:
+        return "0:00"
+    total = max(0, int(time.time() - start))
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def _work_area(root: tk.Misc) -> tuple[int, int, int, int]:
+    """Рабочая область Windows без панели задач; fallback — весь экран."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        rect = wintypes.RECT()
+        # SPI_GETWORKAREA = 0x0030
+        if ctypes.windll.user32.SystemParametersInfoW(
+                0x0030, 0, ctypes.byref(rect), 0):
+            return rect.left, rect.top, rect.right, rect.bottom
+    except Exception:  # noqa: BLE001
+        pass
+    return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
 
 
 class Panel:
@@ -34,14 +143,41 @@ class Panel:
         self._queue: queue.Queue[str] = queue.Queue()
         self._lock = threading.Lock()
         self._theme = Theme(False)
-        self._rows: dict[str, dict] = {}
-        self._combobox: ttk.Combobox | None = None
-        self._strategy_var: tk.StringVar | None = None
-        self._hint: tk.Label | None = None
-        self._footer: tk.Label | None = None
-        self._pill_dot: StatusDot | None = None
-        self._pill_text: tk.Label | None = None
         self._images: list = []
+        self._icon_cache: dict[tuple, ImageTk.PhotoImage] = {}
+        self._body: ScrollBody | None = None
+        self._header: tk.Frame | None = None
+        self._footer: tk.Label | None = None
+        self._subtitle: tk.Label | None = None
+        self._placed = False
+        self._last_height = 0
+        self._first_shown = None
+        self._origin_x = 0
+        self._origin_y = 0
+        self._stage: tk.Canvas | None = None
+        self._main_page: tk.Frame | None = None
+        self._main_item: int | None = None
+        self._settings_item: int | None = None
+        self._stage_bg: int | None = None
+        self._settings_page: SettingsPage | None = None
+        self._settings_visible = False
+        self._page_visible = "main"
+        self._title: tk.Label | None = None
+        self._header_update: IconButton | None = None
+        self._header_gear: IconButton | None = None
+        self._header_back: IconButton | None = None
+        self._activity_period: tk.Label | None = None
+
+        self._vpn: dict = {}
+        self._services: dict[str, dict] = {}
+        self._activity_rows: list[dict] = []
+        self._activity_empty: tk.Label | None = None
+        self._buttons: dict[str, PillButton] = {}
+        self._servers_open = False
+        self._servers_section: AnimatedSection | None = None
+        self._servers_frame: tk.Frame | None = None
+        self._servers_list: tk.Frame | None = None
+        self._servers_signature: tuple | None = None
 
     # ---- публичный интерфейс ---------------------------------------------
     def open(self) -> None:
@@ -63,11 +199,13 @@ class Panel:
 
     def _open_settings(self) -> None:
         root = self._root
-        if root is None:
+        if root is None or self._settings_page is None:
             return
-        if getattr(self, "_settings", None) is None:
-            self._settings = SettingsWindow(root, self._theme, self.controller)
-        self._settings.open()
+        if self._settings_visible:
+            return
+        self._settings_page.reload()
+        self._settings_visible = True
+        self._switch_pages(show_settings=True)
 
     # ---- жизненный цикл ----------------------------------------------------
     def _run(self) -> None:
@@ -75,41 +213,90 @@ class Panel:
 
         Tk-интерпретатор создаётся один раз: закрытие окна лишь прячет его
         (``withdraw``), а ``destroy`` выполняется только при выходе из
-        приложения. Иначе каждый показ панели плодил бы интерпретаторы Tcl.
+        приложения.
         """
         theme = Theme(resolve_dark(self.controller.cfg.get("theme", "auto")))
         self._theme = theme
         root = tk.Tk()
+        # Окно не должно мелькнуть в (0,0) до _fit: строим скрытым, показываем
+        # только когда геометрия, иконка и страницы уже готовы.
+        root.withdraw()
         self._root = root
         try:
             self._build(root, theme)
+            transparent = False
+            try:
+                root.attributes("-alpha", 0.0)
+                transparent = True
+            except tk.TclError:
+                pass
+            root.deiconify()
+            root.lift()
+            root.update_idletasks()
+            # После map Canvas получает настоящую высоту — подгоняем ещё раз,
+            # чтобы первая же видимая высота была окончательной.
+            self._fit(root)
+            root.update_idletasks()
+            root.update()
+            if transparent:
+                try:
+                    root.attributes("-alpha", 1.0)
+                except tk.TclError:
+                    pass
+            # Диагностика первого появления: не (0,0) и не позиция по умолчанию.
+            self._first_shown = (root.winfo_rootx(), root.winfo_rooty())
         except Exception:  # noqa: BLE001
             self._release()
             root.destroy()
             raise
         root.after(TICK_MS, self._pump)
         root.after(POLL_MS, self._tick)
+        self._request_health()
         try:
             root.mainloop()
         finally:
             self._release()
             del root
-            # Tk образует циклы ссылок; собираем их здесь, в потоке-владельце
-            # интерпретатора, иначе он будет освобождён в чужом потоке и Python
-            # сообщит об утечке интерпретатора Tcl (gh-83274).
+            # Tk образует циклы ссылок; собираем их в потоке-владельце
+            # интерпретатора, иначе Python 3.14 сообщит об утечке Tcl.
             gc.collect()
 
     def _release(self) -> None:
         """Забывает Tk-объекты в том же потоке, который их создал."""
+        if self._body is not None:
+            self._body.release()
+        self._settings_page = None
+        self._stage = None
+        self._main_page = None
+        self._main_item = None
+        self._settings_item = None
+        self._settings_visible = False
+        self._page_visible = "main"
         self._root = None
-        self._rows = {}
-        self._combobox = None
-        self._strategy_var = None
-        self._hint = None
+        self._body = None
+        self._header = None
         self._footer = None
-        self._pill_dot = None
-        self._pill_text = None
+        self._subtitle = None
+        self._title = None
+        self._header_update = None
+        self._header_gear = None
+        self._header_back = None
+        self._activity_period = None
+        self._vpn = {}
+        self._services = {}
+        self._activity_rows = []
+        self._activity_empty = None
+        self._buttons = {}
+        self._servers_section = None
+        self._servers_frame = None
+        self._servers_list = None
+        self._servers_signature = None
+        self._servers_open = False
         self._images = []
+        self._icon_cache = {}
+        self._placed = False
+        self._last_height = 0
+        self._first_shown = None
         theme = getattr(self, "_theme", None)
         if theme is not None:
             theme.release()
@@ -118,26 +305,59 @@ class Panel:
         root = self._root
         if root is None:
             return
-        try:
-            while True:
+        while True:
+            try:
                 command = self._queue.get_nowait()
-                if command == "close":
+            except queue.Empty:
+                break
+            if command == "close":
+                try:
                     root.destroy()
-                    return
-                if command == "show":
-                    root.deiconify()
-                    root.lift()
-                    root.attributes("-topmost", True)
-                    root.after(300, lambda: root.attributes("-topmost", False))
-                    root.focus_force()
-                if command == "settings":
-                    self._open_settings()
-        except queue.Empty:
-            pass
+                except tk.TclError:
+                    pass
+                self._root = None
+                return
+            try:
+                self._handle_command(command)
+            except Exception as exc:  # noqa: BLE001
+                # Одна сломанная команда не должна убивать цикл панели.
+                self._report_ui_error(exc)
+        try:
+            root.after(TICK_MS, self._pump)
         except tk.TclError:
             self._root = None
+
+    def _handle_command(self, command: str) -> None:
+        root = self._root
+        if root is None:
             return
-        root.after(TICK_MS, self._pump)
+        if command == "show":
+            root.deiconify()
+            root.lift()
+            root.attributes("-topmost", True)
+            root.after(300, lambda: root.attributes("-topmost", False))
+            root.focus_force()
+            self._request_health()
+        elif command == "settings":
+            self._open_settings()
+        elif command == "render":
+            self._render()
+
+    def _report_ui_error(self, exc: Exception) -> None:
+        """Показывает ошибку в подвале, не роняя цикл панели."""
+        try:
+            if self._footer is not None:
+                self._footer.configure(text=f"ошибка интерфейса: {type(exc).__name__}")
+        except tk.TclError:
+            pass
+
+    def _request_health(self) -> None:
+        run_health = getattr(self.controller, "run_health", None)
+        if callable(run_health):
+            try:
+                run_health()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _tick(self) -> None:
         root = self._root
@@ -150,31 +370,35 @@ class Panel:
             return
         root.after(POLL_MS, self._tick)
 
-    def _settle(self, root: tk.Tk) -> tuple[int, int]:
-        """Даёт разметке устояться и возвращает требуемый размер окна.
-
-        Карточки меняют высоту по событию ``<Configure>``, а такие события
-        доставляются только полным ``update()`` — ``update_idletasks()`` их не
-        обрабатывает, поэтому размер окна считается «на глаз» и контент
-        обрезается.
-        """
-        previous: tuple[int, int] | None = None
-        size = (WINDOW_W, root.winfo_reqheight())
-        for _ in range(12):
-            root.update()
-            size = (max(WINDOW_W, root.winfo_reqwidth()), root.winfo_reqheight())
-            if size == previous:
-                break
-            previous = size
-        return size
-
     # ---- построение интерфейса --------------------------------------------
+    def _icon(self, name: str, color: str, size: int = 20) -> ImageTk.PhotoImage:
+        """Кэшированная иконка панели: PhotoImage не пересоздаётся каждый тик."""
+        key = (name, color, size)
+        image = self._icon_cache.get(key)
+        if image is None:
+            image = ImageTk.PhotoImage(icons.panel_icon(name, color, size))
+            self._icon_cache[key] = image
+            self._images.append(image)
+        return image
+
+    def _set_icon(self, label: tk.Label, name: str, color: str, size: int = 20) -> None:
+        image = self._icon(name, color, size)
+        if getattr(label, "_icon_key", None) != image:
+            label.configure(image=image)
+            label._icon_key = image  # type: ignore[attr-defined]
+
     def _build(self, root: tk.Tk, theme: Theme) -> None:
+        self._theme = theme
         root.title("Обходы")
         root.configure(bg=theme.bg)
         root.resizable(False, False)
         root.protocol("WM_DELETE_WINDOW", self._hide)
 
+        # .ico нужен панели задач/рамке; iconphoto остаётся для Tk.
+        try:
+            root.iconbitmap(default=str(icons.ensure_ico()))
+        except (tk.TclError, OSError, ValueError):
+            pass
         app_icon = ImageTk.PhotoImage(icons.make_app_icon(64))
         self._images.append(app_icon)
         try:
@@ -182,539 +406,809 @@ class Panel:
         except tk.TclError:
             pass
 
-        self._style(root, theme)
         self._build_header(root, theme)
 
-        body = tk.Frame(root, bg=theme.bg)
-        body.pack(fill="both", expand=True, padx=16, pady=(14, 6))
+        self._stage = tk.Canvas(root, bg=theme.bg, bd=0, highlightthickness=0)
+        self._stage.pack(fill="both", expand=True)
+        self._stage_bg = self._stage.create_rectangle(
+            0, 0, WINDOW_W, 1, fill=theme.bg, outline="")
+        self._main_page = tk.Frame(self._stage, bg=theme.bg)
+        self._main_item = self._stage.create_window(
+            0, 0, anchor="nw", window=self._main_page, width=WINDOW_W)
 
-        self._build_status_card(body, theme)
-        self._build_strategy_card(body, theme)
-        self._build_routing_card(body, theme)
-        self._build_updates_card(body, theme)
+        self._body = ScrollBody(self._main_page, theme)
+        self._body.pack(fill="both", expand=True)
+
+        self._build_vpn(self._card())
+        self._build_services(self._card())
+        self._build_activity(self._card())
+        self._build_actions()
 
         self._footer = tk.Label(
-            root, text="", bg=theme.bg, fg=theme.text_faint,
+            self._main_page, text="", bg=theme.bg, fg=theme.text_faint,
             font=theme.font(8), anchor="w", justify="left",
         )
-        self._footer.pack(fill="x", padx=18, pady=(4, 12))
+        self._footer.pack(fill="x", padx=PAD + 2, pady=(2, 10))
+        # Колесо вешаем один раз на готовое дерево главной; строки серверов
+        # пересоздаются в _render_servers и привязываются там.
+        self._body.bind_tree()
+
+        self._settings_page = SettingsPage(
+            self._stage, theme, self.controller, on_close=self._close_settings)
+        self._settings_item = self._stage.create_window(
+            0, 0, anchor="nw", window=self._settings_page,
+            width=WINDOW_W)
+        self._stage.itemconfigure(self._settings_item, state="hidden")
+        self._stage.bind("<Configure>", self._on_stage_configure)
 
         self._render()
-        self._place(root)
+        self._fit(root)
+        _apply_titlebar(root, theme)
 
-    def _place(self, root: tk.Tk) -> None:
-        """Центрирует окно по экрану.
+    def _card(self) -> tk.Frame:
+        theme = self._theme
+        card = Card(self._body.inner, theme)
+        card.pack(fill="x", padx=PAD, pady=(0, CARD_GAP))
+        return card.inner
 
-        Размер окна не фиксируется: Tk сам подстраивает его под содержимое,
-        поэтому карточки не обрезаются при изменении текста.
-        """
-        width, height = self._settle(root)
-        root.minsize(WINDOW_W, 1)
-        x = int(root.winfo_screenwidth() / 2 - width / 2)
-        y = int(root.winfo_screenheight() / 2 - height / 2)
-        root.geometry(f"+{max(0, x)}+{max(0, y)}")
-        root.update()
-
-    def _style(self, root: tk.Tk, theme: Theme) -> None:
-        style = ttk.Style(root)
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
-        style.configure(
-            "TCombobox",
-            fieldbackground=theme.btn,
-            background=theme.btn,
-            foreground=theme.text,
-            arrowcolor=theme.text_dim,
-            bordercolor=theme.card_border,
-            lightcolor=theme.card_border,
-            darkcolor=theme.card_border,
-            padding=6,
-        )
-        style.map(
-            "TCombobox",
-            fieldbackground=[("readonly", theme.btn)],
-            foreground=[("readonly", theme.text)],
-        )
-        root.option_add("*TCombobox*Listbox.background", theme.card)
-        root.option_add("*TCombobox*Listbox.foreground", theme.text)
-        root.option_add("*TCombobox*Listbox.selectBackground", theme.accent)
-        root.option_add("*TCombobox*Listbox.selectForeground", theme.accent_text)
-        root.option_add("*TCombobox*Listbox.font", theme.font(9))
-
+    # ---- шапка -------------------------------------------------------------
     def _build_header(self, root: tk.Tk, theme: Theme) -> None:
         header = tk.Frame(root, bg=theme.header)
         header.pack(fill="x")
-
+        self._header = header
         inner = tk.Frame(header, bg=theme.header)
-        inner.pack(fill="x", padx=16, pady=14)
+        inner.pack(fill="x", padx=PAD, pady=12)
 
-        image = ImageTk.PhotoImage(icons.make_app_icon(46))
-        self._images.append(image)
-        badge = tk.Canvas(inner, width=46, height=46, bg=theme.header,
-                          highlightthickness=0, bd=0)
-        badge.create_image(0, 0, anchor="nw", image=image)
+        badge_image = ImageTk.PhotoImage(icons.make_app_icon(44))
+        self._images.append(badge_image)
+        badge = tk.Label(inner, image=badge_image, bg=theme.header, bd=0)
         badge.pack(side="left", padx=(0, 12))
 
         titles = tk.Frame(inner, bg=theme.header)
         titles.pack(side="left", fill="y")
-        tk.Label(titles, text="Обходы", bg=theme.header, fg=theme.header_text,
-                 font=theme.font(15, "bold"), anchor="w").pack(anchor="w")
-        tk.Label(titles, text="Happ · zapret · tg-ws-proxy", bg=theme.header,
-                 fg=theme.header_dim, font=theme.font(9), anchor="w").pack(anchor="w")
-
-        pill = tk.Frame(inner, bg=theme.header)
-        pill.pack(side="right")
-        self._pill_dot = StatusDot(pill, theme, size=11, bg=theme.header)
-        self._pill_dot.pack(side="left", padx=(0, 7))
-        self._pill_text = tk.Label(pill, text="", bg=theme.header,
-                                   fg=theme.header_text, font=theme.font(10, "bold"))
-        self._pill_text.pack(side="left")
-
-        PillButton(inner, theme, "Настройки", self._open_settings,
-                   kind="secondary", bg=theme.header).pack(side="right", padx=(0, 12))
-
-    def _card(self, parent: tk.Misc, theme: Theme) -> tk.Frame:
-        card = Card(parent, theme)
-        card.pack(fill="x", pady=(0, 10))
-        return card.inner
-
-    def _row(self, parent: tk.Misc, theme: Theme, key: str, title: str,
-             buttons: list[tuple[str, str, object, tuple]]) -> tk.Frame:
-        """Строка статуса: индикатор, название, значение и кнопки.
-
-        Каждая кнопка — ``(текст, вид, функция, аргументы)``; функция
-        выполняется в фоне, чтобы не подвешивать окно.
-        """
-        row = tk.Frame(parent, bg=theme.card)
-        row.pack(fill="x", pady=1)
-        row.columnconfigure(1, weight=1)
-
-        dot = StatusDot(row, theme, size=12)
-        dot.grid(row=0, column=0, rowspan=2, padx=(0, 11), sticky="n")
-
-        name = tk.Label(row, text=title, bg=theme.card, fg=theme.text,
-                        font=theme.font(10, "bold"), anchor="w")
-        name.grid(row=0, column=1, sticky="w")
-
-        detail = tk.Label(row, text="", bg=theme.card, fg=theme.text_faint,
-                          font=theme.font(8), anchor="w")
-        detail.grid(row=1, column=1, sticky="w")
-
-        value = tk.Label(row, text="", bg=theme.card, fg=theme.text_dim,
-                         font=theme.font(9), anchor="e")
-        value.grid(row=0, column=2, rowspan=2, sticky="e", padx=(10, 2))
-
-        holder = tk.Frame(row, bg=theme.card)
-        holder.grid(row=0, column=3, rowspan=2, sticky="e", padx=(8, 0))
-        made: dict[str, PillButton] = {}
-        for text, kind, fn, args in buttons:
-            button = PillButton(holder, theme, text, self._async(fn, *args), kind=kind)
-            button.pack(side="left", padx=(6, 0))
-            made[text] = button
-
-        self._rows[key] = {
-            "dot": dot, "name": name, "detail": detail,
-            "value": value, "buttons": made, "holder": holder,
-        }
-        return row
-
-    def _build_status_card(self, parent: tk.Misc, theme: Theme) -> None:
-        cfg = self.controller.cfg
-        inner = self._card(parent, theme)
-        tk.Label(inner, text="СОСТОЯНИЕ", bg=theme.card, fg=theme.text_faint,
-                 font=theme.font(8, "bold"), anchor="w").pack(fill="x", pady=(0, 9))
-
-        self._row(inner, theme, "happ", "Happ",
-                  [("Открыть", "secondary", actions.open_happ, (cfg,))])
-        Divider(inner, theme).pack(fill="x", pady=9)
-        self._row(inner, theme, "zapret", "zapret",
-                  [("ЗАПУСТИТЬ", "primary", actions.start_zapret, (cfg,)),
-                   ("Остановить", "secondary", actions.stop_zapret, (cfg,))])
-        Divider(inner, theme).pack(fill="x", pady=9)
-        self._row(inner, theme, "tgws", "tg-ws-proxy",
-                  [("Запустить", "secondary", actions.start_tgws, (cfg,))])
-
-    def _build_strategy_card(self, parent: tk.Misc, theme: Theme) -> None:
-        inner = self._card(parent, theme)
-        tk.Label(inner, text="СТРАТЕГИЯ ZAPRET", bg=theme.card, fg=theme.text_faint,
-                 font=theme.font(8, "bold"), anchor="w").pack(fill="x", pady=(0, 9))
-
-        line = tk.Frame(inner, bg=theme.card)
-        line.pack(fill="x")
-        self._strategy_var = tk.StringVar(value=self.controller.cfg.get("zapret_bat", ""))
-        self._combobox = ttk.Combobox(
-            line, textvariable=self._strategy_var, state="readonly",
-            font=theme.font(9), width=32,
+        self._title = tk.Label(
+            titles, text="Обходы", bg=theme.header, fg=theme.header_text,
+            font=theme.font(16, "bold"), anchor="w")
+        self._title.pack(anchor="w")
+        self._subtitle = tk.Label(
+            titles, text="", bg=theme.header, fg=theme.header_dim,
+            font=theme.font(8, "bold"), anchor="w",
         )
-        self._combobox.pack(side="left", fill="x", expand=True)
-        PillButton(line, theme, "Применить", self._apply_strategy, kind="primary").pack(
-            side="left", padx=(8, 0)
+        self._subtitle.pack(anchor="w", pady=(2, 0))
+
+        self._header_back = IconButton(
+            inner, theme, self._icon("chevron_left", theme.header_dim, 20),
+            self._close_settings, tooltip="Назад", bg=theme.header, size=32,
         )
-
-        self._hint = tk.Label(inner, text="", bg=theme.card, fg=theme.text_faint,
-                              font=theme.font(8), anchor="w", justify="left",
-                              wraplength=WINDOW_W - 80)
-        self._hint.pack(fill="x", pady=(9, 0))
-
-        auto = tk.Frame(inner, bg=theme.card)
-        auto.pack(fill="x", pady=(11, 0))
-        PillButton(auto, theme, "Подобрать лучшую стратегию",
-                   self._async(self.controller.start_sweep), kind="secondary").pack(side="left")
-        self._rows["sweep"] = {
-            "value": tk.Label(auto, text="", bg=theme.card, fg=theme.text_faint,
-                              font=theme.font(8), anchor="w", justify="left",
-                              wraplength=WINDOW_W - 260),
-        }
-        self._rows["sweep"]["value"].pack(side="left", padx=(10, 0), fill="x", expand=True)
-
-    def _build_routing_card(self, parent: tk.Misc, theme: Theme) -> None:
-        inner = self._card(parent, theme)
-        tk.Label(inner, text="ПРОКСИ XRAY", bg=theme.card, fg=theme.text_faint,
-                 font=theme.font(8, "bold"), anchor="w").pack(fill="x", pady=(0, 9))
-
-        head = tk.Frame(inner, bg=theme.card)
-        head.pack(fill="x")
-        self._rows["route"] = {
-            "value": tk.Label(head, text="", bg=theme.card, fg=theme.text,
-                              font=theme.font(9, "bold"), anchor="w"),
-        }
-        self._rows["route"]["value"].pack(fill="x")
-
-        buttons = tk.Frame(inner, bg=theme.card)
-        buttons.pack(fill="x", pady=(8, 0))
-        self._rows["route_buttons"] = {
-            "on": PillButton(buttons, theme, "Подключить",
-                             self._async(self.controller.set_proxy, True), kind="primary"),
-            "off": PillButton(buttons, theme, "Отключить",
-                              self._async(self.controller.set_proxy, False), kind="secondary"),
-            "server": PillButton(buttons, theme, "Другой сервер",
-                                 self._async(self.controller.set_proxy, True), kind="secondary"),
-        }
-        self._rows["route_buttons"]["on"].pack(side="left")
-        self._rows["route_buttons"]["off"].pack(side="left", padx=(6, 0))
-        self._rows["route_buttons"]["server"].pack(side="left", padx=(6, 0))
-
-        checks = tk.Frame(inner, bg=theme.card)
-        checks.pack(fill="x", pady=(7, 0))
-        for key, text in (("tunnel", "Локальный прокси"),
-                          ("yt", "Российские сервисы — напрямую"),
-                          ("social", "Заблокированные сайты — через сервер")):
-            label = tk.Label(checks, text=text, bg=theme.card, fg=theme.text_dim,
-                             font=theme.font(9), anchor="w")
-            label.pack(fill="x", pady=1)
-            self._rows[key] = {"value": label}
-
-        self._rows["route_hint"] = {
-            "value": tk.Label(inner, text="", bg=theme.card, fg=theme.text_faint,
-                              font=theme.font(8), anchor="w", justify="left",
-                              wraplength=WINDOW_W - 80),
-        }
-        self._rows["route_hint"]["value"].pack(fill="x", pady=(8, 0))
-
-        # --- выбор сервера из списка ---
-        picker = tk.Frame(inner, bg=theme.card)
-        picker.pack(fill="x", pady=(10, 0))
-        self._server_var = tk.StringVar(value="")
-        self._server_combo = ttk.Combobox(
-            picker, textvariable=self._server_var, state="readonly",
-            font=theme.font(9), width=30,
+        self._header_update = IconButton(
+            inner, theme, self._icon("refresh", theme.header_dim, 20),
+            self._request_update, tooltip="Обновить всё", bg=theme.header, size=32,
         )
-        self._server_combo.pack(side="left", fill="x", expand=True)
-        PillButton(picker, theme, "Поставить", self._apply_server, kind="primary").pack(
-            side="left", padx=(8, 0))
-        PillButton(picker, theme, "Обновить",
-                   self._async(self.controller.load_servers, True),
-                   kind="secondary").pack(side="left", padx=(6, 0))
+        self._header_gear = IconButton(
+            inner, theme, self._icon("gear", theme.header_dim, 20),
+            self._open_settings, tooltip="Настройки", bg=theme.header, size=32,
+        )
+        self._header_back.pack(side="right", padx=(0, 6))
+        self._header_update.pack(side="right", padx=(0, 6))
+        self._header_gear.pack(side="right", padx=(0, 8))
+        self._header_back.pack_forget()
+        self._set_header_mode("main")
 
-    def _build_updates_card(self, parent: tk.Misc, theme: Theme) -> None:
-        inner = self._card(parent, theme)
-        row = tk.Frame(inner, bg=theme.card)
-        row.pack(fill="x")
-        row.columnconfigure(1, weight=1)
-        tk.Label(row, text="ОБНОВЛЕНИЯ", bg=theme.card, fg=theme.text_faint,
-                 font=theme.font(8, "bold"), anchor="w").grid(row=0, column=0, sticky="w")
-        self._rows["updates"] = {
-            "value": tk.Label(row, text="", bg=theme.card, fg=theme.text_dim,
-                              font=theme.font(9), anchor="w"),
-        }
-        self._rows["updates"]["value"].grid(row=1, column=0, columnspan=2,
-                                            sticky="w", pady=(6, 0))
-        PillButton(row, theme, "Проверить", self._async(self.controller.check_updates, True),
-                   kind="secondary").grid(row=0, column=2, rowspan=2, sticky="e")
+    def _set_header_mode(self, mode: str) -> None:
+        theme = self._theme
+        settings = mode == "settings"
+        if self._title is not None:
+            self._title.configure(text="Настройки" if settings else "Обходы")
+        if self._subtitle is not None and settings:
+            self._subtitle.configure(text="Подписка, маршруты и компоненты")
+        for button, visible in ((self._header_gear, not settings),
+                                (self._header_update, not settings),
+                                (self._header_back, settings)):
+            if button is None:
+                continue
+            if visible:
+                button.pack(side="right", padx=(0, 6))
+            else:
+                button.pack_forget()
+        if not settings:
+            self._render_header_update()
+
+    def _request_update(self) -> None:
+        if bool(getattr(self.controller, "updates_running", False)):
+            return
+        if bool((getattr(self.controller, "busy", {}) or {}).get("updates")):
+            return
+        action = getattr(self.controller, "update_everything", None)
+        if not callable(action):
+            action = getattr(self.controller, "check_all", None)
+        if callable(action):
+            self._call(action)
+
+    def _render_header_update(self) -> None:
+        theme = self._theme
+        button = self._header_update
+        if button is None or self._page_visible == "settings":
+            return
+        report = getattr(self.controller, "updates_report", {}) or {}
+        running = bool(getattr(self.controller, "updates_running", False)) or bool(
+            (getattr(self.controller, "busy", {}) or {}).get("updates"))
+        outdated = list(report.get("outdated") or [])
+        if running:
+            color = theme.accent
+            tooltip = "Проверяю…"
+        elif outdated:
+            color = theme.warn
+            tooltip = "Обновить всё"
+        else:
+            color = theme.header_dim
+            tooltip = "Обновить всё"
+        button.set_image(self._icon("refresh", color, 20))
+        button.set_badge(theme.warn if outdated and not running else None)
+        button.set_tooltip(tooltip)
+
+    def _on_section_height(self) -> None:
+        """Колбэк анимации списка серверов: плавно подгоняет окно."""
+        if self._settings_visible:
+            return
+        self._fit(self._root)
+
+    def _refresh_subtitle(self) -> None:
+        """Возвращает подзаголовок главной после выхода из настроек."""
+        controller = self.controller
+        proxy = getattr(controller, "proxy", {}) or {}
+        report = getattr(controller, "health_report", {}) or {}
+        busy = getattr(controller, "busy", {}) or {}
+        self._render_subtitle(
+            bool(proxy.get("running")), str(report.get("verdict") or ""),
+            busy, bool(getattr(controller, "health_running", False)))
+
+    def _set_page_visible(self, show_settings: bool) -> None:
+        """Показывает одну страницу Canvas, не двигая window-item."""
+        stage = self._stage
+        if stage is None or self._main_item is None or self._settings_item is None:
+            return
+        try:
+            stage.itemconfigure(self._main_item,
+                                state="hidden" if show_settings else "normal")
+            stage.itemconfigure(self._settings_item,
+                                state="normal" if show_settings else "hidden")
+        except tk.TclError:
+            return
+        self._page_visible = "settings" if show_settings else "main"
+        self._set_header_mode("settings" if show_settings else "main")
+        if not show_settings:
+            self._refresh_subtitle()
+
+    def _switch_pages(self, show_settings: bool) -> None:
+        """Мгновенно показывает нужную страницу и ставит её высоту."""
+        root = self._root
+        stage = self._stage
+        if root is None or stage is None:
+            return
+        if self._main_item is None or self._settings_item is None:
+            return
+        self._set_page_visible(show_settings)
+        target_height = (self._settings_target_height() if show_settings
+                         else self._main_target_height())
+        self._apply_height(target_height)
+        stage.update_idletasks()
+        root.update_idletasks()
+
+    def _close_settings(self) -> None:
+        if not self._settings_visible:
+            return
+        self._settings_visible = False
+        self._switch_pages(show_settings=False)
+        self._render()
+
+    # -- карточка VPN --------------------------------------------------------
+    def _build_vpn(self, inner: tk.Frame) -> None:
+        theme = self._theme
+        top = tk.Frame(inner, bg=theme.card)
+        top.pack(fill="x")
+
+        shield = tk.Label(top, bg=theme.card, bd=0)
+        self._set_icon(shield, "shield", theme.accent, 22)
+        shield.pack(side="left", padx=(0, 10), anchor="n")
+        self._vpn["icon"] = shield
+
+        titles = tk.Frame(top, bg=theme.card)
+        titles.pack(side="left", fill="x", expand=True)
+        title_row = tk.Frame(titles, bg=theme.card)
+        title_row.pack(fill="x")
+        tk.Label(title_row, text="VPN", bg=theme.card, fg=theme.text,
+                 font=theme.font(11, "bold")).pack(side="left")
+        self._vpn["chip"] = Chip(title_row, theme, "выключен", theme.dim)
+        self._vpn["chip"].pack(side="left", padx=(8, 0))
+        self._vpn["line"] = tk.Label(
+            titles, text="выключен", bg=theme.card, fg=theme.text_dim,
+            font=theme.font(9), anchor="w",
+        )
+        self._vpn["line"].pack(fill="x", pady=(3, 0))
+
+        self._vpn["button"] = PillButton(
+            top, theme, "Включить", lambda: self._call(self.controller.set_proxy, True),
+            kind="primary", min_width=112, height=32,
+        )
+        self._vpn["button"].pack(side="right", padx=(12, 0))
+
+        Divider(inner, theme).pack(fill="x", pady=(10, 4))
+
+        toggle = HoverRow(inner, theme, command=self._toggle_servers)
+        toggle.pack(fill="x")
+        label = tk.Label(toggle, text="Регионы и серверы", bg=theme.card,
+                         fg=theme.text_dim, font=theme.font(9, "bold"), anchor="w")
+        label.pack(side="left", fill="x", expand=True)
+        chevron = tk.Label(toggle, bg=theme.card, bd=0)
+        self._set_icon(chevron, "chevron", theme.text_dim, 14)
+        chevron.pack(side="right", padx=(6, 2))
+        self._vpn["toggle"] = toggle
+        self._vpn["toggle_label"] = label
+        self._vpn["chevron"] = chevron
+        for widget in (chevron, label):
+            toggle.track(widget)
+
+        section = AnimatedSection(inner, theme)
+        section.pack(fill="x")
+        self._servers_section = section
+        self._servers_frame = section.content
+        self._servers_list = tk.Frame(self._servers_frame, bg=theme.card)
+        self._servers_list.pack(fill="x")
+        buttons = tk.Frame(self._servers_frame, bg=theme.card)
+        buttons.pack(fill="x", pady=(6, 0))
+        self._vpn["pick"] = PillButton(
+            buttons, theme, "Подобрать лучший",
+            lambda: self._call(self.controller.pick_best_server),
+            kind="secondary", height=28, pad_x=11,
+        )
+        self._vpn["pick"].pack(side="left")
+        self._vpn["refresh"] = PillButton(
+            buttons, theme, "Обновить список",
+            lambda: self._call(self.controller.load_servers, True),
+            kind="secondary", height=28, pad_x=11,
+        )
+        self._vpn["refresh"].pack(side="left", padx=(8, 0))
+
+    # -- карточка сервисов ---------------------------------------------------
+    def _build_services(self, inner: tk.Frame) -> None:
+        theme = self._theme
+        for index, (key, title, icon_name) in enumerate(SERVICES):
+            row = HoverRow(inner, theme)
+            row.pack(fill="x")
+            grid = tk.Frame(row, bg=theme.card)
+            grid.pack(fill="x", pady=6)
+            grid.columnconfigure(1, weight=1)
+
+            icon = tk.Label(grid, bg=theme.card, bd=0)
+            self._set_icon(icon, icon_name, theme.dim, 20)
+            icon.grid(row=0, column=0, rowspan=2, padx=(0, 11), sticky="n")
+
+            name = tk.Label(grid, text=title, bg=theme.card, fg=theme.text,
+                            font=theme.font(10, "bold"), anchor="w")
+            name.grid(row=0, column=1, sticky="w")
+
+            detail = tk.Label(grid, text="", bg=theme.card, fg=theme.text_faint,
+                              font=theme.font(8), anchor="w")
+            detail.grid(row=1, column=1, sticky="w")
+
+            state = tk.Label(grid, text="—", bg=theme.card, fg=theme.dim,
+                             font=theme.font(9, "bold"), anchor="e")
+            state.grid(row=0, column=2, rowspan=2, sticky="e", padx=(10, 0))
+
+            button = None
+            if key in ("zapret", "tgwsproxy"):
+                button = PillButton(grid, theme, "Запустить", None,
+                                    kind="secondary", height=26, pad_x=10,
+                                    min_width=104)
+                button.grid(row=0, column=2, rowspan=2, sticky="e", padx=(10, 0))
+                button.grid_remove()
+
+            self._services[key] = {
+                "row": row, "grid": grid, "icon": icon, "name": name,
+                "detail": detail, "state": state, "button": button,
+            }
+            for widget in (icon, name, detail, state):
+                row.track(widget)
+            if index < len(SERVICES) - 1:
+                Divider(inner, theme).pack(fill="x")
+
+    # -- карточка журнала ----------------------------------------------------
+    def _build_activity(self, inner: tk.Frame) -> None:
+        theme = self._theme
+        header = tk.Frame(inner, bg=theme.card)
+        header.pack(fill="x", pady=(0, 7))
+        tk.Label(header, text="ЧТО ВИДЖЕТ СДЕЛАЛ САМ", bg=theme.card,
+                 fg=theme.text_faint, font=theme.font(8, "bold"), anchor="w"
+                 ).pack(side="left")
+        self._activity_period = tk.Label(
+            header, text="", bg=theme.card, fg=theme.text_faint,
+            font=theme.font(8), anchor="w")
+        self._activity_period.pack(side="left", padx=(8, 0))
+        self._activity_empty = tk.Label(
+            inner, text="", bg=theme.card, fg=theme.text_faint,
+            font=theme.font(9), anchor="w",
+        )
+        self._activity_empty.pack(fill="x")
+        for _index in range(5):
+            row = tk.Frame(inner, bg=theme.card)
+            stamp = tk.Label(row, text="", bg=theme.card, fg=theme.text_faint,
+                             font=theme.font(8), width=6, anchor="w")
+            stamp.pack(side="left")
+            text = tk.Label(row, text="", bg=theme.card, fg=theme.text_dim,
+                            font=theme.font(9), anchor="w", justify="left")
+            text.pack(side="left", fill="x", expand=True)
+            self._activity_rows.append({"frame": row, "stamp": stamp, "text": text})
+
+    # -- кнопки действий -----------------------------------------------------
+    def _build_actions(self) -> None:
+        theme = self._theme
+        frame = tk.Frame(self._body.inner, bg=theme.bg)
+        frame.pack(fill="x", padx=PAD, pady=(2, CARD_GAP))
+
+        primary = PillButton(
+            frame, theme, "Проверить всё",
+            lambda: self._call(self.controller.run_health), kind="primary",
+            width=WINDOW_W - 2 * PAD, height=32,
+        )
+        primary.pack(fill="x")
+        self._buttons["check_all"] = primary
+
+        row = tk.Frame(frame, bg=theme.bg)
+        row.pack(fill="x", pady=(8, 0))
+        width = (WINDOW_W - 2 * PAD - 16) // 3
+        specs = (
+            ("sweep", "Тест стратегий", self.controller.start_sweep),
+            ("routes", "Проверить маршруты", self._confirm_routes),
+            ("subscription", "Обновить подписку", self.controller.refresh_subscription),
+        )
+        for key, text, command in specs:
+            # Подтверждение маршрутов показывает messagebox — только в UI-потоке.
+            callback = command if key == "routes" else (lambda c=command: self._call(c))
+            button = PillButton(row, theme, text, callback,
+                                kind="secondary", width=width, height=32)
+            button.pack(side="left", padx=(0, 8) if key != "subscription" else (0, 0))
+            self._buttons[key] = button
 
     # ---- обновление данных -------------------------------------------------
     def _render(self) -> None:
         theme = self._theme
-        state = self.controller.status or {}
-        happ = state.get("happ") or {}
-        zapret = state.get("zapret") or {}
-        tgws = state.get("tgwsproxy") or {}
-        routing = state.get("happ_routing") or {}
-
-        key, color, title = self.controller.health()
-        if self._pill_dot is not None:
-            self._pill_dot.set(color)
-        if self._pill_text is not None:
-            labels = {"ok": "всё в порядке", "happ": "Happ выключен",
-                      "zapret": "zapret выключен", "tgws": "прокси не слушает",
-                      "update": "есть обновления", "idle": "опрос…"}
-            self._pill_text.configure(text=labels.get(key, title))
-
-        # Happ
-        row = self._rows.get("happ")
-        if row:
-            running = bool(happ.get("running"))
-            row["dot"].set(theme.ok if running else theme.bad)
-            row["value"].configure(text="запущен" if running else "выключен",
-                                   fg=theme.ok if running else theme.bad)
-            row["detail"].configure(text=happ.get("process") or "процесс не найден")
-
-        # zapret
-        row = self._rows.get("zapret")
-        if row:
-            running = bool(zapret.get("running"))
-            row["dot"].set(theme.ok if running else theme.warn)
-            row["value"].configure(text="запущен" if running else "выключен",
-                                   fg=theme.ok if running else theme.warn)
-            parts = []
-            if zapret.get("strategy"):
-                parts.append(zapret["strategy"])
-            if zapret.get("digest"):
-                parts.append(zapret["digest"])
-            if not parts and zapret.get("dir"):
-                parts.append("стратегия не определена")
-            row["detail"].configure(text=" · ".join(parts) or "winws.exe не найден")
-            self._sync_zapret_buttons(row, bool(zapret.get("as_service")))
-
-        # tg-ws-proxy
-        row = self._rows.get("tgws")
-        if row:
-            listening = bool(tgws.get("listening"))
-            row["dot"].set(theme.ok if listening else theme.warn)
-            row["value"].configure(
-                text=f"слушает :{tgws.get('port', 1443)}" if listening else "не слушает",
-                fg=theme.ok if listening else theme.warn,
-            )
-            row["detail"].configure(
-                text="порт открыт" if listening else "порт закрыт — Telegram без ускорения"
-            )
-
-        self._render_routing(routing)
-        self._render_server_picker()
-        self._render_updates()
-        self._render_hint(zapret)
-        self._render_sweep()
-
-        bats = zapret.get("bats") or []
-        if self._combobox is not None and list(self._combobox["values"]) != bats:
-            self._combobox["values"] = bats
-
-        if self._footer is not None:
-            stamp = time.strftime("%H:%M:%S")
-            note = "" if state.get("admin") else "  ·  без прав администратора"
-            self._footer.configure(text=f"Обновлено в {stamp}{note}")
-
-    def _sync_zapret_buttons(self, row: dict, service_mode: bool) -> None:
-        buttons = row.get("buttons") or {}
-        primary = buttons.get("ЗАПУСТИТЬ")
-        if primary is None:
-            return
-        if service_mode:
-            primary.set_text("Перезапустить")
-            primary.command = self._async(actions.control_service, "restart")
-            stop = buttons.get("Остановить")
-            if stop is not None:
-                stop.set_text("Остановить")
-                stop.command = self._async(actions.control_service, "stop")
-        else:
-            primary.set_text("Запустить")
-            primary.command = self._async(actions.start_zapret, self.controller.cfg)
-            stop = buttons.get("Остановить")
-            if stop is not None:
-                stop.set_text("Остановить")
-                stop.command = self._async(actions.stop_zapret, self.controller.cfg)
-
-    def _render_routing(self, routing: dict) -> None:
-        theme = self._theme
         controller = self.controller
         proxy = getattr(controller, "proxy", {}) or {}
+        status = getattr(controller, "status", {}) or {}
+        report = getattr(controller, "health_report", {}) or {}
+        items = {item.get("id"): item for item in (report.get("items") or [])}
+        busy = getattr(controller, "busy", {}) or {}
+        health_running = bool(getattr(controller, "health_running", False))
         running = bool(proxy.get("running"))
-        busy = bool(proxy.get("busy"))
+        verdict = str(report.get("verdict") or "")
 
-        row = self._rows.get("route")
-        if row:
-            if busy:
-                row["value"].configure(text=proxy.get("message") or "работаю…",
-                                       fg=theme.accent)
-            elif running:
-                latency = proxy.get("latency", -1)
-                tail = f" · {latency} мс" if isinstance(latency, int) and latency >= 0 else ""
-                row["value"].configure(
-                    text=f"подключено · {proxy.get('server') or 'сервер'}{tail}",
-                    fg=theme.ok)
-            else:
-                row["value"].configure(
-                    text=proxy.get("message") or "не подключено", fg=theme.text_dim)
+        if self._page_visible != "settings":
+            self._render_subtitle(running, verdict, busy, health_running)
+        self._render_vpn(proxy, busy)
+        self._render_services(items, status, busy)
+        self._render_activity()
+        self._render_header_update()
+        self._render_footer(status, busy)
+        self._render_buttons(busy, health_running)
+        self._fit(self._root)
 
-        buttons = self._rows.get("route_buttons") or {}
-        for key, enabled in (("on", not running), ("off", running),
-                             ("server", not busy)):
-            button = buttons.get(key)
-            if button is not None:
-                button.set_enabled(enabled and not busy)
-
-        tunnel = self._rows.get("tunnel")
-        if tunnel:
-            port = proxy.get("port") or self.controller.cfg.get("xray_port", 10818)
-            tunnel["value"].configure(
-                text=f"{'✓' if running else '—'}  Локальный прокси "
-                     + (f"127.0.0.1:{port}" if running else "выключен"),
-                fg=theme.ok if running else theme.text_faint)
-
-        yt = self._rows.get("yt")
-        if yt:
-            stream = bool(proxy.get("stream"))
-            if running and stream:
-                text = "⚠  YouTube/Discord — через сервер (zapret не работает)"
-                color = theme.warn
-            elif running:
-                text = "✓  YouTube/Discord — напрямую под zapret"
-                color = theme.ok
-            else:
-                text = "—  YouTube/Discord — напрямую под zapret"
-                color = theme.text_faint
-            yt["value"].configure(text=text, fg=color)
-        social = self._rows.get("social")
-        if social:
-            mark, color = ("✓", theme.ok) if running else ("—", theme.text_faint)
-            social["value"].configure(
-                text=f"{mark}  Instagram/X и заблокированные — через сервер", fg=color)
-
-        hint = self._rows.get("route_hint")
-        if hint:
-            if busy:
-                text = proxy.get("message") or ""
-            elif running:
-                system = ("Системный прокси включён — браузеры уже используют его."
-                          if proxy.get("system_proxy") else
-                          "Системный прокси выключен: укажите 127.0.0.1:"
-                          f"{proxy.get('port', 10818)} в браузере вручную.")
-                if proxy.get("stream"):
-                    text = (f"Работает без Happ и без прав администратора. {system} "
-                            "zapret не запущен, поэтому YouTube и Discord временно "
-                            "идут через сервер. Российские сервисы — напрямую. "
-                            "Как только zapret вернётся, они снова пойдут напрямую.")
-                else:
-                    text = (f"Работает без Happ и без прав администратора. {system} "
-                            "Заблокированные сайты идут через сервер, российские "
-                            "сервисы и YouTube с Discord — напрямую (их закрывает "
-                            "zapret). Если zapret остановится, YouTube и Discord "
-                            "автоматически уйдут через сервер.")
-            else:
-                text = ("Свой клиент на ядре Xray: подписка берётся напрямую, из "
-                        "доступных серверов выбирается самый быстрый по задержке. "
-                        "Права администратора не нужны, TUN не используется, "
-                        "zapret продолжает работать как обычно. Через сервер пойдут "
-                        "только заблокированные сайты; YouTube и Discord останутся "
-                        "напрямую под zapret. «Подключить» пропишет прокси в систему "
-                        "для браузеров.")
-            hint["value"].configure(text=text)
-
-    def _apply_server(self) -> None:
-        name = self._server_var.get() if self._server_var else ""
-        if not name:
+    def _render_subtitle(self, running: bool, verdict: str, busy: dict,
+                         health_running: bool) -> None:
+        if self._subtitle is None:
             return
-        # В списке показываем «название — задержка», на сервер отправляем имя.
-        clean = name.rsplit(" — ", 1)[0]
-        self.controller.select_server(clean)
-
-    def _render_server_picker(self) -> None:
-        combo = getattr(self, "_server_combo", None)
-        if combo is None:
-            return
-        servers = getattr(self.controller, "servers", None) or []
-        labels = [f"{s.get('name', '?')} — {s.get('latency', '?')} мс" for s in servers]
-        if list(combo["values"]) != labels:
-            combo["values"] = labels
-        current = self.controller.proxy.get("server") or ""
-        if current and not self._server_var.get():
-            match = next((l for l in labels if l.startswith(current + " —") or
-                          l.rsplit(" — ", 1)[0] == current), "")
-            if match:
-                self._server_var.set(match)
-
-    def _render_updates(self) -> None:
-        theme = self._theme
-        row = self._rows.get("updates")
-        if not row:
-            return
-        note = self.controller.state.get("updates_note")
-        row["value"].configure(text=note or "нет новых релизов",
-                               fg=theme.warn if note else theme.text_dim)
-
-    def _render_sweep(self) -> None:
-        theme = self._theme
-        row = self._rows.get("sweep")
-        if not row:
-            return
-        sweep = getattr(self.controller, "sweep", {}) or {}
-        if sweep.get("running"):
-            index = sweep.get("index") or 0
-            total = sweep.get("total") or 0
-            prefix = f"{index}/{total} · " if total else ""
-            text = prefix + (sweep.get("message") or "идёт перебор…")
-            row["value"].configure(text=text, fg=theme.accent)
+        if busy or health_running:
+            text = "ПРОВЕРЯЮ…"
+        elif not running:
+            text = "VPN ВЫКЛЮЧЕН"
+        elif verdict == "fail":
+            text = "VPN ВКЛЮЧЁН · ЕСТЬ СБОЙ"
+        elif verdict == "warn":
+            text = "VPN ВКЛЮЧЁН · ТРЕБУЕТ ВНИМАНИЯ"
+        elif verdict == "ok":
+            text = "VPN ВКЛЮЧЁН · ВСЁ РАБОТАЕТ"
         else:
-            last = (self.controller.state or {}).get("last_sweep") or {}
-            if last.get("best"):
-                text = f"Последний подбор: {last['best']}"
-            else:
-                text = sweep.get("message") or "проверит все general*.bat и оставит рабочую"
-            row["value"].configure(text=text, fg=theme.text_faint)
+            text = "VPN ВКЛЮЧЁН · ПРОВЕРКА НЕ ЗАПУСКАЛАСЬ"
+        self._subtitle.configure(text=text)
 
-    def _render_hint(self, zapret: dict) -> None:
-        if self._hint is None:
+    def _render_vpn(self, proxy: dict, busy: dict) -> None:
+        theme = self._theme
+        info = self._vpn
+        if not info:
             return
-        if zapret.get("as_service"):
-            text = ("zapret установлен службой: запуск и остановка выполняются через "
-                    "службу (нужен запрос UAC). Смена стратегии — кнопкой "
-                    "«Сменить стратегию службы» в меню трея.")
-        elif zapret.get("running") and not zapret.get("strategy"):
-            text = "Стратегию не удалось сопоставить с general*.bat."
+        running = bool(proxy.get("running"))
+        busy_here = bool(busy.get("proxy") or proxy.get("busy"))
+        port = proxy.get("port") or self.controller.cfg.get("xray_port", 10818)
+        verdict = str((getattr(self.controller, "health_report", {}) or {}).get("verdict") or "")
+
+        color = theme.dim
+        word = "выключен"
+        if running:
+            color = theme.bad if verdict == "fail" else theme.ok
+            word = "сбой" if verdict == "fail" else "включён"
+        self._set_icon(info["icon"], "shield", color, 22)
+        info["chip"].set(word, color)
+
+        name = clean_server_name(proxy.get("server") or "") or "сервер не выбран"
+        if running:
+            uptime = format_uptime(proxy.get("since"))
+            line = f"{name} · локальный прокси · {uptime}"
+            if busy_here and proxy.get("message"):
+                line = str(proxy.get("message"))
         else:
-            text = "Выбор сохраняется и применяется при запуске zapret."
-        self._hint.configure(text=text)
+            line = proxy.get("message") or "не подключён"
+        info["line"].configure(text=line)
+
+        button = info["button"]
+        button.set_text("Выключить" if running else "Включить")
+        button.set_kind("primary" if not running else "secondary")
+        button.set_command(lambda: self._call(self.controller.set_proxy, not running))
+        button.set_enabled(not busy_here)
+
+        self._render_servers()
+        pick = info.get("pick")
+        refresh_button = info.get("refresh")
+        servers_busy = bool(busy.get("servers") or busy.get("proxy"))
+        if pick is not None:
+            pick.set_enabled(not servers_busy)
+        if refresh_button is not None:
+            refresh_button.set_enabled(not servers_busy)
+
+    def _render_servers(self, force: bool = False) -> None:
+        theme = self._theme
+        controller = self.controller
+        servers = list(getattr(controller, "servers", None) or [])
+        proxy = getattr(controller, "proxy", {}) or {}
+        busy = bool(proxy.get("busy")
+                    or (getattr(controller, "busy", {}) or {}).get("proxy"))
+        current = clean_server_name(proxy.get("server") or
+                                    getattr(controller, "server_selected", "") or "")
+        prepared = []
+        for server in servers:
+            raw = str(server.get("name") or server.get("host") or "?")
+            clean = clean_server_name(raw) or raw
+            display = clean if len(clean) <= 42 else clean[:41].rstrip() + "…"
+            latency = server.get("latency")
+            latency = latency if isinstance(latency, int) and latency >= 0 else None
+            prepared.append({"raw": raw, "clean": clean, "display": display,
+                             "latency": latency})
+        best = min((item["latency"] for item in prepared if item["latency"] is not None),
+                   default=None)
+        signature = (tuple((item["display"], item["latency"]) for item in prepared),
+                     current, busy)
+        if not force and signature == self._servers_signature:
+            return
+        self._servers_signature = signature
+
+        holder = self._servers_list
+        if holder is None:
+            return
+        for child in holder.winfo_children():
+            child.destroy()
+        if not prepared:
+            tk.Label(holder, text="список пуст — нажмите «Обновить список»",
+                     bg=theme.card, fg=theme.text_faint, font=theme.font(8),
+                     anchor="w").pack(fill="x", pady=3)
+            if self._body is not None:
+                self._body.bind_tree(holder)
+            return
+
+        for item in prepared:
+            is_best = item["latency"] is not None and item["latency"] == best
+            is_current = item["clean"] == current
+            marker = ("★" if is_best else "") + ("●" if is_current else "")
+            # Пока прокси занят, строки не реагируют: повторный клик оборвал бы
+            # текущее переключение.
+            command = None if busy else (lambda raw=item["raw"]: self._select(raw))
+            row = HoverRow(holder, theme, command=command)
+            row.pack(fill="x")
+            marker_label = tk.Label(
+                row, text=marker, width=3, bg=theme.card,
+                fg=theme.dim if busy else (theme.accent if is_best else theme.ok),
+                font=theme.font(9, "bold"), anchor="w",
+            )
+            marker_label.pack(side="left")
+            name_label = tk.Label(
+                row, text=item["display"], bg=theme.card,
+                fg=theme.text_faint if busy else theme.text,
+                font=theme.font(9), anchor="w",
+            )
+            name_label.pack(side="left", fill="x", expand=True, pady=2)
+            latency_label = tk.Label(
+                row, text=f"{item['latency']} мс" if item["latency"] is not None else "—",
+                bg=theme.card, fg=theme.text_faint, font=theme.font(8), anchor="e",
+            )
+            latency_label.pack(side="right")
+            for widget in (marker_label, name_label, latency_label):
+                row.track(widget)
+        if self._body is not None:
+            self._body.bind_tree(holder)
+
+    def _select(self, name: str) -> None:
+        select = getattr(self.controller, "select_server", None)
+        if callable(select):
+            self._call(select, name)
+
+    def _service_fallback(self, key: str, status: dict) -> tuple[str, str]:
+        zapret = status.get("zapret") or {}
+        tgws = status.get("tgwsproxy") or {}
+        if key == "zapret":
+            if zapret.get("running"):
+                detail = " · ".join(
+                    part for part in (zapret.get("strategy"), zapret.get("digest")) if part
+                ) or "стратегия не определена"
+                return "ok", detail
+            return "bad", "остановлен" if zapret.get("dir") else "winws.exe не найден"
+        if key == "tgwsproxy":
+            port = tgws.get("port", 1443)
+            if tgws.get("listening"):
+                return "ok", f"порт {port} слушает"
+            return ("bad" if tgws.get("running") else "off"), f"порт {port} закрыт"
+        return "off", "нет данных"
+
+    def _render_services(self, items: dict, status: dict, busy: dict) -> None:
+        theme = self._theme
+        zapret_status = status.get("zapret") or {}
+        for key, _title, icon_name in SERVICES:
+            row = self._services.get(key)
+            if not row:
+                continue
+            item = items.get(key)
+            if item:
+                state = str(item.get("state") or "off")
+                detail = str(item.get("detail") or "")
+            else:
+                state, detail = self._service_fallback(key, status)
+            if key == "youtube" and (getattr(self.controller, "cfg", {}) or {}).get(
+                    "youtube_via_vpn"):
+                detail = (detail + " · через VPN") if detail else "через VPN"
+            color = {"ok": theme.ok, "warn": theme.warn, "bad": theme.bad}.get(
+                state, theme.dim)
+            self._set_icon(row["icon"], icon_name, color, 20)
+            row["detail"].configure(text=detail)
+            row["state"].configure(text=_STATE_WORDS.get(state, "—"), fg=color)
+
+            button = row["button"]
+            if button is None:
+                continue
+            if state == "ok":
+                button.grid_remove()
+                row["state"].grid()
+                continue
+            row["state"].grid_remove()
+            button.grid()
+
+            if key == "zapret":
+                installed = bool(zapret_status.get("dir"))
+                restart = bool(zapret_status.get("running"))
+                button.set_text("Перезапустить" if restart else "Запустить")
+                action = (self.controller.restart_zapret if restart
+                          else self.controller.start_zapret)
+                button.set_command(lambda a=action: self._call(a))
+                button.set_enabled(installed and not busy.get("zapret")
+                                   and not busy.get("health"))
+            else:
+                tgws = status.get("tgwsproxy") or {}
+                restart = bool(tgws.get("running"))
+                button.set_text("Перезапустить" if restart else "Запустить")
+                action = (self.controller.restart_tgws if restart
+                          else self.controller.start_tgws)
+                button.set_command(lambda a=action: self._call(a))
+                installed = bool(self.controller.cfg.get("tgws_exe"))
+                button.set_enabled(installed and not busy.get("tgws"))
+
+    def _activity_period_text(self) -> str:
+        try:
+            hours = int(float(self.controller.cfg.get("activity_hours") or 3))
+        except (TypeError, ValueError):
+            hours = 3
+        if hours == 1:
+            return "последний час"
+        if 2 <= hours <= 4:
+            return f"последние {hours} часа"
+        return f"последние {hours} часов"
+
+    def _render_activity(self) -> None:
+        theme = self._theme
+        period = self._activity_period_text()
+        if self._activity_period is not None:
+            self._activity_period.configure(text=period)
+        rows = list(getattr(self.controller, "activity_items", None) or [])[:5]
+        if self._activity_empty is not None:
+            self._activity_empty.configure(text=f"{period} ничего не делал")
+            if rows:
+                if self._activity_empty.winfo_manager():
+                    self._activity_empty.pack_forget()
+            elif not self._activity_empty.winfo_manager():
+                self._activity_empty.pack(fill="x")
+        for index, holder in enumerate(self._activity_rows):
+            if index >= len(rows):
+                if holder["frame"].winfo_manager():
+                    holder["frame"].pack_forget()
+                continue
+            entry = rows[index]
+            try:
+                stamp = time.strftime("%H:%M", time.localtime(float(entry.get("at") or 0)))
+            except (TypeError, ValueError):
+                stamp = "--:--"
+            text = str(entry.get("text") or "")
+            # Эмодзи и флаги из имён серверов в журнале тоже не показываем.
+            text = " ".join(_EMOJI_RE.sub("", text).split())
+            if len(text) > 92:
+                text = text[:89].rstrip() + "…"
+            holder["stamp"].configure(text=stamp)
+            holder["text"].configure(text=text)
+            if not holder["frame"].winfo_manager():
+                holder["frame"].pack(fill="x", pady=1)
+
+    def _render_footer(self, status: dict, busy: dict) -> None:
+        if self._footer is None:
+            return
+        stamp = getattr(self.controller, "updated_at", 0) or 0
+        clock = time.strftime("%H:%M:%S", time.localtime(stamp or time.time()))
+        cfg = getattr(self.controller, "cfg", {}) or {}
+        guard = "guard активен" if cfg.get("guard_enabled", True) else "guard выключен"
+        admin = ("с правами администратора" if status.get("admin")
+                 else "без прав администратора")
+        youtube = " · YouTube через VPN" if cfg.get("youtube_via_vpn") else ""
+        note = " · работаю…" if busy else ""
+        self._footer.configure(
+            text=f"обновлено {clock} · {guard} · {admin}{youtube}{note}")
+
+    def _render_buttons(self, busy: dict, health_running: bool) -> None:
+        primary = self._buttons.get("check_all")
+        if primary is not None:
+            primary.set_enabled(not health_running and not busy.get("health"))
+        for key in ("sweep", "routes", "subscription"):
+            button = self._buttons.get(key)
+            if button is None:
+                continue
+            blocked = bool(busy.get(key))
+            if key == "subscription":
+                blocked = blocked or bool(busy.get("servers"))
+            button.set_enabled(not blocked)
+
+    # ---- компоновка и прокрутка -------------------------------------------
+    def _header_height(self) -> int:
+        return self._header.winfo_reqheight() if self._header is not None else 0
+
+    def _main_target_height(self) -> int:
+        body = self._body.content_height() if self._body is not None else 0
+        footer = self._footer.winfo_reqheight() if self._footer is not None else 0
+        total = self._header_height() + body + footer + 12
+        root = self._root
+        if root is None:
+            return total
+        return min(total, int(root.winfo_screenheight() * BODY_RATIO))
+
+    def _settings_target_height(self) -> int:
+        page = self._settings_page
+        root = self._root
+        if page is None or root is None:
+            return self._main_target_height()
+        screen = root.winfo_screenheight()
+        max_page = max(320, int(screen * BODY_RATIO) - self._header_height() - 8)
+        return self._header_height() + min(max(320, page.height_request()), max_page)
+
+    def _sync_stage_size(self) -> None:
+        """Растягивает обе страницы на видимую область Canvas."""
+        stage = self._stage
+        if stage is None:
+            return
+        try:
+            width = stage.winfo_width()
+            height = stage.winfo_height()
+        except tk.TclError:
+            return
+        if height <= 1:
+            return
+        if self._stage_bg is not None:
+            try:
+                stage.coords(self._stage_bg, 0, 0, width or WINDOW_W, height)
+                stage.tag_lower(self._stage_bg)
+            except tk.TclError:
+                pass
+        for item in (self._main_item, self._settings_item):
+            if item is None:
+                continue
+            try:
+                stage.itemconfigure(item, width=max(1, width or WINDOW_W),
+                                    height=height)
+            except tk.TclError:
+                pass
+
+    def _on_stage_configure(self, _event=None) -> None:
+        self._sync_stage_size()
+
+    def _height_limit(self) -> int:
+        """Максимальная client-высота ниже сохранённого y."""
+        root = self._root
+        if root is None:
+            return 300
+        title_h = max(0, root.winfo_rooty() - root.winfo_y())
+        work_bottom = _work_area(root)[3]
+        return max(300, work_bottom - self._origin_y - title_h - 16)
+
+    def _apply_height(self, height: int) -> None:
+        """Меняет только высоту; x/y фиксируются при первом показе."""
+        root = self._root
+        if root is None:
+            return
+        total = max(300, int(height))
+        screen = root.winfo_screenheight()
+        if not self._placed:
+            self._origin_x = max(0, int(root.winfo_screenwidth() / 2 - WINDOW_W / 2))
+            self._origin_y = max(0, int(screen / 2 - total / 2))
+            self._placed = True
+        # Окно не двигаем: если новая высота не влезает в рабочую область
+        # ниже сохранённого y, режем высоту — страницы прокручиваются.
+        total = min(total, self._height_limit())
+        root.geometry(f"{WINDOW_W}x{total}+{self._origin_x}+{self._origin_y}")
+        self._last_height = total
+        try:
+            root.update_idletasks()
+        except tk.TclError:
+            return
+        self._sync_stage_size()
+
+    def _fit(self, root: tk.Tk | None) -> None:
+        """Подгоняет высоту окна под текущую страницу, не центрируя заново."""
+        if root is None:
+            return
+        root.update_idletasks()
+        target = (self._settings_target_height() if self._settings_visible
+                  else self._main_target_height())
+        self._apply_height(target)
+
+    def _toggle_servers(self) -> None:
+        section = self._servers_section
+        if section is None:
+            return
+        self._servers_open = not self._servers_open
+        chevron = self._vpn.get("chevron") if self._vpn else None
+        if chevron is not None:
+            self._set_icon(
+                chevron,
+                "chevron_down" if self._servers_open else "chevron",
+                self._theme.text_dim, 14,
+            )
+        if self._servers_open:
+            # Строки уже построены рендером; пересоздавать без нужды не надо.
+            self._render_servers()
+            section.expand(self._on_section_height)
+        else:
+            section.collapse(self._on_section_height)
 
     # ---- действия ----------------------------------------------------------
-    def _async(self, fn, *args):
-        """Оборачивает действие: выполняется в фоне, UI не блокируется."""
-
-        def run() -> None:
-            threading.Thread(
-                target=self.controller.run_action, args=(fn, *args), daemon=True
-            ).start()
-            root = self._root
-            if root is not None:
-                try:
-                    root.after(400, self._render)
-                except tk.TclError:
-                    pass
-
-        return run
-
-    def _apply_strategy(self) -> None:
-        if not self._strategy_var:
-            return
-        self.controller.cfg["zapret_bat"] = self._strategy_var.get()
-        config.save_config(self.controller.cfg)
-        zapret = (self.controller.status or {}).get("zapret") or {}
-        if zapret.get("as_service") and self._hint is not None:
-            self._hint.configure(
-                text="Сохранено. Служба использует свою стратегию — смените её "
-                     "через «Сменить стратегию службы» в меню трея."
+    def _confirm_routes(self) -> None:
+        """Спрашивает подтверждение и применяет маршруты с перезапуском Xray."""
+        try:
+            answer = messagebox.askyesno(
+                "Проверить маршруты",
+                "Туннель перезапустится на несколько секунд. Продолжить?",
+                parent=self._root,
             )
+        except tk.TclError:
+            return
+        if not answer:
+            return
+        apply_now = getattr(self.controller, "apply_routes", None)
+        if callable(apply_now):
+            self._call(apply_now)
+
+    def _call(self, fn, *args) -> None:
+        """Просит контроллер выполнить действие; панель не блокируется.
+
+        Перерисовку просим через очередь команд: трогать Tk из фонового
+        потока нельзя.
+        """
+        def run() -> None:
+            try:
+                fn(*args)
+            except Exception:  # noqa: BLE001
+                pass
+            self._queue.put("render")
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _hide(self) -> None:
         if self._root is not None:

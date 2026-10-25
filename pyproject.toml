@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bypass-tray"
-version = "0.3.0"
-description = "Windows-трей: статус и управление Happ / zapret / tg-ws-proxy (есть сборка одним .exe)"
+version = "0.6.3"
+description = "Windows-трей: статус и управление Xray / zapret / tg-ws-proxy"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

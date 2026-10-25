@@ -113,27 +113,57 @@ def split_command(command: str) -> tuple[str, str]:
 # ---- проверка связи -------------------------------------------------------
 
 
-def probe_url(url: str, timeout: float = 6.0) -> dict:
-    """Открывается ли адрес за отведённое время."""
+def probe_url(url: str, timeout: float = 6.0, limit: int = 524288) -> dict:
+    """Скачивает первые ``limit`` байт и измеряет скорость.
+
+    DPI-троттлинг часто виден только на объёме: страница открывается, а видео
+    грузится по 2 КБ. ``ok`` — ответ 2xx/3xx; обрыв или таймаут дают ``ok=False``.
+    """
     from urllib.parse import urlsplit
 
     parts = urlsplit(url)
     host = parts.hostname or ""
     path = parts.path or "/"
+    if parts.query:
+        path += "?" + parts.query
+    secure = parts.scheme != "http"
     started = time.perf_counter()
-    context = ssl.create_default_context()
     connection = None
+    data = b""
+    status = 0
     try:
-        connection = http.client.HTTPSConnection(host, timeout=timeout, context=context)
+        port = parts.port or (443 if secure else 80)
+        if secure:
+            connection = http.client.HTTPSConnection(
+                host, port, timeout=timeout, context=ssl.create_default_context())
+        else:
+            connection = http.client.HTTPConnection(host, port, timeout=timeout)
         connection.request("GET", path, headers={"User-Agent": USER_AGENT})
         response = connection.getresponse()
-        response.read(2048)
-        elapsed = (time.perf_counter() - started) * 1000
-        ok = 200 <= response.status < 400
-        return {"ok": ok, "status": response.status, "ms": round(elapsed)}
+        status = response.status
+        while len(data) < limit:
+            chunk = response.read(min(65536, limit - len(data)))
+            if not chunk:
+                break
+            data += chunk
+        elapsed = max((time.perf_counter() - started), 1e-6)
+        return {
+            "ok": 200 <= status < 400,
+            "status": status,
+            "ms": round(elapsed * 1000),
+            "bytes": len(data),
+            "kbps": round(len(data) * 8 / 1000 / elapsed),
+        }
     except Exception as exc:  # noqa: BLE001
-        elapsed = (time.perf_counter() - started) * 1000
-        return {"ok": False, "status": 0, "ms": round(elapsed), "error": type(exc).__name__}
+        elapsed = max((time.perf_counter() - started), 1e-6)
+        return {
+            "ok": False,
+            "status": status,
+            "ms": round(elapsed * 1000),
+            "bytes": len(data),
+            "kbps": round(len(data) * 8 / 1000 / elapsed),
+            "error": type(exc).__name__,
+        }
     finally:
         if connection is not None:
             try:
@@ -142,18 +172,46 @@ def probe_url(url: str, timeout: float = 6.0) -> dict:
                 pass
 
 
+#: Сколько нужно скачать, чтобы цель считалась рабочей.
+MIN_DOWNLOAD_BYTES = 64 * 1024
+
+
+def _target_ok(result: dict) -> bool:
+    """Цель засчитана только при ответе и достаточном объёме данных."""
+    return bool(result.get("ok")) and int(result.get("bytes") or 0) >= MIN_DOWNLOAD_BYTES
+
+
+def _rank_candidates(candidates: list[dict]) -> list[dict]:
+    """Лучшие: балл, затем суммарный объём, затем меньшее время."""
+    return sorted(
+        candidates,
+        key=lambda entry: (
+            entry["score"],
+            sum(target.get("bytes", 0)
+                for target in entry.get("targets", {}).values()),
+            -sum(target["ms"]
+                 for target in entry.get("targets", {}).values()),
+        ),
+        reverse=True,
+    )
+
+
 def measure(timeout: float = 6.0) -> dict:
-    """Проверяет целевые адреса и контрольный."""
+    """Проверяет целевые адреса и контрольный, измеряя реальную загрузку."""
     targets = {name: probe_url(url, timeout) for name, url in TARGETS}
     control_name, control_url = CONTROL
     control = probe_url(control_url, timeout)
-    score = sum(1 for result in targets.values() if result["ok"])
+    score = sum(1 for result in targets.values() if _target_ok(result))
+    total_bytes = sum(result.get("bytes", 0) for result in targets.values())
+    total_kbps = sum(result.get("kbps", 0) for result in targets.values())
     return {
         "targets": targets,
         "control": {control_name: control},
         "score": score,
         "total": len(targets),
         "control_ok": control["ok"],
+        "bytes": total_bytes,
+        "kbps": total_kbps,
         "working": score == len(targets) and control["ok"],
     }
 
@@ -261,6 +319,7 @@ def sweep(
             time.sleep(wait)
             result = measure(timeout)
             _kill_winws()
+            target_values = list(result["targets"].values())
             entry = {
                 "name": name,
                 "command": command,
@@ -268,6 +327,8 @@ def sweep(
                 "total": result["total"],
                 "control_ok": result["control_ok"],
                 "working": result["working"],
+                "bytes": sum(t.get("bytes", 0) for t in target_values),
+                "kbps": sum(t.get("kbps", 0) for t in target_values),
                 "targets": result["targets"],
                 "started": bool(process),
             }
@@ -281,14 +342,12 @@ def sweep(
         if not candidates:
             candidates = [r for r in report["results"] if r.get("score", 0) > 0]
         if candidates:
-            candidates.sort(
-                key=lambda r: (r["score"], -sum(t["ms"] for t in r["targets"].values())),
-                reverse=True,
-            )
+            candidates = _rank_candidates(candidates)
             best = candidates[0]
             report["best"] = best["name"]
             report["best_command"] = best["command"]
-            emit(f"Лучшая стратегия: {best['name']} ({best['score']}/{best['total']})")
+            emit(f"Лучшая стратегия: {best['name']} ({best['score']}/{best['total']}, "
+                 f"{best.get('bytes', 0) // 1024} КБ)")
             if install_best:
                 ok = install_service(best["command"])
                 report["installed"] = ok

@@ -1,11 +1,8 @@
-"""Готовит .ico для сборки .exe из того же рисунка, что рисует приложение.
-
-Запуск (нужен Pillow):  python packaging/make_icon.py
-Результат:              packaging/bypass-tray.ico
-"""
+"""Собирает packaging/bypass-tray.ico из иконки приложения."""
 
 from __future__ import annotations
 
+import shutil
 import sys
 from pathlib import Path
 
@@ -14,15 +11,15 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from bypass_tray import icons  # noqa: E402
 
-SIZES = [(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
-
 
 def main() -> int:
-    target = ROOT / "packaging" / "bypass-tray.ico"
-    image = icons.make_app_icon(256)
-    image.save(target, format="ICO", sizes=SIZES)
-    # ASCII, чтобы не падать на консоли с cp1252/cp866 (Windows CI).
-    print(f"icon written: {target}")
+    source = icons.ensure_ico()
+    target = Path(__file__).resolve().parent / "bypass-tray.ico"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".tmp")
+    shutil.copyfile(source, temporary)
+    temporary.replace(target)
+    print(f"{target} ({target.stat().st_size} bytes)")
     return 0
 
 

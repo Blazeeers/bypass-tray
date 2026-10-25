@@ -1,9 +1,7 @@
-"""Сбор статусов: процессы Happ/winws/tg-ws-proxy, порт, стратегии, маршруты Happ."""
+"""Сбор статусов: процессы winws/tg-ws-proxy, порты, стратегии zapret."""
 
 from __future__ import annotations
 
-import json
-import os
 import re
 import socket
 import subprocess
@@ -16,7 +14,6 @@ except ImportError:  # pragma: no cover
     psutil = None
 
 TGWS_RE = re.compile(r"tg[-_ ]?ws[-_ ]?proxy", re.I)
-HAPP_RE = re.compile(r"^happ", re.I)
 
 #: ``--dpi-desync=fake`` в .bat и ``--dpi-desync fake`` в образе службы.
 DPI_DESYNC_RE = re.compile(r"--dpi-desync(?:=|\s+)([^\s\"]+)")
@@ -27,11 +24,6 @@ DPI_OPT_RE = re.compile(r"--(dpi-desync[\w-]*)(?:=|\s+)(\"[^\"]*\"|\S+)")
 BAT_VAR_RE = re.compile(r"%[^%]+%")
 
 ZAPRET_SERVICE = "zapret"
-
-#: Домены, которые должны идти напрямую (их закрывает zapret).
-_DIRECT_HINTS = ("youtube", "youtu.be", "googlevideo", "ytimg", "discord")
-#: Домены западных соцсетей, которые должны идти через Happ.
-_PROXY_HINTS = ("instagram", "facebook", "twitter", "x.com", "tiktok", "reddit")
 
 
 def is_admin() -> bool:
@@ -192,78 +184,19 @@ def _read_bats(zapret_dir: Path | None) -> dict[str, str]:
     return result
 
 
-def happ_routing() -> dict:
-    """Маршрутизация Happ из ``%LOCALAPPDATA%\\Happ\\routing.json``.
-
-    Только чтение: правила меняются в самом Happ, приложение их лишь
-    показывает и подсказывает.
-    """
-    base = Path.home()
-    appdata = Path(os.environ.get("LOCALAPPDATA") or base / "AppData/Local")
-    path = appdata / "Happ" / "routing.json"
-    empty = {
-        "available": False,
-        "active": "",
-        "profiles": [],
-        "proxy_sites": [],
-        "direct_sites": [],
-        "youtube_direct": False,
-        "socials_proxied": False,
-        "split_tunnel_ok": False,
-    }
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return empty
-
-    routings = data.get("routings") or []
-    profiles = [str(r.get("name") or "") for r in routings if r.get("name")]
-    selected = str(data.get("activeRoutingName") or "")
-    if not selected:
-        for sub in data.get("subConfigs") or []:
-            if sub.get("enabled") and sub.get("selectedProfile"):
-                selected = str(sub["selectedProfile"])
-                break
-    if not selected:
-        for sub in data.get("subConfigs") or []:
-            if sub.get("selectedProfile"):
-                selected = str(sub["selectedProfile"])
-                break
-
-    current = next((r for r in routings if str(r.get("name") or "") == selected), None)
-    if current is None and routings:
-        current = routings[0]
-
-    proxy_sites = [str(s).lower() for s in (current or {}).get("proxySites") or []]
-    direct_sites = [str(s).lower() for s in (current or {}).get("directSites") or []]
-    global_proxy = bool((current or {}).get("globalProxy"))
-
-    joined_proxy = " ".join(proxy_sites)
-    youtube_direct = (not global_proxy) and not any(h in joined_proxy for h in _DIRECT_HINTS)
-    socials_proxied = global_proxy or any(h in joined_proxy for h in _PROXY_HINTS)
-
-    return {
-        "available": True,
-        "active": selected,
-        "profiles": profiles,
-        "proxy_sites": proxy_sites,
-        "direct_sites": direct_sites,
-        "youtube_direct": youtube_direct,
-        "socials_proxied": socials_proxied,
-        "split_tunnel_ok": bool(youtube_direct and socials_proxied),
-    }
-
-
 def collect(cfg: dict) -> dict:
     procs = _processes()
     winws = [(name, cmd) for name, cmd in procs if name.lower().startswith("winws")]
-    happ = [name for name, _ in procs if HAPP_RE.match(name or "")]
     tgws = [
         (name, cmd)
         for name, cmd in procs
         if TGWS_RE.search(name or "") or TGWS_RE.search(cmd or "")
     ]
-    port = int(cfg.get("tgws_port") or 1443)
+    try:
+        port = int(cfg.get("tgws_port") or 1443)
+    except (TypeError, ValueError):
+        # Кривой порт в конфиге не должен ронять сбор статусов целиком.
+        port = 1443
 
     raw_dir = cfg.get("zapret_dir") or ""
     # Пустой путь нельзя превращать в Path("") — это текущий каталог, и он
@@ -281,7 +214,6 @@ def collect(cfg: dict) -> dict:
     strategy = identify_strategy(_read_bats(zapret_dir), cmdline) if valid_dir else ""
 
     return {
-        "happ": {"running": bool(happ), "process": happ[0] if happ else ""},
         "zapret": {
             "running": bool(winws),
             "process": winws[0][0] if winws else "",
@@ -293,6 +225,5 @@ def collect(cfg: dict) -> dict:
             "as_service": bool(service_cmd),
         },
         "tgwsproxy": {"running": bool(tgws), "port": port, "listening": port_open(port)},
-        "happ_routing": happ_routing(),
         "admin": is_admin(),
     }
