@@ -922,7 +922,7 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
           and b"for /d" in run_bat_bytes
           and b"dist\\*" in run_bat_bytes
           and b"*.exe" in run_bat_bytes)
-    check("widget_version 0.6.6", updates.widget_version() == "0.6.6",
+    check("widget_version 0.6.7", updates.widget_version() == "0.6.7",
           updates.widget_version())
     empty_components = components.installed({"zapret_dir": "", "tgws_exe": ""})
     check("components.installed: пустые пути — не cwd",
@@ -939,6 +939,122 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
     except FileNotFoundError:
         empty_service_raised = True
     check("open_service_bat: пустой путь — FileNotFoundError", empty_service_raised)
+
+    # --- zapret: запуск не открывает страницу релизов --------------------
+    print("\n-- zapret: без проверки обновлений --")
+    zapret_fake = tmp / "zapret-fake"
+    zapret_fake.mkdir()
+    browser_bat = zapret_fake / "general.bat"
+    browser_bat.write_text(
+        "@echo off\n"
+        "call service.bat status_zapret\n"
+        "call service.bat check_updates\n"
+        "call service.bat load_game_filter\n"
+        "call service.bat load_user_lists\n"
+        'start "zapret: %~n0" /min "%BIN%winws.exe" --wf-tcp=80,443\n',
+        encoding="utf-8",
+    )
+    clean_bat = actions.sanitized_bat(browser_bat)
+    clean_text = clean_bat.read_text(encoding="utf-8") if clean_bat.is_file() else ""
+    check("sanitized_bat: копия рядом с оригиналом",
+          clean_bat != browser_bat and clean_bat.parent == browser_bat.parent
+          and clean_bat.name.startswith(actions.SANITIZED_PREFIX),
+          clean_bat.name)
+    check("sanitized_bat: check_updates вырезан, start остался",
+          "check_updates" not in clean_text and "start " in clean_text.lower(),
+          clean_text.replace("\n", " | ")[:80])
+    check("sanitized_bat: load_game_filter и load_user_lists сохранены",
+          "load_game_filter" in clean_text and "load_user_lists" in clean_text)
+    cyr_bat = zapret_fake / "обход.bat"
+    cyr_bat.write_text(browser_bat.read_text(encoding="utf-8"), encoding="utf-8")
+    cyr_clean = actions.sanitized_bat(cyr_bat)
+    check("sanitized_bat: кириллица в стеме — ASCII-имя копии",
+          cyr_clean != cyr_bat and cyr_clean.name.isascii() and cyr_clean.is_file(),
+          cyr_clean.name)
+    plain_bat = zapret_fake / "plain.bat"
+    plain_bat.write_text('@echo off\nstart "x" /min "winws.exe"\n', encoding="utf-8")
+    check("sanitized_bat: без check_updates — тот же путь",
+          actions.sanitized_bat(plain_bat) == plain_bat)
+    check("sanitized_bat: копия без замен не создаётся",
+          not list(zapret_fake.glob("~bt_plain*.bat")))
+    missing_bat = zapret_fake / "нет-файла.bat"
+    check("sanitized_bat: нет файла — тот же путь",
+          actions.sanitized_bat(missing_bat) == missing_bat)
+
+    # Пробный прогон тоже не должен дёргать check_updates: фейковый
+    # service.bat создаёт маркер именно по этому вызову.
+    probe_dir = tmp / "zapret-probe"
+    probe_dir.mkdir()
+    marker = probe_dir / "updates-checked.txt"
+    (probe_dir / "service.bat").write_text(
+        "@echo off\n"
+        'if /i "%~1"=="status_zapret" exit /b\n'
+        'if /i "%~1"=="check_updates" (\n'
+        f'    echo checked> "{marker}"\n'
+        "    exit /b\n"
+        ")\n"
+        'if /i "%~1"=="load_game_filter" (\n'
+        '    set "GameFilterTCP=2053"\n'
+        "    exit /b\n"
+        ")\n"
+        'if /i "%~1"=="load_user_lists" exit /b\n'
+        "exit /b\n",
+        encoding="utf-8",
+    )
+    probe_bat = probe_dir / "general.bat"
+    probe_bat.write_text(
+        "@echo off\n"
+        "call service.bat status_zapret\n"
+        "call service.bat check_updates\n"
+        "call service.bat load_game_filter\n"
+        "call service.bat load_user_lists\n"
+        'start "probe: %~n0" /min "%~dp0bin\\winws.exe" '
+        "--wf-tcp=80,443,%GameFilterTCP%\n",
+        encoding="utf-8",
+    )
+    probe_command = strategy.extract_command(probe_bat, timeout=25)
+    check("extract_command: check_updates не выполняется", not marker.exists(),
+          marker.name)
+    check("extract_command: команда winws получена",
+          "winws.exe" in probe_command.lower(), probe_command[:80])
+    check("extract_command: GameFilter сохранён", "2053" in probe_command,
+          probe_command[-40:])
+
+    # Запуск берёт копию, а старые копии убирает.
+    real_popen = actions._popen
+    real_kill_process = actions.kill_process
+    real_hide_later = actions._hide_later
+    launched: list[tuple[list[str], str | None]] = []
+    actions._popen = lambda args, cwd=None: launched.append((list(args), cwd))
+    actions.kill_process = lambda prefix: {"killed": 0, "denied": 0}
+    actions._hide_later = lambda *args, **kwargs: None
+    stale_bat = zapret_fake / "~bt_stale.bat"
+    stale_bat.write_text("rem\n", encoding="utf-8")
+    try:
+        actions.start_zapret({"zapret_dir": str(zapret_fake),
+                              "zapret_bat": browser_bat.name})
+    finally:
+        actions._popen = real_popen
+        actions.kill_process = real_kill_process
+        actions._hide_later = real_hide_later
+    run_args, run_cwd = launched[-1] if launched else ([], None)
+    started_bat = Path(run_args[-1]) if run_args else None
+    started_text = (started_bat.read_text(encoding="utf-8")
+                    if started_bat is not None and started_bat.is_file() else "")
+    check("start_zapret запускает санированную копию",
+          bool(launched) and run_args[:2] == ["cmd", "/c"]
+          and started_text != "" and "check_updates" not in started_text,
+          started_bat.name if started_bat is not None else "запуска не было")
+    check("start_zapret: cwd — папка zapret",
+          run_cwd is not None and Path(run_cwd).resolve() == zapret_fake.resolve(),
+          str(run_cwd))
+    copies = sorted(path.name for path in zapret_fake.glob("~bt_*.bat"))
+    check("start_zapret: старая копия удалена, текущая осталась",
+          not stale_bat.exists() and len(copies) == 1
+          and copies[0] == (started_bat.name if started_bat is not None else ""),
+          ", ".join(copies))
+    check("start_zapret: сами сценарии zapret не тронуты",
+          browser_bat.is_file() and plain_bat.is_file() and cyr_bat.is_file())
 
     import ssl
     import urllib.error

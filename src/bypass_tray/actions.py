@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -199,6 +200,79 @@ def control_service(action: str, name: str = ZAPRET_SERVICE) -> str:
     return service_state(name)
 
 
+#: Имя копии сценария без проверки обновлений: ``~bt_<stem>.bat``.
+SANITIZED_PREFIX = "~bt_"
+
+#: ``call service.bat check_updates`` подтягивает версию с GitHub и, если она
+#: новее локальной, делает ``start "" "<релиз>"`` — открывает браузер. Прочие
+#: ``call service.bat ...`` нужны: они задают ``GameFilterTCP/UDP`` и списки.
+_CHECK_UPDATES_RE = re.compile(
+    r"(?mi)^[ \t]*call[ \t]+\"?service\.bat\"?[ \t]+check_updates\b[^\r\n]*"
+)
+
+
+def _strip_check_updates(text: str) -> tuple[str, int]:
+    """Вырезает вызовы ``check_updates`` из текста сценария (``rem`` вместо них)."""
+    return _CHECK_UPDATES_RE.subn("rem", text)
+
+
+def _ascii_stem(stem: str) -> str:
+    """Стем для имени копии: не-ASCII (кириллица) заменяется на ``_``."""
+    return "".join(char if char.isascii() else "_" for char in stem) or "bat"
+
+
+def sanitized_bat(path: Path) -> Path:
+    """Копия сценария без ``call service.bat check_updates``.
+
+    Иначе каждый запуск ``general*.bat`` проверяет версию на GitHub и при
+    расхождении открывает страницу релизов в браузере: «Тест стратегий»
+    запускает 22 сценария подряд и открывал 22 вкладки.
+
+    Копия кладётся рядом с оригиналом: ``%~dp0`` у неё тот же каталог, поэтому
+    относительные ``bin``/``lists`` продолжают работать. Если замен не было,
+    файл не читается или копию не удалось записать — возвращается исходный путь.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return path
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return path
+    stripped, replaced = _strip_check_updates(text)
+    if not replaced:
+        return path
+    target = path.parent / f"{SANITIZED_PREFIX}{_ascii_stem(path.stem)}.bat"
+    try:
+        target.write_text(stripped, encoding="utf-8")
+    except OSError:
+        return path
+    return target
+
+
+def cleanup_sanitized(zapret_dir: Path, keep: Path | None = None) -> int:
+    """Удаляет оставшиеся копии ``~bt_*.bat``, кроме ``keep``.
+
+    Копии одноразовые: при следующем запуске сценарий пересобирается. Больше
+    ничего в папке zapret не трогается, ошибки удаления игнорируются.
+    """
+    keep_name = Path(keep).name.lower() if keep else ""
+    removed = 0
+    try:
+        candidates = list(Path(zapret_dir).glob(f"{SANITIZED_PREFIX}*.bat"))
+    except OSError:
+        return 0
+    for old in candidates:
+        if old.name.lower() == keep_name:
+            continue
+        try:
+            old.unlink()
+        except OSError:
+            continue
+        removed += 1
+    return removed
+
+
 def start_zapret(cfg: dict, bat: str | None = None) -> dict:
     """Запускает выбранный ``general*.bat`` (для установки без службы)."""
     raw_dir = str(cfg.get("zapret_dir") or "").strip()
@@ -209,6 +283,9 @@ def start_zapret(cfg: dict, bat: str | None = None) -> dict:
     path = zapret_dir / bat_name
     if not path.is_file():
         raise FileNotFoundError(f"Не найден сценарий стратегии: {path}")
+    # Запускаем копию без проверки обновлений: она и открывает браузер.
+    launch = sanitized_bat(path)
+    cleanup_sanitized(zapret_dir, keep=launch)
 
     killed = kill_process("winws")
     if killed["killed"] == 0 and killed["denied"] > 0:
@@ -216,7 +293,7 @@ def start_zapret(cfg: dict, bat: str | None = None) -> dict:
             "winws.exe запущен службой zapret и не может быть остановлен без прав "
             "администратора. Используйте «Остановить службу»."
         )
-    _popen(["cmd", "/c", str(path)], cwd=str(zapret_dir))
+    _popen(["cmd", "/c", str(launch)], cwd=str(zapret_dir))
     _hide_later("winws")
     return killed
 

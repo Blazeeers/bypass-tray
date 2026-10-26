@@ -6,9 +6,10 @@
 поэтому перебор запускается отдельным процессом с UAC.
 
 Команда `winws` не парсится вручную: рядом с `.bat` кладётся его копия, в
-которой `start ... winws.exe` заменён на `echo`, и у запущенного сценария
-забирается уже полностью раскрытая строка. Так учитываются переменные
-`%BIN%`, `%LISTS%`, `%GameFilterTCP%` и т.п.
+которой `start ... winws.exe` заменён на `echo`, а проверка обновлений
+(`call service.bat check_updates`, она открывает браузер) вырезана; у
+запущенного сценария забирается уже полностью раскрытая строка. Так
+учитываются переменные `%BIN%`, `%LISTS%`, `%GameFilterTCP%` и т.п.
 """
 
 from __future__ import annotations
@@ -68,6 +69,11 @@ def extract_command(bat_path: Path, timeout: int = 40) -> str:
     )
     if not replaced:
         return ""
+    # Пробный прогон 22 стратегий тоже не должен открывать вкладки: проверку
+    # обновлений вырезаем так же, как в сценарии, который идёт в запуск.
+    # `load_game_filter`/`load_user_lists` остаются — без них в команде не
+    # будет значений GameFilter и списков.
+    probe_text, _cut = actions._strip_check_updates(probe_text)
 
     probe_path = bat_path.parent / f"{PROBE_PREFIX}{bat_path.stem}.bat"
     try:
