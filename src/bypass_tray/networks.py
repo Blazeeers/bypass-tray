@@ -38,6 +38,15 @@ _IPCONFIG_GATEWAY_RE = re.compile(
     r"(?:Default Gateway|Основной шлюз)[^:]*:\s*(\S+)", re.IGNORECASE
 )
 
+#: Таймаут внешней команды: сеть нужна для выбора стратегии, а не для отчёта,
+#: и её нельзя ждать по 10 с внутри цикла трея.
+_RUN_TIMEOUT = 2.0
+#: Сколько секунд держать результат определения сети. ``current()`` зовут из
+#: цикла трея, а каждый вызов — до трёх внешних процессов.
+_CACHE_SECONDS = 45.0
+_CACHED: dict = {}
+_CACHED_AT = 0.0
+
 
 # ---- чистые парсеры -------------------------------------------------------
 
@@ -97,7 +106,7 @@ def parse_ipconfig_gateway(text: str) -> str:
 # ---- определение сети -----------------------------------------------------
 
 
-def _run(args: list[str], timeout: int = 10) -> str:
+def _run(args: list[str], timeout: float = _RUN_TIMEOUT) -> str:
     try:
         completed = subprocess.run(
             args, capture_output=True, timeout=timeout, creationflags=CREATE_NO_WINDOW
@@ -155,19 +164,44 @@ def _mac(ip: str) -> str:
     return parse_arp_mac(_run(["arp", "-a", ip]))
 
 
-def current() -> dict:
-    """Текущая сеть: ключ, SSID, шлюз, MAC и человеческое имя."""
+def network_key(gateway: str, ssid: str, mac: str) -> str:
+    """Один устойчивый ключ сети: шлюз, иначе SSID, иначе MAC.
+
+    Раньше ключом был MAC, а он пуст сразу после загрузки (``arp -a`` ещё не
+    знает шлюз): запись и чтение получали разные ключи, сохранённая стратегия
+    не находилась, а ``remember`` плодил дубли на одну сеть. Шлюз из реестра
+    есть всегда и не меняется, пока сеть та же.
+    """
+    for value in (gateway, ssid, mac):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return "default"
+
+
+def current(force: bool = False) -> dict:
+    """Текущая сеть: ключ, SSID, шлюз, MAC и человеческое имя.
+
+    Результат держится ``_CACHE_SECONDS``: вызов идёт из цикла трея, а это до
+    трёх внешних процессов (``netsh``, реестр/``ipconfig``, ``arp``).
+    ``force=True`` — перечитать немедленно.
+    """
+    global _CACHED, _CACHED_AT
+    if _CACHED and not force and time.monotonic() - _CACHED_AT <= _CACHE_SECONDS:
+        return dict(_CACHED)
     ssid = _wifi_ssid()
     gateway = _gateway()
     mac = _mac(gateway) if gateway else ""
-    key = mac or gateway or ssid or "default"
+    key = network_key(gateway, ssid, mac)
     if ssid:
         name = ssid
     elif gateway:
         name = f"Проводная сеть {gateway}"
     else:
         name = "Сеть"
-    return {"key": key, "ssid": ssid, "gateway": gateway, "mac": mac, "name": name}
+    net = {"key": key, "ssid": ssid, "gateway": gateway, "mac": mac, "name": name}
+    _CACHED, _CACHED_AT = dict(net), time.monotonic()
+    return net
 
 
 # ---- стратегия по сети ----------------------------------------------------
@@ -188,8 +222,21 @@ def all() -> dict:
 
 
 def strategy_for(key: str) -> str:
-    """Какая стратегия zapret работала в этой сети (пусто — неизвестно)."""
-    info = all().get(key) or {}
+    """Какая стратегия zapret работала в этой сети (пусто — неизвестно).
+
+    Кроме прямого совпадения ключа ищем запись по сохранённому шлюзу: старые
+    версии писали ключом MAC, а он сразу после загрузки пуст — тогда шлюз
+    лежал внутри записи, и стратегия всё равно находится.
+    """
+    networks = all()
+    info = networks.get(key)
+    if not isinstance(info, dict):
+        info = {}
+    if not info:
+        for saved in networks.values():
+            if isinstance(saved, dict) and str(saved.get("gateway") or "") == key:
+                info = saved
+                break
     return str(info.get("bat") or "")
 
 
@@ -199,10 +246,18 @@ def remember(key: str, bat: str, info: dict | None = None) -> None:
         return
     networks = all()
     source = info or {}
+    gateway = str(source.get("gateway") or "")
     networks[key] = {
         "bat": str(bat or ""),
         "at": time.time(),
         "ssid": str(source.get("ssid") or ""),
-        "gateway": str(source.get("gateway") or ""),
+        "gateway": gateway,
     }
+    if gateway:
+        # Дубль от старой версии (ключом был MAC, шлюз тот же) больше не нужен.
+        for old_key, saved in list(networks.items()):
+            if old_key == key or not isinstance(saved, dict):
+                continue
+            if str(saved.get("gateway") or "") == gateway:
+                del networks[old_key]
     atomic_write(path(), json.dumps({"networks": networks}, ensure_ascii=False, indent=2))

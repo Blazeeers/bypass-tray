@@ -23,7 +23,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import actions, status
+from . import actions, config, status
 
 PROBE_MARKER = "ZAPRET_CMD"
 PROBE_PREFIX = "_bypass_probe_"
@@ -113,11 +113,18 @@ def split_command(command: str) -> tuple[str, str]:
 # ---- проверка связи -------------------------------------------------------
 
 
-def probe_url(url: str, timeout: float = 6.0, limit: int = 524288) -> dict:
+def probe_url(url: str, timeout: float = 6.0, limit: int = 524288,
+              budget: float | None = None) -> dict:
     """Скачивает первые ``limit`` байт и измеряет скорость.
 
     DPI-троттлинг часто виден только на объёме: страница открывается, а видео
     грузится по 2 КБ. ``ok`` — ответ 2xx/3xx; обрыв или таймаут дают ``ok=False``.
+
+    ``budget`` — жёсткий предел на весь запрос, а не на одну сокет-операцию:
+    при троттлинге 10 КБ/с таймаут сокета не срабатывает, 512 КБ ползут около
+    50 с, перебор выходит за дедлайн UI, а дочерний процесс продолжает
+    сдёргивать ``winws``. По исчерпании бюджета чтение прекращается, и замер
+    считается несостоявшимся (``error="timeout"``): нужный объём не пришёл.
     """
     from urllib.parse import urlsplit
 
@@ -128,9 +135,12 @@ def probe_url(url: str, timeout: float = 6.0, limit: int = 524288) -> dict:
         path += "?" + parts.query
     secure = parts.scheme != "http"
     started = time.perf_counter()
+    expire = started + (float(budget) if budget is not None
+                        else max(float(timeout) * 2.0, 4.0))
     connection = None
     data = b""
     status = 0
+    expired = False
     try:
         port = parts.port or (443 if secure else 80)
         if secure:
@@ -142,18 +152,40 @@ def probe_url(url: str, timeout: float = 6.0, limit: int = 524288) -> dict:
         response = connection.getresponse()
         status = response.status
         while len(data) < limit:
-            chunk = response.read(min(65536, limit - len(data)))
+            left = expire - time.perf_counter()
+            if left <= 0:
+                expired = True
+                break
+            sock = getattr(connection, "sock", None)
+            if sock is not None:
+                try:
+                    sock.settimeout(max(0.05, min(left, timeout)))
+                except OSError:
+                    pass
+            try:
+                # read1 отдаёт то, что уже пришло: read(n) ждал бы весь кусок,
+                # и таймаут сокета обнулялся бы на каждом байте троттлинга.
+                chunk = response.read1(min(65536, limit - len(data)))
+            except TimeoutError:
+                # Сокет-таймаут внутри бюджета — тот же троттлинг: объём
+                # нужных байт не пришёл, замер не состоялся.
+                expired = True
+                break
             if not chunk:
                 break
             data += chunk
         elapsed = max((time.perf_counter() - started), 1e-6)
-        return {
-            "ok": 200 <= status < 400,
+        result = {
+            "ok": 200 <= status < 400 and not expired,
             "status": status,
             "ms": round(elapsed * 1000),
             "bytes": len(data),
             "kbps": round(len(data) * 8 / 1000 / elapsed),
         }
+        if expired:
+            result["error"] = "timeout"
+            result["truncated"] = True
+        return result
     except Exception as exc:  # noqa: BLE001
         elapsed = max((time.perf_counter() - started), 1e-6)
         return {
@@ -196,11 +228,15 @@ def _rank_candidates(candidates: list[dict]) -> list[dict]:
     )
 
 
-def measure(timeout: float = 6.0) -> dict:
-    """Проверяет целевые адреса и контрольный, измеряя реальную загрузку."""
-    targets = {name: probe_url(url, timeout) for name, url in TARGETS}
+def measure(timeout: float = 6.0, budget: float | None = None) -> dict:
+    """Проверяет целевые адреса и контрольный, измеряя реальную загрузку.
+
+    ``budget`` ограничивает каждый замер по времени (см. ``probe_url``):
+    суммарно один ``measure`` не может тянуться дольше трёх бюджетов.
+    """
+    targets = {name: probe_url(url, timeout, budget=budget) for name, url in TARGETS}
     control_name, control_url = CONTROL
-    control = probe_url(control_url, timeout)
+    control = probe_url(control_url, timeout, budget=budget)
     score = sum(1 for result in targets.values() if _target_ok(result))
     total_bytes = sum(result.get("bytes", 0) for result in targets.values())
     total_kbps = sum(result.get("kbps", 0) for result in targets.values())
@@ -242,6 +278,62 @@ def _kill_winws() -> None:
     time.sleep(0.6)
 
 
+def _winws_running() -> bool:
+    """Поднят ли ``winws`` — службой или запуском из ``.bat``."""
+    return bool(actions._pids("winws"))
+
+
+def _wait_winws(seconds: float = 4.0) -> bool:
+    """Ждёт появления ``winws``: запуск из ``.bat`` не мгновенный."""
+    deadline = time.time() + max(0.0, seconds)
+    while time.time() < deadline:
+        if _winws_running():
+            return True
+        time.sleep(0.25)
+    return _winws_running()
+
+
+def _service_start(emit) -> bool:
+    """Запускает службу zapret и подтверждает, что она поднялась."""
+    try:
+        state = actions.control_service("start")
+    except (OSError, subprocess.SubprocessError, PermissionError) as exc:
+        emit(f"Служба не запустилась: {exc}")
+        return False
+    return state == "running"
+
+
+def _restore_obhod(cfg: dict, original: str, bat: str | None, emit,
+                   *, installed: bool = False) -> bool:
+    """Возвращает обход в работу: служба, иначе запуск из ``.bat``.
+
+    Службы может не быть вовсе — zapret часто поднимают из ``general*.bat``.
+    Тогда восстановление это повторный запуск того же сценария: ``sc start``
+    в несуществующую службу съедал откат, и обход лежал до ручного запуска.
+    """
+    if installed:
+        # Служба только что перенастроена на лучшую стратегию — её и стартуем.
+        if _service_start(emit):
+            return True
+    elif original:
+        try:
+            if install_service(original) and _service_start(emit):
+                return True
+        except (OSError, subprocess.SubprocessError, PermissionError) as exc:
+            emit(f"Служба не восстановлена: {exc}")
+    if bat:
+        name = Path(bat).name
+        try:
+            actions.start_zapret(cfg, name)
+        except (OSError, PermissionError, FileNotFoundError) as exc:
+            emit(f"Запуск «{name}» не удался: {exc}")
+        else:
+            if _wait_winws():
+                return True
+            emit(f"«{name}» запущен, но winws не появился.")
+    return False
+
+
 def _launch(command: str, zapret_dir: Path) -> subprocess.Popen | None:
     exe, _ = split_command(command)
     cwd = Path(exe).parent if exe else zapret_dir
@@ -268,12 +360,26 @@ def sweep(
     """Перебирает стратегии и ставит лучшую.
 
     Возвращает отчёт; `restored` показывает, удалось ли вернуть обход в работу.
+    Отчёт формируется всегда: сбой внутри (таймаут ``sc.exe``, отказ UAC)
+    попадает в ``error``, а не роняет процесс — иначе UI ждал бы результат
+    все 900 секунд, а winws остался бы убитым.
     """
     zapret_dir = Path(zapret_dir)
-    original = status.service_image_path()
+    try:
+        cfg = dict(config.load_config() or {})
+    except (OSError, ValueError):
+        cfg = {}
+    # Запуск из .bat при откате должен идти из той папки, которую перебираем.
+    cfg["zapret_dir"] = str(zapret_dir)
+    bat = str(cfg.get("zapret_bat") or "").strip() or None
+    try:
+        original = status.service_image_path()
+    except Exception:  # noqa: BLE001
+        original = ""
     report: dict = {
         "started": time.time(),
         "original_command": original,
+        "bat": bat,
         "results": [],
         "baseline": None,
         "best": "",
@@ -289,6 +395,7 @@ def sweep(
             progress({"index": index, "total": total, "name": name})
 
     total = len(bats)
+    restored = False
     try:
         emit("Останавливаю службу zapret…")
         try:
@@ -349,29 +456,33 @@ def sweep(
             emit(f"Лучшая стратегия: {best['name']} ({best['score']}/{best['total']}, "
                  f"{best.get('bytes', 0) // 1024} КБ)")
             if install_best:
-                ok = install_service(best["command"])
+                try:
+                    ok = install_service(best["command"])
+                except (OSError, subprocess.SubprocessError, PermissionError) as exc:
+                    ok = False
+                    emit(f"sc.exe не отработал: {exc}")
                 report["installed"] = ok
                 emit("Служба перенастроена." if ok else "Не удалось перенастроить службу.")
         else:
             emit("Ни одна стратегия не дала результата — возвращаю исходную.")
 
         emit("Запускаю обход…")
-        try:
-            actions.control_service("start")
-            report["restored"] = actions.service_state() == "running"
-        except Exception as exc:  # noqa: BLE001
-            emit(f"Не удалось запустить службу: {exc}")
+        report["restored"] = _restore_obhod(
+            cfg, original, (report["best"] if report["installed"] else bat) or None,
+            emit, installed=bool(report["installed"]))
+        restored = True
+        emit("Обход работает." if report["restored"]
+             else "Обход не поднялся — нужен ручной запуск.")
+    except Exception as exc:  # noqa: BLE001
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        emit(f"Перебор прерван: {type(exc).__name__}: {exc}")
     finally:
-        _kill_winws()
-        if not report["restored"] and original and not report["installed"]:
-            # Аварийный откат: возвращаем исходную команду службы.
-            emit("Откат к исходной команде службы…")
-            try:
-                install_service(original)
-                actions.control_service("start")
-                report["restored"] = actions.service_state() == "running"
-            except Exception as exc:  # noqa: BLE001
-                emit(f"Откат не удался: {exc}")
+        if not restored:
+            _kill_winws()
+            emit("Возвращаю обход в работу…")
+            report["restored"] = _restore_obhod(
+                cfg, original, (report["best"] if report["installed"] else bat) or None,
+                emit, installed=bool(report["installed"]))
         report["finished"] = time.time()
     return report
 
@@ -384,13 +495,15 @@ def default_bats(zapret_dir: Path) -> list[str]:
     return sorted(path.name for path in directory.glob("general*.bat"))
 
 
-def write_report(report: dict, path: Path) -> None:
+def write_report(report: dict, path: Path) -> bool:
+    """Пишет отчёт перебора. ``False`` — записать не удалось."""
     path = Path(path)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError:
-        pass
+        return False
+    return True
 
 
 def read_report(path: Path) -> dict:
@@ -406,6 +519,12 @@ def run_sweep(path: Path, zapret_dir: Path, bats: list[str] | None = None) -> in
         print("Требуются права администратора.", flush=True)
         return 2
     names = bats or default_bats(zapret_dir)
-    report = sweep(zapret_dir, names, log=lambda m: print(m, flush=True))
-    write_report(report, path)
-    return 0
+    try:
+        report = sweep(zapret_dir, names, log=lambda m: print(m, flush=True))
+    except Exception as exc:  # noqa: BLE001
+        # Отчёт нужен даже после катастрофы: без файла UI ждёт 900 секунд.
+        report = {"started": time.time(), "finished": time.time(),
+                  "results": [], "best": "", "installed": False,
+                  "restored": False, "error": f"{type(exc).__name__}: {exc}"}
+        print(f"Перебор не выполнен: {exc}", flush=True)
+    return 0 if write_report(report, path) else 1

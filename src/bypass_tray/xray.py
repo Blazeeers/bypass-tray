@@ -32,6 +32,12 @@ from . import actions, config
 DEFAULT_SUBSCRIPTION = ""
 DEFAULT_PORT = 10818
 
+#: Сколько ждём ответа от одного сервера и сколько всего тратим на подбор.
+#: Подбор идёт под _LOCK: сорок серверов по пять секунд — это двести секунд,
+#: на которые встают stop/switch из UI и надзирателя.
+PROBE_TIMEOUT = 5.0
+SEARCH_BUDGET = 25.0
+
 #: Файлы ядра, которые держим рядом с приложением.
 CORE_FILES = ("xray.exe", "geoip.dat", "geosite.dat")
 #: Официальный релиз Xray-core для Windows x64 — если своих файлов нет.
@@ -267,15 +273,25 @@ def probe_server(server: dict, timeout: float = 5.0) -> int:
         return -1
 
 
-def rank_servers(links: list[str], limit: int | None = None) -> list[dict]:
-    """Разбирает ссылки и сортирует серверы по доступности и задержке."""
+def rank_servers(links: list[str], limit: int | None = None,
+                 time_budget: float = SEARCH_BUDGET) -> list[dict]:
+    """Разбирает ссылки и сортирует серверы по доступности и задержке.
+
+    Общее время проверки ограничено ``time_budget``: проба каждого сервера
+    укладывается в остаток бюджета, а когда он вышел — осмотр обрывается.
+    Иначе сорок серверов по пять секунд держали бы _LOCK двести секунд.
+    """
     servers = []
+    deadline = time.monotonic() + max(0.0, time_budget)
     for link in links:
+        remaining = deadline - time.monotonic()
+        if remaining < 0.5:
+            break
         try:
             server = parse_vless(link)
         except Exception:  # noqa: BLE001
             continue
-        latency = probe_server(server)
+        latency = probe_server(server, timeout=min(PROBE_TIMEOUT, remaining))
         server["latency"] = latency
         servers.append(server)
     alive = [s for s in servers if s["latency"] >= 0]
@@ -285,10 +301,11 @@ def rank_servers(links: list[str], limit: int | None = None) -> list[dict]:
     return alive
 
 
-def pick_server(links: list[str] | None = None) -> dict | None:
+def pick_server(links: list[str] | None = None,
+                time_budget: float = SEARCH_BUDGET) -> dict | None:
     """Возвращает самый быстрый из доступных серверов."""
     links = links if links is not None else fetch_subscription()
-    alive = rank_servers(links)
+    alive = rank_servers(links, time_budget=time_budget)
     return alive[0] if alive else None
 
 
@@ -513,10 +530,16 @@ def _save_state(server: dict, port: int, stream: bool = False) -> None:
 
 
 def _saved_state() -> dict:
+    """Сохранённое состояние; всё, что не объект, считаем пустым.
+
+    Валидный JSON вида ``null``/``[]``/``"x"`` раньше возвращался как есть и
+    ронял ``status()``/``saved_server()`` на ``.get`` — трей молча умирал.
+    """
     try:
-        return json.loads(state_path().read_text(encoding="utf-8"))
+        data = json.loads(state_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+    return data if isinstance(data, dict) else {}
 
 
 def saved_server() -> dict | None:
@@ -551,6 +574,27 @@ def status() -> dict:
     }
 
 
+def _status_server(info: dict | None = None) -> dict:
+    """Текущий сервер словарём — единый контракт результата ``start``.
+
+    ``status()`` отдаёт имя строкой (так его ждёт UI панели), но успешный
+    ``start`` обязан отдавать объект: потребитель читает
+    ``result["server"].get("name")``. Собирается из живого состояния, при его
+    отсутствии — из сохранённого.
+    """
+    info = status() if info is None else info
+    live = RUNNING.get("server") or {}
+    saved = _saved_state() if info.get("running") else {}
+    latency = info.get("latency", live.get("latency", saved.get("latency", -1)))
+    return {
+        "name": str(info.get("server") or live.get("name") or saved.get("name") or ""),
+        "host": str(info.get("host") or live.get("host") or saved.get("host") or ""),
+        "latency": latency if isinstance(latency, int) else -1,
+        "link": str(live.get("link") or saved.get("link") or ""),
+        "extra": list(live.get("extra") or saved.get("extra") or []),
+    }
+
+
 def _blocked_available() -> bool:
     """Есть ли валидный файл встроенного списка рядом с ядром."""
     try:
@@ -561,24 +605,38 @@ def _blocked_available() -> bool:
         return False
 
 
+def _terminate(process) -> None:
+    """terminate → wait → kill: следующий start не должен гоняться с прежним.
+
+    Ждём завершения на каждом шаге: ``terminate`` только просит закрыться, а
+    живое ядро держит порт и перезаписанный конфиг. Исключения здесь
+    разнородны (TimeoutExpired у Popen, NoSuchProcess у psutil, OSError у
+    Windows), поэтому ловим «что угодно» — гашение всё равно best-effort.
+    """
+    try:
+        process.terminate()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        process.wait(timeout=6)
+        return
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        process.kill()
+        process.wait(timeout=3)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _kill_process() -> None:
     """Гасит наш Xray, не трогая системный прокси."""
     process = RUNNING.pop("process", None)
     if process is not None and process.poll() is None:
-        try:
-            process.terminate()
-            process.wait(timeout=6)
-        except Exception:  # noqa: BLE001
-            try:
-                process.kill()
-            except Exception:  # noqa: BLE001
-                pass
+        _terminate(process)
     other = find_process()
     if other is not None:
-        try:
-            other.terminate()
-        except Exception:  # noqa: BLE001
-            pass
+        _terminate(other)
     _close_log()
 
 
@@ -689,15 +747,28 @@ def _start(cfg: dict | None = None, extra_domains: list[str] | None = None,
     cfg = cfg or config.load_config()
     stream = _effective_stream(cfg, stream_via_proxy)
     if is_running():
+        info = status()
+        try:
+            actual_port = int(info.get("port") or DEFAULT_PORT)
+        except (TypeError, ValueError):
+            actual_port = DEFAULT_PORT
+        # Фактический режим потока, а не из конфига: конфиг мог измениться
+        # уже после запуска ядра.
+        actual_stream = bool(info.get("stream", stream))
         if cfg.get("xray_system_proxy", True):
             # Ядро уже работает, но системный прокси мог остаться выключенным
             # после падения/перезапуска — браузеры не должны ходить мимо.
             try:
-                set_system_proxy(True, int(cfg.get("xray_port") or DEFAULT_PORT),
-                                 stream)
+                set_system_proxy(True, actual_port, actual_stream)
             except Exception:  # noqa: BLE001
                 pass
-        return {"ok": True, "already": True, **status()}
+        # Контракт один для обеих веток: ``server`` — словарь, порт и stream
+        # фактические. Строка в ``server`` давала AttributeError в app.set_proxy
+        # (``result["server"].get("name")``), и busy залипал навсегда.
+        info["server"] = _status_server(info)
+        info["port"] = actual_port
+        info["stream"] = actual_stream
+        return {"ok": True, "already": True, **info}
 
     exe = ensure_core()
     if exe is None:
@@ -713,6 +784,11 @@ def _start(cfg: dict | None = None, extra_domains: list[str] | None = None,
         return {"ok": False, "error": "нет доступных серверов"}
 
     port = int(cfg.get("xray_port") or DEFAULT_PORT)
+    if _port_open(port):
+        # Наш Xray не найден (иначе вернулись бы выше), значит порт держит
+        # чужой процесс: ядро не стартует, а ложный ok оставил бы UI уверенным,
+        # что VPN поднят. Конфиг при этом не трогаем.
+        return {"ok": False, "error": f"порт {port} занят другим процессом"}
     extra, legacy_direct = _config_route_lists(cfg, extra_domains)
     # Оверрайды аудита маршрутов: что проверки требуют вести через прокси.
     from . import routes
@@ -772,6 +848,11 @@ def _start(cfg: dict | None = None, extra_domains: list[str] | None = None,
         if process.poll() is not None:
             _close_log()
             RUNNING.clear()
+            # Прокси мог остаться включённым с прошлого запуска: без снятия
+            # после неудачного рестарта браузер ходит в мёртвый 127.0.0.1:port
+            # и остаётся без интернета до следующей синхронизации.
+            if cfg.get("xray_system_proxy", True):
+                set_system_proxy(False, port)
             return {"ok": False, "error": "Xray завершился при запуске",
                     "log": _read_log()}
         if _port_open(port):
@@ -838,14 +919,22 @@ def _log_path() -> Path:
 
 
 def _trim_log(limit: int = 256 * 1024) -> None:
-    """Оставляет только хвост журнала: не храним историю посещений."""
+    """Оставляет только хвост журнала: не храним историю посещений.
+
+    Читается именно хвост: ``read_bytes()`` тянул в память весь файл, а он
+    растёт с каждой ошибкой Xray.
+    """
     path = _log_path()
     try:
         size = path.stat().st_size
         if size <= limit:
             return
-        data = path.read_bytes()[-limit:]
-        path.write_bytes(data)
+        with open(path, "r+b") as handle:
+            handle.seek(size - limit)
+            data = handle.read()
+            handle.seek(0)
+            handle.write(data)
+            handle.truncate()
     except OSError:
         pass
 
@@ -1077,9 +1166,72 @@ def _proxy_bypass_list(stream_via_proxy: bool | None = None) -> str:
     return ";".join(parts)
 
 
+def proxy_backup_path() -> Path:
+    """Где лежат настройки прокси, снятые перед первым включением."""
+    return config.config_dir() / "proxy_backup.json"
+
+
+def _load_proxy_backup() -> dict | None:
+    """Прежние настройки прокси; ``None`` — бэкапа нет или он битый."""
+    try:
+        data = json.loads(proxy_backup_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _store_proxy_backup(values: dict) -> None:
+    config.atomic_write(proxy_backup_path(),
+                        json.dumps(values, ensure_ascii=False, indent=2))
+
+
+def _drop_proxy_backup() -> None:
+    try:
+        proxy_backup_path().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _read_proxy_values(key) -> dict:
+    """Текущие ProxyEnable/ProxyServer/ProxyOverride; ``None`` — значения не было."""
+    import winreg
+
+    values: dict = {}
+    for name in ("ProxyEnable", "ProxyServer", "ProxyOverride"):
+        try:
+            values[name] = winreg.QueryValueEx(key, name)[0]
+        except OSError:
+            values[name] = None
+    return values
+
+
+def _write_proxy_values(key, values: dict) -> None:
+    """Возвращает прежние настройки; отсутствовавшие значения удаляются."""
+    import winreg
+
+    kinds = {"ProxyEnable": winreg.REG_DWORD, "ProxyServer": winreg.REG_SZ,
+             "ProxyOverride": winreg.REG_SZ}
+    for name, value in values.items():
+        if name not in kinds:
+            continue
+        if value is None:
+            try:
+                winreg.DeleteValue(key, name)
+            except OSError:
+                pass
+        else:
+            winreg.SetValueEx(key, name, 0, kinds[name], value)
+
+
 def set_system_proxy(enable: bool, port: int = DEFAULT_PORT,
                      stream_via_proxy: bool = False) -> dict:
-    """Включает/выключает системный прокси (только HKCU — права не нужны)."""
+    """Включает/выключает системный прокси (только HKCU — права не нужны).
+
+    Перед первой модификацией прежние значения (например, корпоративный
+    прокси) кладутся в ``proxy_backup.json`` рядом с конфигом: раньше включение
+    затирало ProxyServer/ProxyOverride, а выключение просто удаляло их, и
+    настройки пользователя терялись навсегда.
+    """
     if not sys.platform.startswith("win"):
         return {"ok": False}
     try:
@@ -1088,9 +1240,20 @@ def set_system_proxy(enable: bool, port: int = DEFAULT_PORT,
         with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, _INTERNET_SETTINGS, 0,
                                 winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE) as key:
             if enable:
+                own = f"127.0.0.1:{port}"
+                try:
+                    current, _kind = winreg.QueryValueEx(key, "ProxyServer")
+                except OSError:
+                    current = ""
+                # Бэкап пишем один раз и только для чужих настроек: там
+                # исходные значения пользователя. Существующий не
+                # перезаписываем — иначе повторный «включить» запомнил бы уже
+                # наш прокси и восстанавливать стало бы нечего.
+                if (str(current or "").strip() != own
+                        and _load_proxy_backup() is None):
+                    _store_proxy_backup(_read_proxy_values(key))
                 winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1)
-                winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ,
-                                  f"127.0.0.1:{port}")
+                winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, own)
                 winreg.SetValueEx(
                     key, "ProxyOverride", 0, winreg.REG_SZ,
                     _proxy_bypass_list(stream_via_proxy),
@@ -1105,6 +1268,19 @@ def set_system_proxy(enable: bool, port: int = DEFAULT_PORT,
                     # Не наш прокси (или его вообще нет) — не трогаем.
                     return {"ok": True, "enabled": True, "kept": True,
                             "server": str(current or "")}
+                backup = _load_proxy_backup()
+                saved_server = str((backup or {}).get("ProxyServer") or "").strip()
+                if backup is not None and saved_server != own:
+                    # Пользовательских настроек с тех пор не касались (иначе
+                    # ProxyServer был бы другим) — возвращаем их.
+                    _write_proxy_values(key, backup)
+                    _drop_proxy_backup()
+                    _refresh_wininet()
+                    return {"ok": True, "enabled": bool(backup.get("ProxyEnable")),
+                            "restored": True,
+                            "server": str(backup.get("ProxyServer") or "")}
+                # Бэкапа нет (или в нём наш же прокси) — просто выключаем.
+                _drop_proxy_backup()
                 winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
                 try:
                     winreg.DeleteValue(key, "ProxyServer")

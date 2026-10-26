@@ -8,6 +8,10 @@ Xray надзиратель **не перезапускает**: смена ма
 живой туннель посреди работы. Явное применение — только кнопка UI
 (``routes.apply_now``).
 
+Исключение — мёртвый сервер: если проба через туннель провалилась
+(``health`` вернул ``vpn: bad``), надзиратель переключается на другой сервер,
+но не чаще раза в 30 минут.
+
 Любая ошибка одного шага превращается в предупреждение: надзиратель не должен
 ронять приложение. Одинаковые предупреждения пишутся в журнал не чаще раза в
 час.
@@ -25,6 +29,12 @@ ZAPRET_WARN = "zapret остановлен — запустите вручную
 _REPEAT_SECONDS = 3600
 #: Сколько ждать открытия порта после запуска tg-ws-proxy.
 _TGWS_PORT_WAIT = 3.0
+#: Переключение сервера из-за мёртвого VPN — не чаще раза в 30 минут: проход
+#: надзирателя идёт каждые ``guard_minutes``, а живой сервер может просто не
+#: ответить на одну пробу. Гонять серверы по кругу нельзя.
+_VPN_SWITCH_SECONDS = 1800
+_VPN_SWITCH_AT = 0.0
+_VPN_HEAL_DELAY = "VPN не отвечает — переключение сервера отложено"
 
 
 def overdue(last_ts, minutes: int) -> bool:
@@ -117,12 +127,29 @@ def _heal_zapret(status_state: dict) -> list[dict]:
     return [_action("warn", ZAPRET_WARN)]
 
 
+def _vpn_switch_allowed() -> bool:
+    """Прошло ли достаточно времени с прошлой попытки переключить сервер."""
+    return time.time() - _VPN_SWITCH_AT >= _VPN_SWITCH_SECONDS
+
+
 def _heal_vpn(cfg: dict, proxy: dict, health: dict | None) -> list[dict]:
-    if not proxy.get("running") or not health:
+    """Переключает сервер, если проба через туннель провалилась.
+
+    Вызывается из ``heal`` с теми же данными, что уже собрал ``health.collect``:
+    лишних сетевых проверок не делает. Между попытками не меньше
+    ``_VPN_SWITCH_SECONDS`` — иначе десятиминутный проход гонял бы серверы
+    из-за одной медленной пробы.
+    """
+    global _VPN_SWITCH_AT
+    if not (proxy or {}).get("running") or not health:
         return []
     vpn = next((i for i in (health.get("items") or []) if i.get("id") == "vpn"), None)
     if not vpn or vpn.get("state") != "bad":
         return []
+    if not _vpn_switch_allowed():
+        _log_throttled(_VPN_HEAL_DELAY)
+        return []
+    _VPN_SWITCH_AT = time.time()
     try:
         from . import xray
 
@@ -171,6 +198,8 @@ def heal(cfg: dict, status_state: dict, proxy: dict,
     done: list[dict] = []
     for step in (
         lambda: _heal_tgws(cfg or {}, status_state),
+        # VPN — по уже собранному отчёту: сервер мёртв, значит нужен другой.
+        lambda: _heal_vpn(cfg or {}, proxy, health),
         lambda: _heal_zapret(status_state),
         lambda: _heal_routes(cfg or {}),
     ):

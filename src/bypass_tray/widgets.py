@@ -596,12 +596,18 @@ class AnimatedSection(tk.Canvas):
         self._bg = bg or theme.card
         self._open = False
         self._pack_info: dict | None = None
+        self._height = 0
+        self._on_height = None
         super().__init__(master, bg=self._bg, bd=0, highlightthickness=0,
                          height=0)
         self.content = tk.Frame(self, bg=self._bg)
         self._item = self.create_window(0, 0, anchor="nw", window=self.content)
         self.itemconfigure(self._item, state="hidden")
         self.bind("<Configure>", self._on_configure)
+        # Открытая секция должна расти вместе с содержимым: после
+        # «Обновить список» в ней появляются новые строки, а высота Canvas
+        # сама по себе не меняется — строки оставались невидимыми.
+        self.content.bind("<Configure>", self._on_content)
 
     def is_open(self) -> bool:
         return self._open
@@ -612,8 +618,28 @@ class AnimatedSection(tk.Canvas):
         except tk.TclError:
             pass
 
+    def _on_content(self, _event=None) -> None:
+        """Подогнать высоту секции под выросшее содержимое."""
+        if not self._open:
+            return
+        try:
+            target = max(1, self.content.winfo_reqheight())
+        except tk.TclError:
+            return
+        if target == self._height:
+            return
+        self._height = target
+        try:
+            self.configure(height=target)
+        except tk.TclError:
+            return
+        # Окно/страница тоже должны узнать о новой высоте.
+        if callable(self._on_height):
+            self._on_height()
+
     def expand(self, on_height=None) -> None:
         self._open = True
+        self._on_height = on_height
         try:
             if not self.winfo_manager() and self._pack_info:
                 info = {key: value for key, value in self._pack_info.items()
@@ -622,6 +648,7 @@ class AnimatedSection(tk.Canvas):
             self.itemconfigure(self._item, state="normal")
             self.update_idletasks()
             target = max(1, self.content.winfo_reqheight())
+            self._height = target
             self.configure(height=target)
             self.update_idletasks()
         except tk.TclError:
@@ -631,6 +658,7 @@ class AnimatedSection(tk.Canvas):
 
     def collapse(self, on_height=None) -> None:
         self._open = False
+        self._height = 0
         try:
             self.configure(height=0)
             self.itemconfigure(self._item, state="hidden")
@@ -722,13 +750,34 @@ class ScrollBody(tk.Frame):
             self.bind_tree(child)
 
     def bind_wheel(self, widget: tk.Misc) -> None:
-        """Вешает колесо на один виджет; повторно обработчик не дублирует."""
+        """Навесить колесо на виджет дерева; повторно обработчик не плодим.
+
+        Проверяем именно свою привязку: чужая привязка на этом виджете не
+        повод считать колесо навешенным (раньше из-за неё прокрутка над
+        виджетом не работала).
+        """
+        bound = getattr(widget, "_scroll_wheel_ids", None)
+        if bound is None:
+            bound = {}
+            try:
+                widget._scroll_wheel_ids = bound  # type: ignore[attr-defined]
+            except (AttributeError, tk.TclError):
+                return
         for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
             try:
-                if not widget.bind(sequence):
-                    widget.bind(sequence, self._wheel, add="+")
+                current = widget.bind(sequence)
             except tk.TclError:
                 continue
+            mine = bound.get(sequence)
+            if mine and str(mine) in str(current):
+                continue
+            try:
+                funcid = widget.bind(sequence, self._wheel, add="+")
+            except tk.TclError:
+                continue
+            if funcid:
+                bound[sequence] = funcid
+
 
     def _wheel_step(self, event) -> int:
         number = getattr(event, "num", None)

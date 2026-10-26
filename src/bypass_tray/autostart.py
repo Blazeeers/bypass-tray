@@ -42,11 +42,19 @@ def _ps_quote(value: str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
+def _discard(path: Path) -> None:
+    """Убирает временный файл; сбой очистки не должен скрывать причину."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def enable() -> bool:
     """Создаёт ярлык в автозагрузке. False — если не вышло.
 
-    Старый ярлык сначала удаляется: иначе после смены пути остался бы ярлык на
-    прежнее место, а проверка «ярлык есть» засчитывала бы чужой файл.
+    Новый ярлык собирается во временном файле и подменяет старый атомарно:
+    при сбое PowerShell прежний автозапуск остаётся рабочим.
     """
     target = link_path()
     if not target.parent.is_dir():
@@ -62,14 +70,19 @@ def enable() -> bool:
         if not executable.is_file():
             return False
         workdir = project_root()
+    # Ярлык собирается рядом и подменяет старый только после успеха: если
+    # PowerShell недоступен, прежний автозапуск остаётся на месте.
+    # WScript.Shell требует имя с расширением .lnk: иначе CreateShortcut
+    # падает, и автозапуск не создаётся вовсе.
+    temp = target.with_name(f"{target.stem}.tmp-{os.getpid()}{target.suffix}")
     try:
-        target.unlink(missing_ok=True)
+        temp.unlink(missing_ok=True)
     except OSError:
         return False
     script = (
         "$ErrorActionPreference = 'Stop';"
         "$s = (New-Object -ComObject WScript.Shell).CreateShortcut("
-        + _ps_quote(str(target)) + ");"
+        + _ps_quote(str(temp)) + ");"
         "$s.TargetPath = " + _ps_quote(str(executable)) + ";"
         "$s.WorkingDirectory = " + _ps_quote(str(workdir)) + ";"
         + ("$s.IconLocation = " + _ps_quote(str(executable) + ",0") + ";"
@@ -82,8 +95,15 @@ def enable() -> bool:
             capture_output=True, timeout=30, creationflags=CREATE_NO_WINDOW,
         )
     except (OSError, subprocess.SubprocessError):
+        _discard(temp)
         return False
-    if completed.returncode != 0:
+    if completed.returncode != 0 or not temp.is_file():
+        _discard(temp)
+        return False
+    try:
+        os.replace(temp, target)
+    except OSError:
+        _discard(temp)
         return False
     return target.is_file()
 

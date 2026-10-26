@@ -80,6 +80,8 @@ STATE_COLORS = {
     "ok": "#22A06B",
     "warn": "#E0902B",
     "bad": "#DC3D43",
+    "busy": "#2F6FED",
+    "idle": "#8A98A8",
     "dim": "#8A98A8",
 }
 

@@ -40,6 +40,16 @@ _EMOJI_RE = re.compile(
     "[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F\u200D]"
 )
 _STATE_WORDS = {"ok": "ок", "warn": "внимание", "bad": "сбой", "off": "выкл"}
+#: Вердикт старого кэша → трёхцветный уровень (совместимость).
+_VERDICT_LEVELS = {"ok": "ok", "warn": "degraded", "fail": "down"}
+
+
+def report_level(report: dict) -> str:
+    """Уровень отчёта health; старый кэш без ``level`` — по вердикту."""
+    level = str((report or {}).get("level") or "")
+    if level:
+        return level
+    return _VERDICT_LEVELS.get(str((report or {}).get("verdict") or ""), "")
 
 SERVICES = (
     ("zapret", "zapret · обход DPI", "zap"),
@@ -119,19 +129,55 @@ def format_uptime(seconds) -> str:
     return f"{minutes}:{secs:02d}"
 
 
-def _work_area(root: tk.Misc) -> tuple[int, int, int, int]:
-    """Рабочая область Windows без панели задач; fallback — весь экран."""
+def _window_hwnd(root: tk.Misc) -> int:
+    """HWND рамки окна Tk; 0 — если Windows недоступен."""
+    if not sys.platform.startswith("win"):
+        return 0
     try:
         import ctypes
-        from ctypes import wintypes
 
-        rect = wintypes.RECT()
-        # SPI_GETWORKAREA = 0x0030
-        if ctypes.windll.user32.SystemParametersInfoW(
-                0x0030, 0, ctypes.byref(rect), 0):
-            return rect.left, rect.top, rect.right, rect.bottom
+        return int(ctypes.windll.user32.GetParent(root.winfo_id())
+                   or root.winfo_id() or 0)
     except Exception:  # noqa: BLE001
-        pass
+        return 0
+
+
+def _work_area(root: tk.Misc) -> tuple[int, int, int, int]:
+    """Рабочая область монитора, на котором стоит окно, без панели задач.
+
+    ``SPI_GETWORKAREA`` отдаёт область основного монитора, поэтому на втором
+    экране потолок высоты иначе считается неверно. Fallback — весь экран.
+    """
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class _MonitorInfo(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", wintypes.DWORD),
+                    ("rcMonitor", wintypes.RECT),
+                    ("rcWork", wintypes.RECT),
+                    ("dwFlags", wintypes.DWORD),
+                ]
+
+            hwnd = _window_hwnd(root)
+            if hwnd:
+                # MONITOR_DEFAULTTONEAREST = 2
+                monitor = ctypes.windll.user32.MonitorFromWindow(hwnd, 2)
+                info = _MonitorInfo()
+                info.cbSize = ctypes.sizeof(_MonitorInfo)
+                if monitor and ctypes.windll.user32.GetMonitorInfoW(
+                        monitor, ctypes.byref(info)):
+                    work = info.rcWork
+                    return work.left, work.top, work.right, work.bottom
+            rect = wintypes.RECT()
+            # SPI_GETWORKAREA = 0x0030
+            if ctypes.windll.user32.SystemParametersInfoW(
+                    0x0030, 0, ctypes.byref(rect), 0):
+                return rect.left, rect.top, rect.right, rect.bottom
+        except Exception:  # noqa: BLE001
+            pass
     return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
 
 
@@ -140,7 +186,8 @@ class Panel:
         self.controller = controller
         self._thread: threading.Thread | None = None
         self._root: tk.Tk | None = None
-        self._queue: queue.Queue[str] = queue.Queue()
+        #: команды панели (str) и итоги действий контроллера (tuple).
+        self._queue: queue.Queue[object] = queue.Queue()
         self._lock = threading.Lock()
         self._theme = Theme(False)
         self._images: list = []
@@ -166,7 +213,13 @@ class Panel:
         self._header_update: IconButton | None = None
         self._header_gear: IconButton | None = None
         self._header_back: IconButton | None = None
+        self._header_update_icon: tuple | None = None
+        self._header_update_text: str | None = None
         self._activity_period: tk.Label | None = None
+        #: Текст ошибки в подвале: держится до следующего удачного действия.
+        self._ui_error = ""
+        #: Действия контроллера, уже запущенные из панели (защита от двойного клика).
+        self._inflight: set = set()
 
         self._vpn: dict = {}
         self._services: dict[str, dict] = {}
@@ -281,7 +334,11 @@ class Panel:
         self._header_update = None
         self._header_gear = None
         self._header_back = None
+        self._header_update_icon = None
+        self._header_update_text = None
         self._activity_period = None
+        self._ui_error = ""
+        self._inflight = set()
         self._vpn = {}
         self._services = {}
         self._activity_rows = []
@@ -310,6 +367,13 @@ class Panel:
                 command = self._queue.get_nowait()
             except queue.Empty:
                 break
+            if isinstance(command, tuple):
+                # Итог действия контроллера из фонового потока.
+                try:
+                    self._handle_event(command)
+                except Exception as exc:  # noqa: BLE001
+                    self._report_ui_error(exc)
+                continue
             if command == "close":
                 try:
                     root.destroy()
@@ -343,11 +407,35 @@ class Panel:
         elif command == "render":
             self._render()
 
-    def _report_ui_error(self, exc: Exception) -> None:
-        """Показывает ошибку в подвале, не роняя цикл панели."""
+    def _handle_event(self, event: tuple) -> None:
+        """Итог действия, запущенного кнопкой: успех, отказ или исключение."""
+        kind, payload = event
+        if kind == "ok":
+            self._ui_error = ""
+        elif kind == "failed":
+            self._report_action_failed(str(payload))
+        elif kind == "error":
+            self._report_ui_error(payload, "действия")
+
+    def _report_ui_error(self, exc: Exception, label: str = "интерфейса") -> None:
+        """Показывает ошибку в подвале, не роняя цикл панели.
+
+        Текст остаётся до следующего успешного действия: иначе ближайший
+        ``_render_footer`` затрёт его через секунду.
+        """
+        self._ui_error = f"ошибка {label}: {type(exc).__name__}"
+        self._show_ui_error()
+
+    def _report_action_failed(self, name: str) -> None:
+        """Действие вернуло False — контроллер работу не начал (занят/нельзя)."""
+        self._ui_error = f"не выполнено: {name}"
+        self._show_ui_error()
+
+    def _show_ui_error(self) -> None:
+        if self._footer is None or not self._ui_error:
+            return
         try:
-            if self._footer is not None:
-                self._footer.configure(text=f"ошибка интерфейса: {type(exc).__name__}")
+            self._footer.configure(text=self._ui_error)
         except tk.TclError:
             pass
 
@@ -366,9 +454,18 @@ class Panel:
         try:
             self._render()
         except tk.TclError:
+            # Окно уже уничтожено — перерисовывать нечего.
             self._root = None
-            return
-        root.after(POLL_MS, self._tick)
+        except Exception as exc:  # noqa: BLE001
+            # Ошибка рендера не должна навсегда останавливать таймер:
+            # иначе залипают подзаголовок, кнопки и список серверов.
+            self._report_ui_error(exc)
+        finally:
+            if self._root is not None:
+                try:
+                    root.after(POLL_MS, self._tick)
+                except tk.TclError:
+                    self._root = None
 
     # ---- построение интерфейса --------------------------------------------
     def _icon(self, name: str, color: str, size: int = 20) -> ImageTk.PhotoImage:
@@ -542,9 +639,18 @@ class Panel:
         else:
             color = theme.header_dim
             tooltip = "Обновить всё"
-        button.set_image(self._icon("refresh", color, 20))
-        button.set_badge(theme.warn if outdated and not running else None)
-        button.set_tooltip(tooltip)
+        # Кнопка перерисовывается каждую секунду: set_image/set_tooltip зовём
+        # только при смене значения, иначе всплывающая подсказка гаснет на
+        # следующем тике.
+        badge = theme.warn if outdated and not running else None
+        icon_state = (color, badge)
+        if icon_state != self._header_update_icon:
+            self._header_update_icon = icon_state
+            button.set_image(self._icon("refresh", color, 20))
+            button.set_badge(badge)
+        if tooltip != self._header_update_text:
+            self._header_update_text = tooltip
+            button.set_tooltip(tooltip)
 
     def _on_section_height(self) -> None:
         """Колбэк анимации списка серверов: плавно подгоняет окно."""
@@ -559,7 +665,7 @@ class Panel:
         report = getattr(controller, "health_report", {}) or {}
         busy = getattr(controller, "busy", {}) or {}
         self._render_subtitle(
-            bool(proxy.get("running")), str(report.get("verdict") or ""),
+            bool(proxy.get("running")), report_level(report),
             busy, bool(getattr(controller, "health_running", False)))
 
     def _set_page_visible(self, show_settings: bool) -> None:
@@ -780,10 +886,10 @@ class Panel:
         busy = getattr(controller, "busy", {}) or {}
         health_running = bool(getattr(controller, "health_running", False))
         running = bool(proxy.get("running"))
-        verdict = str(report.get("verdict") or "")
+        level = report_level(report)
 
         if self._page_visible != "settings":
-            self._render_subtitle(running, verdict, busy, health_running)
+            self._render_subtitle(running, level, busy, health_running)
         self._render_vpn(proxy, busy)
         self._render_services(items, status, busy)
         self._render_activity()
@@ -792,7 +898,7 @@ class Panel:
         self._render_buttons(busy, health_running)
         self._fit(self._root)
 
-    def _render_subtitle(self, running: bool, verdict: str, busy: dict,
+    def _render_subtitle(self, running: bool, level: str, busy: dict,
                          health_running: bool) -> None:
         if self._subtitle is None:
             return
@@ -800,11 +906,11 @@ class Panel:
             text = "ПРОВЕРЯЮ…"
         elif not running:
             text = "VPN ВЫКЛЮЧЕН"
-        elif verdict == "fail":
+        elif level == "down":
             text = "VPN ВКЛЮЧЁН · ЕСТЬ СБОЙ"
-        elif verdict == "warn":
+        elif level == "degraded":
             text = "VPN ВКЛЮЧЁН · ТРЕБУЕТ ВНИМАНИЯ"
-        elif verdict == "ok":
+        elif level == "ok":
             text = "VPN ВКЛЮЧЁН · ВСЁ РАБОТАЕТ"
         else:
             text = "VPN ВКЛЮЧЁН · ПРОВЕРКА НЕ ЗАПУСКАЛАСЬ"
@@ -818,13 +924,17 @@ class Panel:
         running = bool(proxy.get("running"))
         busy_here = bool(busy.get("proxy") or proxy.get("busy"))
         port = proxy.get("port") or self.controller.cfg.get("xray_port", 10818)
-        verdict = str((getattr(self.controller, "health_report", {}) or {}).get("verdict") or "")
+        level = report_level(getattr(self.controller, "health_report", {}) or {})
 
         color = theme.dim
         word = "выключен"
         if running:
-            color = theme.bad if verdict == "fail" else theme.ok
-            word = "сбой" if verdict == "fail" else "включён"
+            if level == "down":
+                color, word = theme.bad, "сбой"
+            elif level == "degraded":
+                color, word = theme.warn, "внимание"
+            else:
+                color, word = theme.ok, "включён"
         self._set_icon(info["icon"], "shield", color, 22)
         info["chip"].set(word, color)
 
@@ -978,7 +1088,10 @@ class Panel:
             button.grid()
 
             if key == "zapret":
-                installed = bool(zapret_status.get("dir"))
+                # Служба Windows ставит zapret без каталога в конфиге:
+                # as_service=True означает «установлен» не хуже, чем dir.
+                installed = bool(zapret_status.get("dir")
+                                 or zapret_status.get("as_service"))
                 restart = bool(zapret_status.get("running"))
                 button.set_text("Перезапустить" if restart else "Запустить")
                 action = (self.controller.restart_zapret if restart
@@ -1043,6 +1156,10 @@ class Panel:
     def _render_footer(self, status: dict, busy: dict) -> None:
         if self._footer is None:
             return
+        if self._ui_error:
+            # Ошибку показываем вместо обычной строки, пока действие не пройдёт.
+            self._show_ui_error()
+            return
         stamp = getattr(self.controller, "updated_at", 0) or 0
         clock = time.strftime("%H:%M:%S", time.localtime(stamp or time.time()))
         cfg = getattr(self.controller, "cfg", {}) or {}
@@ -1071,22 +1188,27 @@ class Panel:
     def _header_height(self) -> int:
         return self._header.winfo_reqheight() if self._header is not None else 0
 
+    def _body_limit(self) -> int:
+        """Потолок высоты окна: 88 % рабочей области монитора, где стоит окно."""
+        root = self._root
+        if root is None:
+            return 0
+        _left, top, _right, bottom = _work_area(root)
+        return max(300, int(max(1, bottom - top) * BODY_RATIO))
+
     def _main_target_height(self) -> int:
         body = self._body.content_height() if self._body is not None else 0
         footer = self._footer.winfo_reqheight() if self._footer is not None else 0
         total = self._header_height() + body + footer + 12
-        root = self._root
-        if root is None:
-            return total
-        return min(total, int(root.winfo_screenheight() * BODY_RATIO))
+        limit = self._body_limit()
+        return min(total, limit) if limit else total
 
     def _settings_target_height(self) -> int:
         page = self._settings_page
         root = self._root
         if page is None or root is None:
             return self._main_target_height()
-        screen = root.winfo_screenheight()
-        max_page = max(320, int(screen * BODY_RATIO) - self._header_height() - 8)
+        max_page = max(320, self._body_limit() - self._header_height() - 8)
         return self._header_height() + min(max(320, page.height_request()), max_page)
 
     def _sync_stage_size(self) -> None:
@@ -1119,31 +1241,60 @@ class Panel:
     def _on_stage_configure(self, _event=None) -> None:
         self._sync_stage_size()
 
+    def _remember_origin(self) -> None:
+        """Запоминает живое положение окна: его мог перетащить пользователь."""
+        root = self._root
+        if root is None:
+            return
+        try:
+            if not root.winfo_ismapped():
+                return
+            self._origin_x = int(root.winfo_x())
+            self._origin_y = int(root.winfo_y())
+        except tk.TclError:
+            return
+
     def _height_limit(self) -> int:
-        """Максимальная client-высота ниже сохранённого y."""
+        """Максимальная client-высота ниже текущего верха окна."""
         root = self._root
         if root is None:
             return 300
-        title_h = max(0, root.winfo_rooty() - root.winfo_y())
+        try:
+            y = int(root.winfo_y()) if root.winfo_ismapped() else self._origin_y
+            title_h = max(0, root.winfo_rooty() - root.winfo_y())
+        except tk.TclError:
+            y, title_h = self._origin_y, 0
         work_bottom = _work_area(root)[3]
-        return max(300, work_bottom - self._origin_y - title_h - 16)
+        return max(300, work_bottom - y - title_h - 16)
 
     def _apply_height(self, height: int) -> None:
-        """Меняет только высоту; x/y фиксируются при первом показе."""
+        """Меняет высоту окна, не трогая его положение.
+
+        ``geometry`` с ``+x+y`` вызывается только при первом показе: иначе
+        каждую секунду окно возвращалось бы на сохранённое место и не давало
+        себя перетащить (а на втором мониторе телепортировалось на первый).
+        """
         root = self._root
         if root is None:
             return
         total = max(300, int(height))
-        screen = root.winfo_screenheight()
         if not self._placed:
+            screen = root.winfo_screenheight()
             self._origin_x = max(0, int(root.winfo_screenwidth() / 2 - WINDOW_W / 2))
             self._origin_y = max(0, int(screen / 2 - total / 2))
             self._placed = True
-        # Окно не двигаем: если новая высота не влезает в рабочую область
-        # ниже сохранённого y, режем высоту — страницы прокручиваются.
-        total = min(total, self._height_limit())
-        root.geometry(f"{WINDOW_W}x{total}+{self._origin_x}+{self._origin_y}")
-        self._last_height = total
+            # Окно ещё не показано — позицию задаём вместе с размером.
+            total = min(total, self._height_limit())
+            root.geometry(f"{WINDOW_W}x{total}+{self._origin_x}+{self._origin_y}")
+            self._last_height = total
+        else:
+            self._remember_origin()
+            total = min(total, self._height_limit())
+            if total == self._last_height:
+                return
+            # Только размер: без +x+y оконный менеджер место не меняет.
+            root.geometry(f"{WINDOW_W}x{total}")
+            self._last_height = total
         try:
             root.update_idletasks()
         except tk.TclError:
@@ -1198,14 +1349,28 @@ class Panel:
     def _call(self, fn, *args) -> None:
         """Просит контроллер выполнить действие; панель не блокируется.
 
-        Перерисовку просим через очередь команд: трогать Tk из фонового
-        потока нельзя.
+        Перерисовку и итог просим через очередь команд: трогать Tk из фонового
+        потока нельзя. Падение действия больше не проглатывается — ошибка
+        уходит в подвал, а ``False`` от контроллера значит «не выполнено».
         """
+        key = (fn, args)
+        # Нажатие помечаем сразу в UI-потоке: второй клик до ответа
+        # контроллера не должен запустить то же действие ещё раз.
+        if key in self._inflight:
+            return
+        self._inflight.add(key)
+        label = str(getattr(fn, "__name__", "") or "действие")
+
         def run() -> None:
+            note: tuple = ("ok", None)
             try:
-                fn(*args)
-            except Exception:  # noqa: BLE001
-                pass
+                if fn(*args) is False:
+                    note = ("failed", label)
+            except Exception as exc:  # noqa: BLE001
+                note = ("error", exc)
+            finally:
+                self._inflight.discard(key)
+            self._queue.put(note)
             self._queue.put("render")
 
         threading.Thread(target=run, daemon=True).start()

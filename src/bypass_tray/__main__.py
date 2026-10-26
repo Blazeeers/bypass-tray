@@ -151,6 +151,14 @@ def _set_app_user_model_id() -> None:
 
 
 def main() -> int:
+    # console=False: sys.stdout/stderr = None, и первый print() упал бы.
+    from . import runtime
+
+    runtime.ensure_streams()
+    # DPI-awareness пока НЕ включаем: панель сверстана в пиксельных константах
+    # (WINDOW_W, PAD, BODY_RATIO), и при 125-200% интерфейс стал бы мельче и
+    # теснее, чем растянутый Windows'ом. Нужна отдельная задача со scaling.
+    # runtime.enable_dpi_awareness()
     _set_app_user_model_id()
     parser = argparse.ArgumentParser(prog="bypass-tray")
     parser.add_argument("--status", action="store_true",
@@ -223,8 +231,13 @@ def main() -> int:
         return 0
 
     if args.status:
-        _print_json(status.collect(config.load_config()))
-        return 0
+        try:
+            result = status.collect(config.load_config())
+        except Exception as exc:  # noqa: BLE001
+            result = {"error": f"{type(exc).__name__}: {exc}"}
+        _print_json(result)
+        # Ненулевой код — сигнал скриптам, что статус собрать не удалось.
+        return 1 if result.get("error") else 0
 
     if args.sweep_strategies:
         from . import strategy

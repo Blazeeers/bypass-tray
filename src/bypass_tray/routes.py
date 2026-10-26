@@ -15,12 +15,17 @@ YouTube и Discord аудитом не управляются: их маршру
 from __future__ import annotations
 
 import concurrent.futures
+import http.client
 import json
+import os
+import socket
+import ssl
+import tempfile
 import time
 import urllib.parse
 from pathlib import Path
 
-from .config import atomic_write, config_dir
+from .config import atomic_write, config_dir, last_write_error
 
 #: Что проверяем по умолчанию. YouTube/Discord здесь нет намеренно: их закрывает
 #: zapret, а резервный режим включает сам Xray.
@@ -177,21 +182,141 @@ def _is_stream_domain(name: str, blocked: set[str]) -> bool:
 
 # ---- проверка и решение ---------------------------------------------------
 
+#: Признаки локального выпуска сертификата. Такой TLS-сбой говорит о доверии
+#: к хранилищу на этой машине, а не о недоступности сайта.
+_LOCAL_ISSUER_HINTS = ("localhost", "self", "local", "bypass")
+
+PROBE_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) bypass-tray"
+
+
+def _tls_error(result: dict) -> bool:
+    """Был ли провал именно TLS-ошибкой."""
+    error = str(result.get("error") or "")
+    return error == "tls" or error.endswith("SSLCertVerificationError")
+
+
+def _peer_certificate(host: str, port: int, timeout: float,
+                      proxy_port: int | None = None) -> tuple[bytes, int]:
+    """Сертификат узла и код HTTP-ответа — без проверки подписи.
+
+    Второй проход после TLS-ошибки. Сертификат и ответ доказывают, что узел
+    отвечает, а первая ошибка касалась только доверия к нему. Пустой
+    сертификат с нулевым кодом — оборванное рукопожатие (типовая сигнатура
+    ТСПУ и подмены сертификата провайдером).
+    """
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    connection = None
+    try:
+        if proxy_port:
+            connection = http.client.HTTPSConnection(
+                "127.0.0.1", int(proxy_port), timeout=timeout, context=context)
+            connection.set_tunnel(host, port)
+        else:
+            connection = http.client.HTTPSConnection(
+                host, port, timeout=timeout, context=context)
+        connection.request("GET", "/", headers={"User-Agent": PROBE_UA})
+        status = int(connection.getresponse().status)
+        sock = connection.sock
+        der = sock.getpeercert(binary_form=True) if sock is not None else b""
+        return der or b"", status
+    except (OSError, ValueError, http.client.HTTPException):
+        return b"", 0
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except OSError:
+                pass
+
+
+def _certificate_issuer(der: bytes) -> dict:
+    """Разобранный сертификат (``issuer``/``subject``) или ``{}``.
+
+    Разбор идёт через ``ssl`` — отдельная зависимость ради одного поля не
+    нужна. Сертификат передаётся файлом: другого входа у разборщика нет.
+    """
+    if not der:
+        return {}
+    decode = getattr(getattr(ssl, "_ssl", None), "_test_decode_cert", None)
+    if decode is None:
+        return {}
+    path = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+                "w", suffix=".pem", delete=False, encoding="ascii") as handle:
+            handle.write(ssl.DER_cert_to_PEM_cert(der))
+            path = handle.name
+        return decode(path) or {}
+    except (OSError, ValueError):
+        return {}
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+def _issuer_text(decoded: dict) -> str:
+    names = []
+    for field in decoded.get("issuer") or ():
+        for key, value in field:
+            names.append(f"{key}={value}")
+    return " ".join(names).lower()
+
+
+def _issuer_is_local(decoded: dict) -> bool:
+    """Выпущен ли сертификат локально или сам собой (self-signed)."""
+    if not decoded:
+        return False
+    if decoded.get("subject") == decoded.get("issuer"):
+        return True
+    issuer = _issuer_text(decoded)
+    hints = list(_LOCAL_ISSUER_HINTS)
+    try:
+        host = socket.gethostname().strip().lower()
+    except OSError:
+        host = ""
+    if len(host) >= 3:
+        hints.append(host)
+    return any(hint in issuer for hint in hints)
+
 
 def probe(domain: str, proxy_port: int | None = None, timeout: float = 5.0) -> dict:
-    """Проверяет домен: напрямую или через прокси (``proxy_port``)."""
+    """Проверяет домен: напрямую или через прокси (``proxy_port``).
+
+    TLS-сбой сам по себе недоступности не доказывает — и не опровергает.
+    Обрыв рукопожатия (сигнатура ТСПУ) и подмена сертификата провайдером
+    выглядят одинаково, поэтому после такой ошибки идёт второй проход без
+    проверки подписи. Достижимым домен считается, только если узел предъявил
+    сертификат **и** ответил, а сертификат выпущен локально или сам собой:
+    тогда проблема в хранилище этой машины. Публичный сертификат при
+    непройденной проверке — признак подмены, и это провал.
+    """
     from . import health
 
     name = clean_domain(domain)
     if not name:
         return {"ok": False, "status": 0, "ms": 0, "error": "пустой домен"}
     result = health._http(f"https://{name}/", proxy_port, timeout)
-    if (not result.get("ok")
-            and (result.get("error") == "tls"
-                 or str(result.get("error") or "").endswith("SSLCertVerificationError"))):
-        # TLS-ошибка локального хранилища не означает недоступность сайта.
-        result = {**result, "ok": True, "error": "tls"}
-    return result
+    if result.get("ok") or not _tls_error(result):
+        return result
+    der, status = _peer_certificate(name, 443, timeout, proxy_port)
+    if not der or not 0 < status < 500:
+        # Сертификата нет: рукопожатие оборвано, домен недоступен.
+        return {**result, "ok": False, "error": "tls"}
+    decoded = _certificate_issuer(der)
+    local = _issuer_is_local(decoded)
+    return {
+        **result,
+        "ok": local,
+        "status": status,
+        "error": "tls",
+        "tls_local": local,
+        "tls_issuer": _issuer_text(decoded)[:120],
+    }
 
 
 def decide(direct_ok: bool, proxy_ok: bool) -> str:
@@ -237,6 +362,10 @@ def audit(cfg: dict, proxy_port: int | None = None,
 
     Если прокси не запущен, проверка идёт только напрямую, а провал даёт
     маршрут ``unknown`` — такой результат не сохраняется.
+
+    ``full`` в результате — аудит прошёл весь набор по умолчанию. Явно
+    заданный список доменов делает аудит частичным: выводы по нему не
+    доказывают, что остальные сохранённые маршруты устарели.
     """
     state = _probe_state()
     running = bool(state.get("running"))
@@ -290,7 +419,8 @@ def audit(cfg: dict, proxy_port: int | None = None,
             broken.append(name)
         items.append({"domain": name, "direct": direct, "proxy": via, "route": route})
 
-    return {"at": time.time(), "proxy": running, "items": items, "broken": broken}
+    return {"at": time.time(), "proxy": running, "domains": names,
+            "full": not domains, "items": items, "broken": broken}
 
 
 # ---- оверрайды ------------------------------------------------------------
@@ -328,10 +458,15 @@ def load_overrides() -> dict:
     return dict(_load_file()["routes"])
 
 
-def save_overrides(data: dict, at: float | None = None) -> None:
-    """Пишет маршруты и время аудита атомарно."""
+def save_overrides(data: dict, at: float | None = None) -> bool:
+    """Пишет маршруты и время аудита атомарно.
+
+    ``False`` — запись не удалась: тогда сообщать «маршруты обновлены» нельзя,
+    и перезапускать Xray незачем — он прочитал бы прежний файл.
+    """
     payload = {"at": float(at if at is not None else time.time()), "routes": data}
-    atomic_write(overrides_path(), json.dumps(payload, ensure_ascii=False, indent=2))
+    return bool(atomic_write(overrides_path(),
+                             json.dumps(payload, ensure_ascii=False, indent=2)))
 
 
 def apply_audit(result: dict, cfg: dict | None = None) -> dict:
@@ -341,11 +476,16 @@ def apply_audit(result: dict, cfg: dict | None = None) -> dict:
     такие домены не перезаписываются (и старый оверрайд для них удаляется).
 
     Сохраняются и ``direct``, и ``proxy``: direct — тоже решение аудита, а не
-    отсутствие записи. ``unknown`` не сохраняется вовсе. Запись удаляется
-    только если домен больше не аудируется. У неизменившегося маршрута
-    сохраняется исходное ``since``.
+    отсутствие записи. ``unknown`` не сохраняется вовсе.
 
-    Возвращает ``{"changed": [...], "overrides": {...}}``.
+    Прунинг — только у полного аудита (``result["full"]``) или по явному
+    списку ``result["prune_domains"]``: тогда удаляется запись домена, который
+    в этот раз не проверялся, то есть выпал из аудита. Частичный аудит не
+    трогает маршруты, которых он не касался: стереть лишнее хуже, чем
+    оставить. У неизменившегося маршрута сохраняется исходное ``since``.
+
+    Возвращает ``{"changed": [...], "overrides": {...}, "saved": bool}``;
+    при неудачной записи ``changed`` пуст и есть ``error``.
     """
     at = float(result.get("at") or time.time())
     overrides = dict(_load_file()["routes"])
@@ -386,12 +526,26 @@ def apply_audit(result: dict, cfg: dict | None = None) -> dict:
             "since": old_since if same and old_since else at,
             "checked": at,
         }
-    for domain in sorted(overrides):
-        if domain not in audited:
-            overrides.pop(domain, None)
-            changed.append(domain)
-    save_overrides(overrides, at=at)
-    return {"changed": changed, "overrides": overrides}
+    scope = result.get("prune_domains")
+    if isinstance(scope, (list, tuple)):
+        prune_set = {clean_domain(str(name)) for name in scope}
+        prune_set.discard("")
+    elif result.get("full") is True:
+        # Полный аудит: всё, что не проверено в этот раз, из маршрутов уходит.
+        prune_set = None
+    else:
+        prune_set = set()
+    if prune_set is None or prune_set:
+        for domain in sorted(overrides):
+            if prune_set is not None and domain not in prune_set:
+                continue
+            if domain not in audited:
+                overrides.pop(domain, None)
+                changed.append(domain)
+    if not save_overrides(overrides, at=at):
+        return {"changed": [], "overrides": overrides, "saved": False,
+                "error": last_write_error()}
+    return {"changed": changed, "overrides": overrides, "saved": True}
 
 
 def _domains_by_route(route: str) -> list[str]:
@@ -403,7 +557,12 @@ def _domains_by_route(route: str) -> list[str]:
 
 
 def proxy_domains() -> list[str]:
-    """Домены, которые аудит требует вести через прокси."""
+    """Домены, которые аудит требует вести через прокси.
+
+    В конфиге Xray они должны стоять **выше** ``geosite:category-ru`` и
+    ``geoip:ru``: заблокированный ресурс на российском хостинге иначе
+    попадёт в правило «РФ — напрямую» и останется недоступным.
+    """
     return _domains_by_route("proxy")
 
 
@@ -444,9 +603,14 @@ def apply_now(cfg: dict) -> dict:
     """
     result = audit(cfg)
     applied = apply_audit(result, cfg)
+    if not applied.get("saved", True):
+        # Запись не удалась: применять нечего, Xray читал бы прежний файл.
+        return {"changed": 0, "need_restart": False, "restarted": False,
+                "saved": False, "error": applied.get("error") or ""}
     changed = len(applied.get("changed") or [])
     if not changed:
-        return {"changed": 0, "need_restart": False, "restarted": False}
+        return {"changed": 0, "need_restart": False, "restarted": False,
+                "saved": True}
     from . import xray as xray_module
 
     restarted = False

@@ -81,3 +81,26 @@ def ensure_streams() -> None:
     if sys.stderr is None:
         sys.stderr = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115
 
+
+def enable_dpi_awareness() -> bool:
+    """Делает процесс DPI-осведомлённым, чтобы панель не размывалась.
+
+    Без этого Windows при масштабе 125–200% растягивает готовую картинку
+    окна, и интерфейс вместе со значками выглядит мыльным. Контекст ``-4`` —
+    per-monitor v2. Если осведомлённость уже задана (повторный вызов,
+    манифест) или Windows старше 10 1703, вызов просто не удаётся: это не
+    ошибка, работаем дальше.
+    """
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        # Типы задаются явно: без argtypes ctypes передаст 32-битный int,
+        # а API ждёт значение размером с HANDLE.
+        user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        user32.SetProcessDpiAwarenessContext.restype = ctypes.c_bool
+        return bool(user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)))
+    except Exception:  # noqa: BLE001
+        return False

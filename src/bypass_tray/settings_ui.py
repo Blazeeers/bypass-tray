@@ -19,6 +19,66 @@ from .widgets import (
     Chip, PillButton, ScrollBody, Segmented, ToggleSwitch, Tooltip, rounded_rect,
 )
 
+PORT_MIN = 1024
+PORT_MAX = 65535
+
+
+def _text_value(cfg: dict, key: str) -> str:
+    """Строковое поле конфига: ``None`` и не-строки читаются как пустая строка."""
+    value = cfg.get(key)
+    return value if isinstance(value, str) else ""
+
+
+def _port_text(cfg: dict) -> str:
+    """Порт для поля ввода.
+
+    ``None``/bool не должны показываться как «None»: подставляем порт по
+    умолчанию. Кривое, но заданное значение показываем как есть — пусть
+    пользователь увидит его и исправит, а «Сохранить» объяснит ошибку.
+    """
+    raw = cfg.get("xray_port")
+    if raw is None or isinstance(raw, bool):
+        return str(xray.DEFAULT_PORT)
+    text = str(raw).strip()
+    return text or str(xray.DEFAULT_PORT)
+
+
+def _parse_port(text: str) -> tuple[int | None, str]:
+    """Порт из поля ввода: ``(port, "")`` или ``(None, причина)``."""
+    raw = str(text or "").strip()
+    if not raw:
+        return xray.DEFAULT_PORT, ""
+    try:
+        value = int(raw)
+    except ValueError:
+        return None, f"Порт — число от {PORT_MIN} до {PORT_MAX}"
+    if not PORT_MIN <= value <= PORT_MAX:
+        return None, f"Порт должен быть от {PORT_MIN} до {PORT_MAX}"
+    return value, ""
+
+
+def _merge_legacy_routes(cfg: dict) -> None:
+    """Переносит старые списки доменов в ``xray_routes``, затем чистит их.
+
+    Раньше сохранение обнуляло ``xray_direct_domains``/``xray_extra_domains``
+    безусловно — введённое вручную пропадало. Теперь значения становятся
+    явными правилами (правила из формы главнее), только после этого списки
+    пустеют.
+    """
+    raw_mapping = cfg.get("xray_routes")
+    mapping = dict(raw_mapping) if isinstance(raw_mapping, dict) else {}
+    for key, route in (("xray_direct_domains", "direct"),
+                       ("xray_extra_domains", "proxy")):
+        values = cfg.get(key)
+        if isinstance(values, (list, tuple)):
+            for raw in values:
+                name = routes.normalize_user_domain(raw)
+                if name:
+                    mapping.setdefault(name, route)
+        cfg[key] = []
+    cfg["xray_routes"] = mapping
+
+
 BEHAVIOR_TIPS = {
     "autostart": "Запускать «Обходы» при входе в Windows и подключать VPN, "
                  "если включено автоподключение.",
@@ -46,6 +106,10 @@ class SettingsPage(tk.Frame):
         self.toggles: dict[str, ToggleSwitch] = {}
         self.rules: dict[str, str] = {}
         self.vars: dict[str, tk.Variable] = {}
+        self.entries: dict[str, ttk.Entry] = {}
+        #: Правила, которые на момент последней синхронизации лежали в конфиге:
+        #: по ним видно, есть ли несохранённые правки маршрутов.
+        self._saved_rules: dict[str, str] | None = None
         self._blocked_busy = False
         self._blocked_result = None
         self._blocked_text = ""
@@ -73,7 +137,19 @@ class SettingsPage(tk.Frame):
         entry = ttk.Entry(parent, style="Settings.TEntry",
                           textvariable=self.vars[key], font=self.theme.font(9))
         entry.pack(fill="x", ipady=3)
+        self.entries[key] = entry
         return entry
+
+    def _mark_entry_error(self, key: str, error: bool) -> None:
+        """Подсветить поле с неверным значением (или снять подсветку)."""
+        entry = self.entries.get(key)
+        if entry is None:
+            return
+        try:
+            entry.configure(style="SettingsError.TEntry" if error
+                            else "Settings.TEntry")
+        except tk.TclError:
+            pass
 
     def _build(self) -> None:
         theme = self.theme
@@ -93,6 +169,9 @@ class SettingsPage(tk.Frame):
         style.configure("Settings.TEntry", fieldbackground=theme.btn,
                         foreground=theme.text, bordercolor=theme.card_border,
                         lightcolor=theme.card_border, darkcolor=theme.card_border)
+        style.configure("SettingsError.TEntry", fieldbackground=theme.btn,
+                        foreground=theme.text, bordercolor=theme.bad,
+                        lightcolor=theme.bad, darkcolor=theme.bad)
 
         self._actions = tk.Frame(self, bg=theme.bg)
         self._actions.pack(side="bottom", fill="x", padx=16, pady=(8, 12))
@@ -103,13 +182,14 @@ class SettingsPage(tk.Frame):
 
         cfg = dict(self.controller.cfg or {})
         self.vars = {
-            "xray_subscription": tk.StringVar(value=cfg.get("xray_subscription", "")),
-            "xray_port": tk.StringVar(value=str(cfg.get("xray_port", xray.DEFAULT_PORT))),
+            "xray_subscription": tk.StringVar(
+                value=_text_value(cfg, "xray_subscription")),
+            "xray_port": tk.StringVar(value=_port_text(cfg)),
             "xray_system_proxy": tk.BooleanVar(value=bool(cfg.get("xray_system_proxy", True))),
             "xray_stream_fallback": tk.BooleanVar(
                 value=bool(cfg.get("xray_stream_fallback", True))),
-            "zapret_dir": tk.StringVar(value=cfg.get("zapret_dir", "")),
-            "tgws_exe": tk.StringVar(value=cfg.get("tgws_exe", "")),
+            "zapret_dir": tk.StringVar(value=_text_value(cfg, "zapret_dir")),
+            "tgws_exe": tk.StringVar(value=_text_value(cfg, "tgws_exe")),
         }
 
         # --- поведение (три тумблера применяются сразу, YouTube — по «Сохранить»)
@@ -294,28 +374,62 @@ class SettingsPage(tk.Frame):
         self.reload()
 
     # ---- данные -----------------------------------------------------------
-    def revert(self) -> None:
-        """Кнопка «Закрыть»: вернуть панель на главную."""
+    def _routes_dirty(self) -> bool:
+        """Отличаются ли правила на экране от тех, что лежат в конфиге."""
+        if self._saved_rules is None:
+            return bool(self.rules)
+        return self.rules != self._saved_rules
+
+    def _persist_routes(self) -> bool:
+        """Тихо записать маршруты из формы, не трогая остальные поля.
+
+        Нужно при закрытии: брошенное правило не должно пропадать. Прокси
+        отсюда не перезапускаем — применение остаётся за «Сохранить».
+        """
+        cfg = dict(self.controller.cfg or {})
+        cfg["xray_routes"] = dict(self.rules)
+        if not config.save_config(cfg):
+            return False
+        self.controller.cfg = cfg
+        self._saved_rules = dict(self.rules)
+        return True
+
+    def revert(self) -> bool:
+        """Кнопка «Закрыть»: сохранить маршруты и вернуть панель на главную.
+
+        Правки маршрутов раньше терялись молча: добавил правило, закрыл
+        настройки — правила нет. Теперь при закрытии изменённые правила
+        записываются в config.json.
+        """
+        if self._routes_dirty() and not self._persist_routes():
+            activity.log("не сохранил маршруты: config.json недоступен",
+                         kind="warn")
         self._busy = False
         self._blocked_busy = False
         self._blocked_result = None
         self._blocked_run += 1
         if callable(self._on_close):
             self._on_close()
+        return True
 
     _close = revert
 
     def reload(self) -> None:
-        """Перечитывает конфиг, не пересоздавая страницу."""
+        """Перечитывает конфиг, не пересоздавая страницу.
+
+        Несохранённые правки маршрутов не затираются: иначе добавленное
+        правило исчезало при повторном открытии настроек.
+        """
         cfg = dict(self.controller.cfg or {})
         if "xray_subscription" in self.vars:
-            self.vars["xray_subscription"].set(cfg.get("xray_subscription", ""))
-            self.vars["xray_port"].set(str(cfg.get("xray_port", xray.DEFAULT_PORT)))
+            self.vars["xray_subscription"].set(_text_value(cfg, "xray_subscription"))
+            self.vars["xray_port"].set(_port_text(cfg))
             self.vars["xray_system_proxy"].set(bool(cfg.get("xray_system_proxy", True)))
             self.vars["xray_stream_fallback"].set(
                 bool(cfg.get("xray_stream_fallback", True)))
-            self.vars["zapret_dir"].set(cfg.get("zapret_dir", ""))
-            self.vars["tgws_exe"].set(cfg.get("tgws_exe", ""))
+            self.vars["zapret_dir"].set(_text_value(cfg, "zapret_dir"))
+            self.vars["tgws_exe"].set(_text_value(cfg, "tgws_exe"))
+            self._mark_entry_error("xray_port", False)
         values = {
             "autostart": bool(cfg.get("autoconnect")),
             "quiet": bool(cfg.get("quiet_icon", True)),
@@ -333,7 +447,10 @@ class SettingsPage(tk.Frame):
             name = routes.normalize_user_domain(raw)
             if name and str(route) in ("direct", "proxy"):
                 loaded[name] = str(route)
-        self.rules = loaded
+        if self._saved_rules is None or self.rules == self._saved_rules:
+            self.rules = loaded
+            self._saved_rules = dict(loaded)
+        # иначе на экране есть несохранённые правки — их не выкидываем
         self._blocked_busy = False
         self._blocked_result = None
         self._blocked_text = ""
@@ -461,7 +578,7 @@ class SettingsPage(tk.Frame):
         self._refresh_blocked_status()
         self.blocked_progress.configure(text="Список обновлён", fg=self.theme.ok)
         restart = getattr(self.controller, "restart_proxy", None)
-        if callable(restart) and self.controller.proxy.get("running"):
+        if callable(restart) and self._proxy_running():
             if restart() is False:
                 self.blocked_progress.configure(
                     text="Обновлено, но прокси занят — перезапустите вручную",
@@ -614,12 +731,19 @@ class SettingsPage(tk.Frame):
         self._refresh_status()
 
     # ---- сохранение --------------------------------------------------------
-    def _save(self) -> None:
-        cfg = dict(self.controller.cfg)
-        try:
-            port = int(str(self.vars["xray_port"].get()).strip() or xray.DEFAULT_PORT)
-        except ValueError:
-            port = xray.DEFAULT_PORT
+    def _proxy_running(self) -> bool:
+        """Работает ли прокси (``controller.proxy`` может быть ``None``)."""
+        proxy = getattr(self.controller, "proxy", None)
+        return bool(isinstance(proxy, dict) and proxy.get("running"))
+
+    def _save(self) -> bool:
+        cfg = dict(self.controller.cfg or {})
+        port, port_error = _parse_port(self.vars["xray_port"].get())
+        if port is None:
+            self._mark_entry_error("xray_port", True)
+            self.progress_label.configure(text=port_error, fg=self.theme.bad)
+            return False
+        self._mark_entry_error("xray_port", False)
         cfg["xray_subscription"] = self.vars["xray_subscription"].get().strip()
         cfg["xray_port"] = port
         cfg["xray_system_proxy"] = bool(self.vars["xray_system_proxy"].get())
@@ -627,25 +751,27 @@ class SettingsPage(tk.Frame):
         cfg["blocked_list_enabled"] = bool(self.blocked_toggle.get())
         cfg["youtube_via_vpn"] = bool(self.toggles["youtube"].get())
         cfg["xray_routes"] = dict(self.rules)
-        cfg["xray_extra_domains"] = []
-        cfg["xray_direct_domains"] = []
+        # Старые списки не обнуляем в никуда: их значения становятся правилами.
+        _merge_legacy_routes(cfg)
         cfg["zapret_dir"] = self.vars["zapret_dir"].get().strip()
         cfg["tgws_exe"] = self.vars["tgws_exe"].get().strip()
         if not config.save_config(cfg):
             self.progress_label.configure(
                 text="Не сохранено: config.json недоступен", fg=self.theme.warn)
-            return
+            return False
         self.controller.cfg = cfg
+        self._saved_rules = dict(self.rules)
         # Перечитываем тумблеры/поля из сохранённого cfg: старые галочки
         # не должны оставаться после смены настроек.
         self.reload()
         self.progress_label.configure(text="Сохранено", fg=self.theme.ok)
         restart = getattr(self.controller, "restart_proxy", None)
-        if callable(restart) and self.controller.proxy.get("running"):
+        if callable(restart) and self._proxy_running():
             if restart() is False:
                 self.progress_label.configure(
                     text="Сохранено, но прокси занят — перезапустите вручную",
                     fg=self.theme.warn)
+        return True
 
 
 class SettingsWindow:
@@ -709,10 +835,13 @@ class SettingsWindow:
     def _close(self) -> None:
         self._busy = False
         self._blocked_busy = False
-        if self.page is not None:
-            self.page._blocked_busy = False
-            self.page._blocked_result = None
-            self.page._blocked_run += 1
+        page = self.page
+        if page is not None:
+            # page.revert сохранит несохранённые маршруты и вызовет _destroy.
+            page._blocked_busy = False
+            page._blocked_result = None
+            page._blocked_run += 1
+            page.revert()
         self._destroy()
         # page оставляем: после закрытия тесты читают page.rules, а Toplevel уже нет.
 

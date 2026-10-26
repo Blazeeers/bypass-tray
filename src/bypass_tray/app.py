@@ -17,13 +17,36 @@ from . import (
     status, strategy, updates, xray,
 )
 from .theme import STATE_COLORS
-from .ui import Panel, clean_server_name
+from .ui import Panel, clean_server_name, report_level
 
 
 
 #: После автосмены сервера не трогаем его 10 минут: частые перезапуски
 #: Xray рвут уже установленные соединения (в том числе YouTube).
 AUTO_SWITCH_COOLDOWN = 600.0
+
+#: Подписи пунктов для подсказки иконки (как в панели).
+_LEVEL_LABELS = {
+    "zapret": "zapret",
+    "youtube": "YouTube",
+    "discord": "Discord",
+    "deepseek": "DeepSeek",
+    "vpn": "VPN",
+    "telegram": "Telegram",
+    "tgwsproxy": "tg-ws-proxy",
+}
+#: Второстепенные пункты: их bad деградирует, а не красит в красный.
+_SECONDARY_LABELS = {"telegram", "tgwsproxy"}
+#: Подписи действий меню, ушедших в фоновый поток (ключ — имя функции).
+_ACTION_TEXTS = {
+    "start_zapret": "запускаю zapret…",
+    "stop_zapret": "останавливаю zapret…",
+    "restart_zapret": "перезапускаю zapret…",
+    "control_service": "служба zapret…",
+    "open_service_bat": "открываю стратегию службы…",
+    "start_tgws": "запускаю tg-ws-proxy…",
+    "stop_tgws": "останавливаю tg-ws-proxy…",
+}
 
 class TrayApp:
     def __init__(self):
@@ -46,6 +69,9 @@ class TrayApp:
         self._icon = None
         self._signature = None
         self._checking = False
+        # Таймер автоподключения и флаг выхода: после stop() ничего не поднимаем.
+        self._autoconnect_timer: threading.Timer | None = None
+        self._shutting_down = False
 
         # --- данные проверок и фоновых действий ---
         self.health_report: dict = {}
@@ -61,6 +87,22 @@ class TrayApp:
         self.busy: dict[str, str] = {}
         self.updated_at: float = 0.0
         self._prev_verdict = ""
+        # --- трёхцветный уровень иконки и гистерезис ---
+        self._level: str = "off"
+        self._level_candidate: str = ""
+        self._level_hits = 0
+        self._level_at = 0.0
+        self._user_off = False
+        cached = health.load_cache(self.cfg)
+        if cached:
+            # Свежий отчёт с прошлого запуска: не показываем «нет данных».
+            self.health_report = cached
+            try:
+                self.health_at = float(cached.get("checked") or 0)
+            except (TypeError, ValueError):
+                self.health_at = 0.0
+            self._level = report_level(cached) or "ok"
+            self._level_at = time.time()
         self._net_key = ""
         self._net_checked = 0.0
         # Последние отправленные авто-тосты: (время, текст) по ключу.
@@ -71,6 +113,8 @@ class TrayApp:
         """Поднимает или гасит собственный прокси Xray."""
         if self.proxy.get("busy"):
             return
+        self._user_off = not enable
+        self._reset_health()
         self.proxy = {**self.proxy, "busy": True,
                       "message": "подключаю…" if enable else "отключаю…"}
         self._signature = None
@@ -83,31 +127,51 @@ class TrayApp:
                     result = xray.stop()
             except Exception as exc:  # noqa: BLE001
                 result = {"ok": False, "error": str(exc)}
-            if result.get("ok"):
-                if enable:
-                    server = result.get("server") or {}
-                    self.proxy = {
-                        "running": True, "busy": False,
-                        "message": f"подключено · {server.get('name', '')}",
-                        "server": server.get("name", ""),
-                        "host": server.get("host", ""),
-                        "latency": server.get("latency", -1),
-                        "port": result.get("port", xray.DEFAULT_PORT),
-                    }
-                    self.server_selected = str(server.get("name") or "")
-                    activity.log(f"подключил VPN: {server.get('name') or 'сервер'}", kind="ok")
+            if not isinstance(result, dict):
+                result = {"ok": False, "error": str(result)}
+            # Хвост целиком в try/finally: исключение здесь не должно оставить
+            # ``busy`` включённым — иначе кнопки залипают до перезапуска.
+            try:
+                if result.get("ok"):
+                    if enable:
+                        # ``server`` приходит строкой в ветке «уже запущен»:
+                        # один ``.get`` по строке убил бы поток.
+                        srv = result.get("server")
+                        if isinstance(srv, dict):
+                            name = str(srv.get("name") or "")
+                            host = str(srv.get("host") or "")
+                            latency = srv.get("latency", -1)
+                        else:
+                            name, host, latency = str(srv or ""), "", -1
+                        self.proxy = {
+                            "running": True, "busy": False,
+                            "message": f"подключено · {name}",
+                            "server": name,
+                            "host": host,
+                            "latency": latency,
+                            "port": result.get("port", xray.DEFAULT_PORT),
+                        }
+                        self.server_selected = name
+                        activity.log(f"подключил VPN: {name or 'сервер'}", kind="ok")
+                    else:
+                        self.proxy = {"running": False, "busy": False,
+                                      "message": "отключено",
+                                      "server": "", "port": xray.DEFAULT_PORT}
+                        activity.log("отключил VPN")
+                    self.refresh_activity()
+                    self.notify(self.proxy["message"])
                 else:
-                    self.proxy = {"running": False, "busy": False, "message": "отключено",
-                                  "server": "", "port": xray.DEFAULT_PORT}
-                    activity.log("отключил VPN")
-                self.refresh_activity()
-                self.notify(self.proxy["message"])
-            else:
-                self.proxy = {**self.proxy, "busy": False,
-                              "message": "не удалось: " + str(result.get("error", "?"))}
-                self.notify(str(result.get("error", "не удалось")))
-            self._signature = None
-            self.refresh()
+                    error = str(result.get("error", "не удалось"))
+                    self.proxy = {**self.proxy, "busy": False,
+                                  "message": "не удалось: " + error}
+                    self.notify(error)
+            except Exception as exc:  # noqa: BLE001
+                activity.log(f"подключение сорвалось: {exc}", kind="warn")
+                self.notify(f"Подключение не удалось: {type(exc).__name__}")
+            finally:
+                self.proxy = {**self.proxy, "busy": False}
+                self._signature = None
+                self.refresh()
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -120,6 +184,7 @@ class TrayApp:
         """
         if self.proxy.get("busy") or self.busy.get("proxy"):
             return False
+        self._reset_health()
         self.proxy = {**self.proxy, "busy": True, "message": "перезапускаю прокси…"}
         self.busy["proxy"] = "перезапускаю прокси…"
         self._signature = None
@@ -192,8 +257,9 @@ class TrayApp:
                 rows = xray.scan_servers()
                 if rows:
                     self.servers = rows
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                # Молчать нельзя: список остаётся пустым без объяснения.
+                activity.log(f"список серверов не обновился: {exc}", kind="warn")
             finally:
                 self._servers_loading = False
                 self.busy.pop("servers", None)
@@ -221,6 +287,7 @@ class TrayApp:
             self.notify("Сервер не найден — обновите список")
             return
         raw_name = str(row.get("name") or name)
+        self._reset_health()
         self.proxy = {**self.proxy, "busy": True, "message": f"переключаю на {raw_name}…"}
         self.busy["proxy"] = "переключаю сервер…"
         self._signature = None
@@ -282,8 +349,10 @@ class TrayApp:
                 self._health_checking = False
             if result.get("ok"):
                 self._proxy_failures = 0
+                self._apply_tunnel_level(0)
                 return
             self._proxy_failures += 1
+            self._apply_tunnel_level(self._proxy_failures)
             if self._proxy_failures < 3:
                 return
             # Пока шла проверка, мог начаться кулдаун или смена сервера.
@@ -307,6 +376,8 @@ class TrayApp:
             # минуту. ``failed_servers`` не сбрасываем, чтобы не выбрать тот же.
             self._last_auto_switch = time.time()
             if switched.get("ok"):
+                # Новое подключение — старый вердикт к нему не относится.
+                self._reset_health()
                 server = switched.get("server") or {}
                 name = str(server.get("name") or server.get("host") or "другой")
                 self.proxy = {**self.proxy, "busy": False, **xray.status()}
@@ -375,31 +446,45 @@ class TrayApp:
         """Проверяет сервисы в фоне; ``heal`` — заодно дать надзирателю поработать."""
         if self.health_running:
             return False
+        # Надзирателя занимаем синхронно, до старта потока: иначе плановый
+        # проход и heal могли пойти параллельно и дважды запустить tgws/zapret.
+        if heal and self.guard_running:
+            heal = False
         self.health_running = True
+        if heal:
+            self.guard_running = True
         self.busy["health"] = "проверяю сервисы…"
         self._signature = None
         snapshot_status = self.status
         snapshot_proxy = dict(self.proxy)
 
         def worker() -> None:
+            ok = False
             try:
                 report = health.collect(self.cfg, snapshot_status, snapshot_proxy)
                 self.health_report = report
-                self._note_verdict(str(report.get("verdict") or "ok"))
-                if heal:
-                    # Лечение занимает guard_running, чтобы плановый проход не
-                    # начал второе одновременно.
-                    self.guard_running = True
-                    try:
-                        done = guard.heal(self.cfg, snapshot_status, snapshot_proxy, report)
-                        self._report_guard(done)
-                    finally:
-                        self.guard_running = False
-            except Exception:  # noqa: BLE001
-                pass
+                ok = True
+                self._apply_level(report)
+            except Exception as exc:  # noqa: BLE001
+                activity.log(f"проверка сервисов не удалась: {exc}", kind="warn")
+            try:
+                # Лечим только по свежим данным: упавшая проверка — не отчёт.
+                if heal and ok:
+                    done = guard.heal(self.cfg, snapshot_status, snapshot_proxy,
+                                      self.health_report)
+                    self._report_guard(done)
+            except Exception as exc:  # noqa: BLE001
+                activity.log(f"лечение не удалось: {exc}", kind="warn")
             finally:
-                self.health_at = time.time()
-                self.guard_at = time.time() if heal else self.guard_at
+                if heal:
+                    self.guard_running = False
+                    if ok:
+                        # Отметка только за реальный проход надзирателя.
+                        self.guard_at = time.time()
+                if ok:
+                    # Время ставим только после успешной проверки, иначе сбой
+                    # выглядит как свежий успех и проверка откладывается.
+                    self.health_at = time.time()
                 self.health_running = False
                 self.busy.pop("health", None)
                 self.refresh_activity()
@@ -444,15 +529,138 @@ class TrayApp:
         return True
 
     def _note_verdict(self, verdict: str) -> None:
-        """Уведомляет только о переходах ok→warn/fail и fail→ok."""
+        """Уведомляет о переходах между ok, warn и fail."""
         previous = self._prev_verdict
         self._prev_verdict = verdict
         if not previous or previous == verdict or self.cfg.get("quiet_icon", True):
             return
         if verdict in ("warn", "fail") and previous == "ok":
             self.notify("Проверка: " + ("есть сбой" if verdict == "fail" else "есть замечания"))
+        elif verdict == "fail" and previous == "warn":
+            self.notify("Проверка: появился сбой")
+        elif verdict == "warn" and previous == "fail":
+            self.notify("Проверка: сбой снят, остались замечания")
         elif verdict == "ok" and previous == "fail":
             self.notify("Снова всё работает")
+
+    # ---- уровень иконки ----------------------------------------------------
+    _LEVEL_RANK = {"ok": 0, "degraded": 1, "down": 2}
+    _LEVEL_WORDS = {"ok": "всё работает", "degraded": "требует внимания",
+                    "down": "есть сбой"}
+
+    def _reset_health(self) -> None:
+        """Забывает отчёт: устаревший вердикт не переезжает на новое подключение.
+
+        Уровень обнуляется, чтобы первая проба нового подключения применилась
+        сразу, без гистерезиса и кулдауна от прежнего состояния.
+        """
+        self.health_report = {}
+        self.health_at = 0.0
+        self._level = ""
+        self._level_candidate = ""
+        self._level_hits = 0
+        self._level_at = 0.0
+
+    def _apply_tunnel_level(self, failures: int) -> None:
+        """Быстрый уровень по отказу туннеля, не дожидаясь ``health.collect``.
+
+        Две неудачи подряд — деградация, три — сбой; успех возвращает уровень
+        свежего отчёта. Гистерезис остаётся в ``_apply_level``, здесь только
+        повод пересчитать.
+        """
+        if failures >= 3:
+            level, verdict = "down", "fail"
+        elif failures >= 2:
+            level, verdict = "degraded", "warn"
+        else:
+            report = self.health_report or {}
+            try:
+                minutes = max(1, int(self.cfg.get("health_minutes") or 10))
+            except (TypeError, ValueError):
+                minutes = 10
+            if not report or time.time() - self.health_at > 2 * minutes * 60:
+                return
+            level = report_level(report) or "ok"
+            verdict = str(report.get("verdict") or "ok")
+        self._apply_level({"level": level, "verdict": verdict, "items": []})
+
+    def _apply_level(self, report: dict) -> None:
+        """Уровень иконки с гистерезисом, чтобы одиночная проба не мигала.
+
+        Смена не чаще раза в 60 с. Ухудшение принимается после двух одинаковых
+        результатов, ``down`` — после трёх; улучшение — сразу.
+        """
+        self._note_verdict(str((report or {}).get("verdict") or "ok"))
+        candidate = str((report or {}).get("level") or "ok")
+        if candidate not in self._LEVEL_RANK:
+            candidate = "ok"
+        now = time.time()
+        if self._level not in self._LEVEL_RANK:
+            # Первый отчёт после старта показываем сразу, без накопления.
+            self._level = candidate
+            self._level_at = now
+            self._level_candidate = ""
+            self._level_hits = 0
+            return
+        if candidate == self._level:
+            self._level_candidate = ""
+            self._level_hits = 0
+            return
+        if candidate == self._level_candidate:
+            self._level_hits += 1
+        else:
+            self._level_candidate = candidate
+            self._level_hits = 1
+        previous = self._level
+        worse = self._LEVEL_RANK[candidate] > self._LEVEL_RANK[previous]
+        need = (3 if candidate == "down" else 2) if worse else 1
+        if self._level_at and now - self._level_at < 60:
+            return
+        if self._level_hits < need:
+            return
+        self._level = candidate
+        self._level_at = now
+        self._level_candidate = ""
+        self._level_hits = 0
+        reasons = self._level_reasons(candidate)
+        text = "состояние: " + self._LEVEL_WORDS.get(candidate, candidate)
+        if reasons:
+            text += f" — {reasons}"
+        activity.log(text, kind="ok" if candidate == "ok" else "warn")
+
+    def _level_reasons(self, level: str) -> str:
+        """Короткий список пунктов, из-за которых уровень не ``ok``."""
+        items = list((self.health_report or {}).get("items") or [])
+        names: list[str] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("id") or "")
+            state = str(item.get("state") or "")
+            if item_id not in _LEVEL_LABELS or state not in ("bad", "warn"):
+                continue
+            if level == "down" and state != "bad":
+                continue
+            if (level != "down" and state == "bad"
+                    and item_id not in _SECONDARY_LABELS):
+                continue
+            names.append(_LEVEL_LABELS[item_id])
+        return ", ".join(names[:3])
+
+    def _level_title(self, level: str) -> str:
+        """Подсказка уровня: причина и время последней проверки."""
+        title = self._LEVEL_WORDS.get(level, "всё работает")
+        reasons = self._level_reasons(level)
+        if reasons:
+            title = f"{title}: {reasons}"
+        if self.health_at:
+            try:
+                stamp = time.strftime("%H:%M", time.localtime(self.health_at))
+            except (ValueError, OSError, OverflowError):
+                stamp = ""
+            if stamp:
+                title += f" · {stamp}"
+        return title
 
     def _report_guard(self, done: list) -> None:
         """Сообщает о предупреждениях надзирателя; остальное он пишет в журнал."""
@@ -731,6 +939,7 @@ class TrayApp:
 
     # ---- поведение ---------------------------------------------------------
     def set_quiet(self, value: bool) -> None:
+        """Тихий режим — только уведомления; цвет иконки от него не зависит."""
         self.cfg["quiet_icon"] = bool(value)
         config.save_config(self.cfg)
         self._signature = None
@@ -927,22 +1136,33 @@ class TrayApp:
         self.check_network()
 
     def tray_state(self) -> tuple[str, str, str]:
-        """(вид иконки, цвет, подсказка) — приоритет по свежей проверке."""
-        if self.busy:
-            return "busy", STATE_COLORS["warn"], "работаю…"
-        report = self.health_report or {}
-        verdict = str(report.get("verdict") or "")
-        running = bool(self.proxy.get("running"))
-        if verdict == "fail":
-            return "warn", STATE_COLORS["bad"], "есть сбой"
-        if verdict == "warn":
-            return "warn", STATE_COLORS["warn"], "требует внимания"
-        if not running:
-            return "off", STATE_COLORS["dim"], "VPN выключен"
-        if verdict == "ok":
-            color = STATE_COLORS["dim"] if self.cfg.get("quiet_icon", True) else STATE_COLORS["ok"]
-            return "ok", color, "всё работает"
-        return "off", STATE_COLORS["dim"], "нет данных проверки"
+        """(вид иконки, цвет, подсказка) — трёхцветный уровень проверки.
+
+        ``busy`` — модификатор: цвет и глиф уровня сохраняются, меняется только
+        подсказка. Синий спиннер — лишь пока данных проверки ещё нет.
+        """
+        busy = bool(self.busy) or self.health_running
+        if self._user_off or not self.proxy.get("running"):
+            key, color, title = "off", STATE_COLORS["idle"], "VPN выключен"
+        elif not self.health_report:
+            key, color, title = "idle", STATE_COLORS["idle"], "нет данных проверки"
+        else:
+            level = (self._level if self._level in self._LEVEL_WORDS
+                     else (report_level(self.health_report) or "ok"))
+            key, color = {
+                "down": ("down", STATE_COLORS["bad"]),
+                "degraded": ("degraded", STATE_COLORS["warn"]),
+            }.get(level, ("ok", STATE_COLORS["ok"]))
+            title = self._level_title(level)
+        if busy:
+            if key == "idle":
+                key, color = "busy", STATE_COLORS["busy"]
+            # Словарь меняют фоновые потоки: итерация по живому dict падает
+            # с RuntimeError, поэтому берём снимок значений.
+            title = next((str(text) for text in list(self.busy.values()) if text),
+                         "проверяю…")
+        # szTip Windows — около 127 символов, префикс «bypass-tray · » тоже там.
+        return key, color, title[:110]
 
     def update_icon(self) -> None:
         if self._icon is None:
@@ -951,14 +1171,16 @@ class TrayApp:
         signature = (key, color, title, self._menu_signature())
         if signature == self._signature:
             return
-        self._signature = signature
         try:
             self._icon.icon = icons.make_icon(key, color)
             self._icon.title = f"bypass-tray · {title}"
             self._icon.menu = self.build_menu()
             self._icon.update_menu()
         except Exception:  # noqa: BLE001
-            pass
+            # Подпись запоминаем только после успешной отрисовки: иначе
+            # неудачная попытка залипнет и иконка не обновится.
+            return
+        self._signature = signature
 
     def _menu_signature(self) -> tuple:
         state = self.status or {}
@@ -1164,16 +1386,27 @@ class TrayApp:
                 sys.executable, "-m", "bypass_tray", "--sweep-strategies",
                 "--out", str(result_path), "--report", str(progress_path),
             ]
-        launched = actions.run_elevated(command)
-        if not launched:
-            self.sweep = {"running": False, "message": "Запрос прав отклонён"}
-            self.busy.pop("sweep", None)
-            self.update_icon()
-            return False
 
-        threading.Thread(
-            target=self._watch_sweep, args=(result_path, progress_path), daemon=True
-        ).start()
+        def launch() -> None:
+            # ``run_elevated`` блокирует поток до ответа на UAC, поэтому
+            # запускаем его вне message-loop трея.
+            try:
+                launched = actions.run_elevated(command)
+            except Exception as exc:  # noqa: BLE001
+                activity.log(f"автоподбор не запустился: {exc}", kind="warn")
+                launched = False
+            if not launched:
+                self.sweep = {"running": False, "message": "Запрос прав отклонён"}
+                self.busy.pop("sweep", None)
+                self._signature = None
+                self.update_icon()
+                return
+            threading.Thread(
+                target=self._watch_sweep, args=(result_path, progress_path),
+                daemon=True, name="sweep-watch",
+            ).start()
+
+        threading.Thread(target=launch, daemon=True, name="sweep-launch").start()
         return True
 
     def _watch_sweep(self, result_path, progress_path) -> None:
@@ -1228,12 +1461,16 @@ class TrayApp:
             self._signature = None
             self.refresh()
 
-    def run_action(self, fn, *args) -> None:
-        try:
-            fn(*args)
-        except Exception as exc:  # noqa: BLE001
-            self.notify(str(exc))
-        self.refresh()
+    def run_action(self, fn, *args) -> bool:
+        """Пункт меню: действие уходит в поток, а не в message-loop pystray.
+
+        ``sc.exe`` живёт 10–30 с, а ``ShellExecuteW`` с runas блокирует до
+        ответа на UAC: в потоке трея это «приложение не отвечает». Поэтому
+        идём через ``_run_action_busy`` — как панель.
+        """
+        key = getattr(fn, "__name__", "") or "action"
+        text = _ACTION_TEXTS.get(key, "выполняю…")
+        return self._run_action_busy(key, text, fn, *args)
 
     # ---- жизненный цикл ----------------------------------------------------
     def start(self) -> None:
@@ -1252,11 +1489,19 @@ class TrayApp:
         self._icon = pystray.Icon("bypass-tray", icon, "bypass-tray", menu=self.build_menu())
         threading.Thread(target=self._loop, daemon=True).start()
         if self.cfg.get("autoconnect") and not self.proxy.get("running"):
-            threading.Timer(3.0, self._autoconnect).start()
+            timer = threading.Timer(3.0, self._autoconnect)
+            timer.daemon = True
+            timer.name = "autoconnect"
+            self._autoconnect_timer = timer
+            timer.start()
         self._icon.run()
 
     def _autoconnect(self) -> None:
         """Подключение при входе; если ядро уже живёт — только прокси."""
+        if self._shutting_down:
+            # Пользователь вышел раньше, чем сработал таймер: поднимать Xray и
+            # включать системный прокси на мёртвый порт нельзя.
+            return
         try:
             if xray.is_running():
                 self.sync_proxy_state()
@@ -1267,7 +1512,7 @@ class TrayApp:
             pass
 
     def _loop(self) -> None:
-        while True:
+        while not self._shutting_down:
             try:
                 self.refresh()
                 self.check_proxy_health()
@@ -1279,9 +1524,22 @@ class TrayApp:
                 self._maybe_health()
             except Exception:  # noqa: BLE001
                 pass
-            time.sleep(float(self.cfg.get("refresh_seconds") or 5))
+            # Мусор в config.json не должен убивать цикл: интервал считаем в
+            # try, держим в разумных пределах.
+            try:
+                interval = float(self.cfg.get("refresh_seconds") or 5)
+            except (TypeError, ValueError):
+                interval = 5.0
+            time.sleep(min(600.0, max(1.0, interval)))
 
     def stop(self) -> None:
+        # Сначала гасим отложенные действия: иначе автоподключение сработает
+        # после остановки Xray и включит прокси на мёртвый порт.
+        self._shutting_down = True
+        timer = self._autoconnect_timer
+        if timer is not None:
+            timer.cancel()
+            self._autoconnect_timer = None
         # Не оставляем мёртвый системный прокси после выхода.
         try:
             xray.stop(port=int(self.proxy.get("port") or 10818))

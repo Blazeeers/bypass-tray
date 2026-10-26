@@ -291,6 +291,16 @@ def main() -> int:
         image = icons.make_icon(key, color)
         check(f"иконка «{key}» {image.size[0]}px", image.size == (64, 64) and image.mode == "RGBA")
 
+    check("глиф bad — cross", icons.STATE_GLYPHS.get("bad") == "cross")
+    check("глифы degraded/down — alert и cross",
+          icons.STATE_GLYPHS.get("degraded") == "alert"
+          and icons.STATE_GLYPHS.get("down") == "cross")
+    same_color = theme.STATE_COLORS["warn"]
+    degraded_icon = icons.make_icon("degraded", same_color)
+    down_icon = icons.make_icon("down", same_color)
+    check("иконки degraded/down различаются пикселями при одном цвете",
+          degraded_icon.tobytes() != down_icon.tobytes())
+
     ico = icons.ensure_ico()
     check("иконка .ico создана", ico.is_file() and ico.stat().st_size > 1000,
           str(ico))
@@ -318,7 +328,8 @@ def main() -> int:
     controller.last_check = time.time()
     controller.refresh()
     key, color, title = controller.tray_state()
-    check("tray_state() возвращает состояние", key in ("ok", "warn", "busy", "off"),
+    check("tray_state() возвращает состояние",
+          key in ("ok", "warn", "bad", "busy", "off", "idle", "degraded", "down"),
           f"{key} / {title}")
     check("health_report — словарь", isinstance(controller.health_report, dict))
     check("поля журнала/обновлений/занятости есть",
@@ -788,6 +799,94 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
     check("atomic_write: временные файлы потоков убраны",
           not list(tmp.glob("atomic-concurrent.json.tmp*")))
 
+    # --- health.load_cache: свежесть отчёта -----------------------------
+    print("\n-- кэш проверок --")
+    cache_file = tmp / "health.json"
+    # Валидный кэш обязан содержать все критичные пункты: без них судить о
+    # здоровье нельзя (проверка полноты живёт в load_cache).
+    fresh_report = {"checked": time.time(),
+                    "items": [{"id": item_id, "title": item_id, "state": "ok",
+                               "detail": "", "ms": 0}
+                              for item_id in health.CRITICAL_IDS],
+                    "verdict": "ok", "level": "ok"}
+    config.atomic_write(cache_file, json.dumps(fresh_report, ensure_ascii=False))
+    cached = health.load_cache({"health_minutes": 10})
+    check("load_cache: свежий отчёт читается",
+          bool(cached) and cached.get("level") == "ok")
+    partial_report = {**fresh_report,
+                      "items": [{"id": "telegram", "title": "Telegram",
+                                 "state": "ok", "detail": "", "ms": 0}]}
+    config.atomic_write(cache_file, json.dumps(partial_report, ensure_ascii=False))
+    check("load_cache: отчёт без критичных пунктов — None",
+          health.load_cache({"health_minutes": 10}) is None)
+    stale_report = {**fresh_report, "checked": time.time() - 21 * 60}
+    config.atomic_write(cache_file, json.dumps(stale_report, ensure_ascii=False))
+    check("load_cache: старый отчёт отбрасывается",
+          health.load_cache({"health_minutes": 10}) is None)
+    config.atomic_write(cache_file, "{ это не json")
+    check("load_cache: битый файл — None",
+          health.load_cache({"health_minutes": 10}) is None)
+    cache_file.unlink()
+
+    # --- уровень: гистерезис --------------------------------------------
+    print("\n-- гистерезис уровня --")
+    level_app = TrayApp()
+    level_app._level = "ok"
+    level_app._level_at = 0.0
+    level_app._level_candidate = ""
+    level_app._level_hits = 0
+
+    def level_report(name: str) -> dict:
+        return {"checked": time.time(), "items": [], "verdict": "ok", "level": name}
+
+    level_app._apply_level(level_report("degraded"))
+    check("гистерезис: один плохой отчёт не меняет уровень",
+          level_app._level == "ok")
+    level_app._apply_level(level_report("degraded"))
+    check("гистерезис: два подряд — уровень понижается",
+          level_app._level == "degraded")
+    level_app._level_at = time.time()
+    level_app._apply_level(level_report("ok"))
+    check("гистерезис: кулдаун 60 с держит уровень",
+          level_app._level == "degraded")
+    level_app._level_at = time.time() - 120
+    for _ in range(2):
+        level_app._apply_level(level_report("down"))
+    held = level_app._level
+    level_app._apply_level(level_report("down"))
+    check("гистерезис: down после трёх отчётов",
+          held == "degraded" and level_app._level == "down")
+    level_app._level_at = time.time() - 120
+    level_app._apply_level(level_report("ok"))
+    check("гистерезис: улучшение применяется сразу",
+          level_app._level == "ok")
+
+    # --- сброс отчёта: новая проба не ждёт гистерезиса -------------------
+    level_app._level = "down"
+    level_app._level_at = time.time()
+    level_app._reset_health()
+    check("_reset_health обнуляет уровень",
+          level_app._level == "" and level_app._level_at == 0.0)
+    level_app._apply_level(level_report("ok"))
+    check("после _reset_health свежий ok применяется сразу",
+          level_app._level == "ok")
+
+    # --- старый кэш без level: трей не должен быть зелёным --------------
+    legacy_cache = {"checked": time.time(), "verdict": "fail",
+                    "items": [{"id": "youtube", "title": "YouTube",
+                               "state": "bad", "detail": "", "ms": 0}]}
+    config.atomic_write(tmp / "health.json",
+                        json.dumps(legacy_cache, ensure_ascii=False))
+    legacy_app = TrayApp()
+    legacy_app.proxy = {**legacy_app.proxy, "running": True}
+    legacy_key, legacy_color, _legacy_title = legacy_app.tray_state()
+    check("кэш без level при verdict=fail — трей не зелёный",
+          legacy_color != theme.STATE_COLORS["ok"],
+          f"{legacy_key} / {legacy_color}")
+    check("кэш без критичных пунктов не выдаётся за свежий",
+          legacy_app.health_report == {}, str(legacy_app.health_report))
+    (tmp / "health.json").unlink()
+
     # --- нечитаемый config.json не перезаписывается --------------------
     saved_cfg = {"quiet_icon": True, "guard_enabled": True,
                  "zapret_dir": "", "tgws_exe": "", "xray_routes": {}}
@@ -823,7 +922,7 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
           and b"for /d" in run_bat_bytes
           and b"dist\\*" in run_bat_bytes
           and b"*.exe" in run_bat_bytes)
-    check("widget_version 0.6.3", updates.widget_version() == "0.6.3",
+    check("widget_version 0.6.4", updates.widget_version() == "0.6.4",
           updates.widget_version())
     empty_components = components.installed({"zapret_dir": "", "tgws_exe": ""})
     check("components.installed: пустые пути — не cwd",
@@ -844,6 +943,9 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
     import ssl
     import urllib.error
     real_direct = health._http_direct
+    real_certificate = routes._peer_certificate
+    real_issuer = routes._certificate_issuer
+    real_local = routes._issuer_is_local
 
     def tls_failure(url, timeout):
         raise urllib.error.URLError(
@@ -851,12 +953,31 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
 
     health._http_direct = tls_failure
     try:
+        # Второй проход не нашёл ни сертификата, ни ответа — рукопожатие
+        # оборвано, домен недоступен.
+        routes._peer_certificate = (
+            lambda name, port, timeout, proxy_port=None: (b"", 0))
         tls_route = routes.probe("yandex.ru")
+        check("routes.probe: обрыв рукопожатия — недоступен",
+              tls_route.get("ok") is False and tls_route.get("error") == "tls",
+              str(tls_route))
+        # Узел ответил, а сертификат выпущен локально: проблема в хранилище
+        # этой машины, домен достижим.
+        routes._peer_certificate = (
+            lambda name, port, timeout, proxy_port=None: (b"PEM", 200))
+        routes._certificate_issuer = lambda der: {"issuer": (), "subject": ()}
+        routes._issuer_is_local = lambda decoded: True
+        local_route = routes.probe("yandex.ru")
+        check("routes.probe: локальный сертификат — достижим",
+              local_route.get("ok") is True
+              and local_route.get("error") == "tls"
+              and local_route.get("tls_local") is True,
+              str(local_route))
     finally:
         health._http_direct = real_direct
-    check("routes.probe: TLS-ошибка — достижимо",
-          tls_route.get("ok") is True and tls_route.get("error") == "tls",
-          str(tls_route))
+        routes._peer_certificate = real_certificate
+        routes._certificate_issuer = real_issuer
+        routes._issuer_is_local = real_local
 
     # Реальный cmd: копия run.bat с start→echo под cp866.
     run_bat_text = (ROOT / "run.bat").read_text(encoding="ascii")
@@ -1097,7 +1218,53 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
           health.verdict([health_item("ok"), health_item("off")]) == "ok")
     check("verdict: warn — warn", health.verdict([health_item("ok"), health_item("warn")]) == "warn")
     check("verdict: bad — fail", health.verdict([health_item("warn"), health_item("bad")]) == "fail")
-    check("verdict: пусто — ok", health.verdict([]) == "ok")
+    check("verdict: пусто — warn", health.verdict([]) == "warn")
+
+    def level_items(**states: str) -> list[dict]:
+        return [{"id": key, "title": key, "state": value, "detail": "", "ms": 0}
+                for key, value in states.items()]
+
+    all_ok = level_items(zapret="ok", youtube="ok", discord="ok", deepseek="ok",
+                         vpn="ok", telegram="ok", tgwsproxy="ok")
+    check("level: всё ok — ok", health.level(all_ok) == "ok")
+    check("level: пустой набор — degraded", health.level([]) == "degraded")
+    check("level: off не влияет",
+          health.level(level_items(zapret="off", vpn="off", telegram="off")) == "ok")
+    check("level: deepseek bad — down",
+          health.level(level_items(deepseek="bad")) == "down")
+    check("level: youtube и discord bad — down",
+          health.level(level_items(youtube="bad", discord="bad")) == "down")
+    check("level: одиночный youtube bad — degraded",
+          health.level(level_items(youtube="bad")) == "degraded")
+    check("level: одиночный zapret bad — degraded",
+          health.level(level_items(zapret="bad")) == "degraded")
+    check("level: vpn bad — down",
+          health.level(level_items(vpn="bad")) == "down")
+    check("level: telegram bad — degraded",
+          health.level(level_items(telegram="bad")) == "degraded")
+    check("level: tgwsproxy bad — degraded",
+          health.level(level_items(tgwsproxy="bad")) == "degraded")
+    check("level: zapret warn — degraded",
+          health.level(level_items(zapret="warn")) == "degraded")
+    check("level: устаревший отчёт — degraded",
+          health.level(all_ok, fresh=False) == "degraded")
+
+    reserve_item = health._check_zapret(
+        {"zapret": {"running": False, "dir": "C:/Zapret"}},
+        {"youtube_via_vpn": True},
+        {"running": True, "stream": False})
+    check("zapret: остановлен при VPN-резерве — warn",
+          reserve_item["state"] == "warn" and "через VPN" in reserve_item["detail"],
+          reserve_item["detail"])
+    check("level: zapret warn при резерве — degraded",
+          health.level([reserve_item]) == "degraded")
+    missing_item = health._check_zapret(
+        {"zapret": {"running": False, "dir": ""}},
+        {"youtube_via_vpn": True},
+        {"running": True, "stream": False})
+    check("zapret: не найден при VPN-резерве — warn",
+          missing_item["state"] == "warn"
+          and "не найден" in missing_item["detail"], missing_item["detail"])
 
     zapret_item = health._check_zapret({"zapret": {"running": False, "dir": "C:/Zapret"}})
     check("zapret: остановлен", zapret_item["state"] == "bad"
@@ -1232,12 +1399,26 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
         routes._probe_state = original_probe_state
     check("audit пропускает YouTube/Discord и поддомены",
           stream_audit["items"] == [], str(stream_audit["items"]))
+    check("audit: явный список доменов — частичный",
+          stream_audit.get("full") is False, str(stream_audit.get("full")))
 
-    routes.apply_audit({"at": time.time(),
+    # Полный аудит: домен выпал из проверенного набора — его маршрут уходит.
+    routes.apply_audit({"at": time.time(), "full": True,
                         "items": [{"domain": "instagram.com", "route": "proxy"}]})
     saved = routes.load_overrides()
     check("apply_audit: снятый с аудита домен удалён",
           "huggingface.co" not in saved and "instagram.com" in saved, str(sorted(saved)))
+
+    routes.save_overrides({"instagram.com": {"route": "proxy", "since": 1, "checked": 1},
+                           "other.example": {"route": "direct", "since": 1,
+                                             "checked": 1}},
+                          at=time.time())
+    routes.apply_audit({"at": time.time(),
+                        "items": [{"domain": "instagram.com", "route": "proxy"}]})
+    partial_saved = routes.load_overrides()
+    check("apply_audit: частичный аудит не стирает остальные маршруты",
+          "other.example" in partial_saved and "instagram.com" in partial_saved,
+          str(sorted(partial_saved)))
 
     routes.save_overrides({"instagram.com": {"route": "proxy", "since": 1, "checked": 1}},
                           at=time.time())
@@ -1281,22 +1462,38 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
     guard_calls: list = []
     real_switch = xray.switch_server
     real_guard_routes = guard._heal_routes
+    real_switch_at = guard._VPN_SWITCH_AT
     xray.switch_server = lambda *args, **kwargs: (
         guard_calls.append((args, kwargs))
         or {"ok": True, "server": {"name": "Не должен"}})
     guard._heal_routes = lambda cfg: []
+    guard_status = {"zapret": {"running": True, "dir": cfg.get("zapret_dir", "")},
+                    "tgwsproxy": {"running": False, "listening": False}}
+    guard_cfg = {**cfg, "tgws_exe": "", "guard_enabled": True}
     try:
-        guard.heal(
-            {**cfg, "tgws_exe": "", "guard_enabled": True},
-            {"zapret": {"running": True, "dir": cfg.get("zapret_dir", "")},
-             "tgwsproxy": {"running": False, "listening": False}},
-            {"running": True},
-            {"items": [{"id": "vpn", "state": "bad", "detail": "сервер не отвечает"}]},
-        )
+        # warn — «не успели проверить», а не «сервер мёртв»: менять нечего.
+        guard._VPN_SWITCH_AT = 0.0
+        guard.heal(guard_cfg, guard_status, {"running": True},
+                   {"items": [{"id": "vpn", "state": "warn",
+                               "detail": "проверка не успела"}]})
+        check("guard heal: warn по VPN сервер не меняет",
+              not guard_calls, str(guard_calls))
+        # bad — сервер не отвечает: одно переключение с троттлингом 30 минут.
+        guard._VPN_SWITCH_AT = 0.0
+        guard.heal(guard_cfg, guard_status, {"running": True},
+                   {"items": [{"id": "vpn", "state": "bad",
+                               "detail": "сервер не отвечает"}]})
+        check("guard heal: мёртвый VPN — одно переключение",
+              len(guard_calls) == 1, str(guard_calls))
+        guard.heal(guard_cfg, guard_status, {"running": True},
+                   {"items": [{"id": "vpn", "state": "bad",
+                               "detail": "сервер не отвечает"}]})
+        check("guard heal: повтор в пределах 30 мин — без переключения",
+              len(guard_calls) == 1, str(guard_calls))
     finally:
         xray.switch_server = real_switch
         guard._heal_routes = real_guard_routes
-    check("guard heal не меняет сервер VPN", not guard_calls, str(guard_calls))
+        guard._VPN_SWITCH_AT = real_switch_at
 
     # --- автозапуск на временном каталоге ------------------------------
     print("\n-- автозапуск --")

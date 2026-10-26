@@ -19,16 +19,19 @@ from PIL import Image, ImageDraw, ImageFont
 STATE_GLYPHS = {
     "ok": "check",
     "warn": "alert",
-    "bad": "alert",
+    "bad": "cross",
     "busy": "busy",
     "off": "shield",
     "shield": "shield",
     "update": "down",
+    # Трёхцветный уровень: degraded и down обязаны отличаться пикселями.
+    "degraded": "alert",
+    "down": "cross",
     # Совместимость со старыми ключами иконки трея.
     "zapret": "shield",
     "tgws": "letter:T",
     "proxy": "letter:X",
-    "idle": "letter:…",
+    "idle": "clock",
 }
 
 _FONT_CANDIDATES = ("segoeuib.ttf", "segoeui.ttf", "arialbd.ttf", "arial.ttf")
@@ -96,6 +99,19 @@ def _draw_state_glyph(draw: ImageDraw.ImageDraw, big: int, kind: str,
         dot = 0.045 * big
         cx, cy = 0.5 * big, 0.73 * big
         draw.ellipse((cx - dot, cy - dot, cx + dot, cy + dot), fill=_WHITE)
+    elif kind == "cross":
+        # Икс вместо «!»: сбой должен читаться иначе, чем «внимание».
+        draw.line(_points(big, [(0.3, 0.3), (0.7, 0.7)], 0.86),
+                  fill=_WHITE, width=width)
+        draw.line(_points(big, [(0.7, 0.3), (0.3, 0.7)], 0.86),
+                  fill=_WHITE, width=width)
+    elif kind == "clock":
+        box = (big * 0.2, big * 0.2, big * 0.8, big * 0.8)
+        draw.ellipse(box, outline=_WHITE, width=width)
+        draw.line((big * 0.5, big * 0.5, big * 0.5, big * 0.32),
+                  fill=_WHITE, width=width)
+        draw.line((big * 0.5, big * 0.5, big * 0.63, big * 0.6),
+                  fill=_WHITE, width=width)
     elif kind == "shield":
         _draw_shield(draw, big, _WHITE, scale=0.62)
     elif kind == "down":

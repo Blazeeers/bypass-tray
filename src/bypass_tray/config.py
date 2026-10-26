@@ -51,6 +51,9 @@ _LAST_WRITE_ERROR = ""
 #: молча не перезаписывает пользовательские настройки умолчаниями.
 _READ_ERROR = False
 _READ_ERROR_MESSAGE = ""
+#: О неудачном чтении сообщаем в журнал не чаще раза в 10 минут.
+_READ_LOG_AT = 0.0
+_READ_LOG_EVERY = 600.0
 
 
 def atomic_write(path: Path, text: str) -> bool:
@@ -339,13 +342,98 @@ def load_config() -> dict:
     return cfg
 
 
+def _refresh_read_state() -> dict | None:
+    """Повторно читает config.json, чтобы снять latch после неудачного старта.
+
+    Приложение читает конфиг один раз (``App.__init__``), поэтому запрет
+    записи, залипший на первом чтении (файл держал антивирус или OneDrive),
+    иначе жил бы до перезапуска и молча терял все настройки. ``None`` — файл
+    по-прежнему не читается; иначе его содержимое с диска (пустой словарь,
+    если файла уже нет — терять тогда нечего).
+    """
+    global _READ_ERROR, _READ_ERROR_MESSAGE
+    if not _READ_ERROR:
+        return {}
+    last_error = ""
+    for attempt in range(2):
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            _READ_ERROR = False
+            _READ_ERROR_MESSAGE = ""
+            return {}
+        except (OSError, ValueError) as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            if attempt == 0:
+                time.sleep(0.1)
+            continue
+        if not isinstance(data, dict):
+            last_error = "config.json: ожидался объект JSON"
+            break
+        _READ_ERROR = False
+        _READ_ERROR_MESSAGE = ""
+        return data
+    _READ_ERROR_MESSAGE = last_error or _READ_ERROR_MESSAGE
+    return None
+
+
+def _keep_untouched(cfg: dict, disk: dict) -> dict:
+    """Копия ``cfg``, где ключи, оставшиеся умолчаниями, взяты с диска.
+
+    Сохранение после неудачного первого чтения пишет словарь, собранный из
+    ``DEFAULTS``: без этой подстановки подписка, ``zapret_bat`` и
+    ``autoconnect``, которых пользователь в этой сессии не касался, были бы
+    стёрты умолчаниями.
+    """
+    merged = dict(cfg)
+    for key, value in disk.items():
+        if merged.get(key) == DEFAULTS.get(key):
+            merged[key] = value
+    return merged
+
+
+def _log_read_error() -> None:
+    """Пишет причину отказа в журнал действий (не чаще раза в 10 минут)."""
+    global _READ_LOG_AT
+    now = time.time()
+    if now - _READ_LOG_AT < _READ_LOG_EVERY:
+        return
+    _READ_LOG_AT = now
+    detail = _READ_ERROR_MESSAGE or "файл недоступен"
+    try:
+        from . import activity  # локальный импорт: activity импортирует config
+
+        activity.log(f"настройки не сохраняются: config.json не читается ({detail})",
+                     kind="warn")
+    except (ImportError, TypeError, ValueError):
+        pass
+
+
 def save_config(cfg: dict) -> bool:
     global _LAST_WRITE_ERROR
+    recovered = False
     if _READ_ERROR:
-        _LAST_WRITE_ERROR = "config.json не читается — запись отменена"
-        return False
-    return atomic_write(
+        disk = _refresh_read_state()
+        if disk is None:
+            _LAST_WRITE_ERROR = ("config.json не читается — запись отменена: "
+                                 + (_READ_ERROR_MESSAGE or "файл недоступен"))
+            _log_read_error()
+            return False
+        # Файл снова читается: сохраняем накопленное, не затирая того, что в
+        # этой сессии осталось умолчаниями.
+        cfg = _keep_untouched(cfg, disk)
+        recovered = True
+    written = atomic_write(
         CONFIG_FILE, json.dumps(cfg, ensure_ascii=False, indent=2))
+    if written and recovered:
+        try:
+            from . import activity
+
+            activity.log("config.json снова читается — сохранение возобновлено",
+                         kind="info")
+        except (ImportError, TypeError, ValueError):
+            pass
+    return written
 
 
 def load_state() -> dict:
