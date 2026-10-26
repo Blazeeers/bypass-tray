@@ -16,7 +16,7 @@ try:
 except ImportError:  # pragma: no cover
     psutil = None
 
-from .status import ZAPRET_SERVICE, is_admin
+from .status import ZAPRET_SERVICE, is_admin, port_open
 
 CREATE_NO_WINDOW = 0x08000000 if sys.platform.startswith("win") else 0
 SW_HIDE = 0
@@ -334,15 +334,44 @@ def tgws_running() -> bool:
     return bool(_pids("TgWsProxy") or _pids("tg-ws-proxy"))
 
 
+#: Сколько ждать открытия порта после запуска tg-ws-proxy.
+TGWS_PORT_WAIT = 4.0
+#: Шаг опроса порта: Popen отвечает за процесс, а порт открывается не сразу.
+TGWS_PORT_STEP = 0.25
+
+
+def tgws_port(cfg: dict) -> int:
+    try:
+        return int(cfg.get("tgws_port") or 1443)
+    except (TypeError, ValueError):
+        return 1443
+
+
 def start_tgws(cfg: dict) -> bool:
-    """Запускает tg-ws-proxy, если он ещё не запущен (иначе False)."""
+    """Запускает tg-ws-proxy и дожидается открытия порта.
+
+    ``True`` — только если порт действительно слушает. Раньше успехом
+    считался сам факт ``Popen``, поэтому упавший сразу после старта прокси
+    отрапортовал «запустил» и в панели, и в надзирателе.
+    """
     if tgws_running():
         return False
     exe = cfg.get("tgws_exe") or ""
     if not exe or not Path(exe).is_file():
         raise FileNotFoundError(f"Не найден tg-ws-proxy: {exe or '(путь не задан)'}")
-    _popen([exe], cwd=str(Path(exe).parent))
-    return True
+    port = tgws_port(cfg)
+    process = _popen([exe], cwd=str(Path(exe).parent))
+    poll = getattr(process, "poll", None)
+    deadline = time.monotonic() + TGWS_PORT_WAIT
+    while True:
+        if port_open(port):
+            return True
+        if poll is not None and poll() is not None:
+            # Процесс умер: ждать нечего, порт уже не откроется.
+            return False
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(TGWS_PORT_STEP)
 
 
 def stop_tgws() -> dict:

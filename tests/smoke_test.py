@@ -922,7 +922,7 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
           and b"for /d" in run_bat_bytes
           and b"dist\\*" in run_bat_bytes
           and b"*.exe" in run_bat_bytes)
-    check("widget_version 0.6.7", updates.widget_version() == "0.6.7",
+    check("widget_version 0.6.8", updates.widget_version() == "0.6.8",
           updates.widget_version())
     empty_components = components.installed({"zapret_dir": "", "tgws_exe": ""})
     check("components.installed: пустые пути — не cwd",
@@ -2477,6 +2477,8 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
     tunnel_app.proxy = {**tunnel_app.proxy, "running": True, "busy": False,
                         "host": "old.example", "server": "Старый"}
     tunnel_app.refresh = lambda: None
+    # Новый сторож tg-ws-proxy не должен трогать реальный прокси из теста.
+    tunnel_app.cfg = {**tunnel_app.cfg, "tgws_exe": ""}
     notifications: list[str] = []
     tunnel_app._notify_throttled = (
         lambda key, message, hours=1.0: notifications.append(message))
@@ -2585,6 +2587,222 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
         xray.verify = real_verify
         xray.switch_server = real_switch
         xray.status = real_status
+
+    # --- сторож tg-ws-proxy: падение замечается за минуту -----------------
+    print("\n-- сторож tg-ws-proxy --")
+    fake_tgws = tmp / "TgWsProxy_windows.exe"
+    fake_tgws.write_bytes(b"MZ")          # файл есть, запускать его не будем
+    tgws_cfg = {"tgws_exe": str(fake_tgws), "tgws_port": 1443}
+    port_state = {"open": False}
+    popens: list = []
+
+    class FakeProcess:
+        """Живой или умерший процесс вместо настоящего Popen."""
+
+        def __init__(self, alive: bool) -> None:
+            self.alive = alive
+
+        def poll(self):
+            return None if self.alive else 1
+
+    real_port_open = actions.port_open
+    real_popen = actions._popen
+    real_port_wait = actions.TGWS_PORT_WAIT
+    real_port_step = actions.TGWS_PORT_STEP
+    real_start_tgws = actions.start_tgws
+    real_tgws_running = actions.tgws_running
+    real_stop_tgws = actions.stop_tgws
+    real_status_port = status.port_open
+    actions.port_open = lambda port: port_state["open"]
+    actions._popen = lambda args, cwd=None: (
+        popens.append((list(args), cwd)) or FakeProcess(True))
+    actions.TGWS_PORT_WAIT = 0.0         # не ждём 4 с в тесте
+    actions.TGWS_PORT_STEP = 0.0
+    actions.tgws_running = lambda: False
+    try:
+        check("start_tgws: порт не открылся — False",
+              actions.start_tgws(tgws_cfg) is False,
+              f"popen={len(popens)}")
+        check("start_tgws: процесс всё равно запускался",
+              len(popens) == 1 and popens[0][0] == [str(fake_tgws)],
+              str(popens[:1]))
+
+        actions.TGWS_PORT_WAIT = 4.0
+        popens.clear()
+        actions._popen = lambda args, cwd=None: (
+            popens.append((list(args), cwd)) or FakeProcess(False))
+        began = time.monotonic()
+        died = actions.start_tgws(tgws_cfg)
+        spent = time.monotonic() - began
+        check("start_tgws: процесс умер — False без ожидания",
+              died is False and spent < 1.0 and len(popens) == 1,
+              f"{spent:.2f} с")
+
+        actions._popen = lambda args, cwd=None: (
+            popens.append((list(args), cwd)) or FakeProcess(True))
+        port_state["open"] = True
+        check("start_tgws: порт слушает — True",
+              actions.start_tgws(tgws_cfg) is True)
+        popens.clear()
+        actions.tgws_running = lambda: True
+        check("start_tgws: уже запущенный не поднимает второй",
+              actions.start_tgws(tgws_cfg) is False and not popens,
+              str(popens))
+        actions.tgws_running = lambda: False
+
+        # --- сторож в приложении ---
+        ok_items = [
+            {"id": "zapret", "title": "zapret", "state": "ok", "detail": "general"},
+            {"id": "youtube", "title": "YouTube", "state": "ok", "detail": "3.2 с"},
+            {"id": "discord", "title": "Discord", "state": "ok", "detail": "1.4 с"},
+            {"id": "deepseek", "title": "DeepSeek", "state": "ok", "detail": "0.4 с"},
+            {"id": "telegram", "title": "Telegram", "state": "ok", "detail": "Bot API"},
+            {"id": "tgwsproxy", "title": "tg-ws-proxy", "state": "ok",
+             "detail": "порт 1443 слушает"},
+            {"id": "vpn", "title": "VPN", "state": "ok", "detail": "подключён"},
+        ]
+
+        def fresh_report(items: list[dict], level: str = "ok",
+                         verdict: str = "ok") -> dict:
+            return {"checked": time.time(), "verdict": verdict, "level": level,
+                    "items": [dict(item) for item in items]}
+
+        def service_of(app, item_id: str = "tgwsproxy") -> dict:
+            return next(item for item in app.health_report.get("items") or []
+                        if item.get("id") == item_id)
+
+        watch_app = TrayApp()
+        watch_app.cfg = {**watch_app.cfg, **tgws_cfg}
+        watch_app.refresh = lambda: None
+        watch_app.refresh_activity = lambda: None
+        watch_app.health_report = fresh_report(ok_items)
+        watch_app.health_at = time.time()
+        watch_app._level = "ok"
+        watch_app._level_at = 0.0
+        starts: list = []
+        actions.start_tgws = lambda cfg: (starts.append(dict(cfg)) or True)
+        actions.tgws_running = lambda: False
+        port_state["open"] = False
+
+        watch_app._watch_tgws()
+        check("сторож: мёртвый tgws — один перезапуск", len(starts) == 1,
+              str(len(starts)))
+        check("сторож: успешный перезапуск — пункт снова ok",
+              service_of(watch_app)["state"] == "ok",
+              str(service_of(watch_app)))
+        check("сторож: в журнале «tg-ws-proxy упал — перезапустил»",
+              any(row.get("text") == "tg-ws-proxy упал — перезапустил"
+                  for row in activity.recent(20)))
+        watch_app._watch_tgws()
+        check("сторож: повтор в пределах минуты не запускает",
+              len(starts) == 1, str(len(starts)))
+
+        watch_app._tgws_user_off = True
+        watch_app._last_tgws_restart = 0.0
+        watch_app.health_report = fresh_report(ok_items)
+        watch_app._watch_tgws()
+        check("сторож: ручная остановка блокирует перезапуск",
+              len(starts) == 1, str(len(starts)))
+
+        watch_app._tgws_user_off = False
+        watch_app._last_tgws_restart = 0.0
+        actions.start_tgws = lambda cfg: False
+        watch_app._watch_tgws()
+        bad_item = service_of(watch_app)
+        check("сторож: неудачный перезапуск — пункт bad с причиной",
+              bad_item["state"] == "bad" and "не слушает" in bad_item["detail"],
+              str(bad_item))
+        check("сторож: в журнале «перезапустить не удалось»",
+              any(row.get("text") == "tg-ws-proxy упал — перезапустить не удалось"
+                  for row in activity.recent(20)))
+        check("сторож: падение видно в уровне, а не только в отчёте",
+              watch_app.health_report.get("level") == "degraded",
+              str(watch_app.health_report.get("level")))
+
+        actions.tgws_running = lambda: True
+        status.port_open = lambda port: True
+        watch_app._tgws_down = True
+        watch_app._watch_tgws()
+        check("сторож: вернувшийся прокси снова ok",
+              not watch_app._tgws_down
+              and service_of(watch_app)["state"] == "ok",
+              str(service_of(watch_app)))
+        status.port_open = real_status_port
+
+        # --- _mark_service: уровень считается по всем пунктам ---
+        mark_app = TrayApp()
+        mark_app.refresh_activity = lambda: None
+        mark_app.proxy = {"running": False}
+        mark_app.health_report = fresh_report(ok_items)
+        mark_app._level = "ok"
+        mark_app._level_at = 0.0
+        mark_app._level_candidate = ""
+        mark_app._level_hits = 0
+        mark_app._mark_service("tgwsproxy", "bad", "порт 1443 не слушает")
+        marked = service_of(mark_app)
+        first_level = mark_app._level
+        check("_mark_service: пункт отчёта обновлён",
+              marked["state"] == "bad"
+              and mark_app.health_report.get("level") == "degraded",
+              f"{marked['state']} / {mark_app.health_report.get('level')}")
+        mark_app._mark_service("tgwsproxy", "bad", "порт 1443 не слушает")
+        check("_mark_service: bad даёт degraded, а не ok",
+              first_level != "down" and mark_app._level == "degraded",
+              f"один отчёт: {first_level}, два: {mark_app._level}")
+        mark_app._level_at = time.time() - 120
+        mark_app._mark_service("tgwsproxy", "ok", "порт 1443 слушает")
+        check("_mark_service: ok возвращает уровень",
+              mark_app._level == "ok" and service_of(mark_app)["state"] == "ok",
+              mark_app._level)
+
+        down_items = [dict(item) for item in ok_items]
+        for item in down_items:
+            if item["id"] == "vpn":
+                item["state"] = "bad"
+                item["detail"] = "сервер не отвечает"
+        mark_app.health_report = fresh_report(down_items, "down", "fail")
+        mark_app._level = "down"
+        mark_app._level_at = time.time() - 120
+        mark_app._level_candidate = ""
+        mark_app._level_hits = 0
+        mark_app._mark_service("tgwsproxy", "ok", "порт 1443 слушает")
+        check("_mark_service: оживший Telegram не зеленеет при мёртвом VPN",
+              mark_app._level == "down"
+              and mark_app.health_report.get("level") == "down",
+              f"{mark_app._level} / {mark_app.health_report.get('level')}")
+
+        # --- ручная остановка и запуск из меню ---
+        stop_calls: list = []
+        actions.stop_tgws = lambda: (stop_calls.append(1) or {"killed": 1})
+        starts.clear()
+        actions.start_tgws = lambda cfg: (starts.append(dict(cfg)) or True)
+        watch_app._tgws_user_off = False
+        watch_app.busy.pop("tgws", None)
+        check("stop_tgws запускается", watch_app.stop_tgws() is True)
+        check("stop_tgws ставит флаг ручной остановки",
+              watch_app._tgws_user_off is True)
+        deadline = time.time() + 3
+        while watch_app.busy.get("tgws") and time.time() < deadline:
+            time.sleep(0.02)
+        check("stop_tgws вызвал остановку", len(stop_calls) == 1,
+              str(len(stop_calls)))
+        check("start_tgws снимает флаг ручной остановки",
+              watch_app.start_tgws() is True
+              and watch_app._tgws_user_off is False)
+        deadline = time.time() + 3
+        while watch_app.busy.get("tgws") and time.time() < deadline:
+            time.sleep(0.02)
+        check("start_tgws снова разрешает сторожу поднимать прокси",
+              len(starts) == 1)
+    finally:
+        actions.port_open = real_port_open
+        actions._popen = real_popen
+        actions.TGWS_PORT_WAIT = real_port_wait
+        actions.TGWS_PORT_STEP = real_port_step
+        actions.start_tgws = real_start_tgws
+        actions.tgws_running = real_tgws_running
+        actions.stop_tgws = real_stop_tgws
+        status.port_open = real_status_port
 
     # --- обновление всего ------------------------------------------------
     print("\n-- обновление всего --")

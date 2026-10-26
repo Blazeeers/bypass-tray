@@ -6,6 +6,7 @@ import json
 import sys
 import threading
 import time
+from pathlib import Path
 
 try:
     import pystray
@@ -24,6 +25,10 @@ from .ui import Panel, clean_server_name, report_level
 #: После автосмены сервера не трогаем его 10 минут: частые перезапуски
 #: Xray рвут уже установленные соединения (в том числе YouTube).
 AUTO_SWITCH_COOLDOWN = 600.0
+
+#: Не чаще раза в минуту поднимаем упавший tg-ws-proxy: каждый запуск ждёт
+#: порт до 4 с, а частые перезапуски только мешают.
+TGWS_RESTART_COOLDOWN = 60.0
 
 #: Подписи пунктов для подсказки иконки (как в панели).
 _LEVEL_LABELS = {
@@ -65,6 +70,12 @@ class TrayApp:
         self._health_checking = False
         self._health_tick = 0
         self._last_auto_switch = 0.0
+        # --- сторож tg-ws-proxy ---
+        self._last_tgws_restart = 0.0
+        # Ручная остановка из меню: пока флаг стоит, сами не поднимаем.
+        self._tgws_user_off = False
+        # Мы уже сказали «упал»: вернуть ok, когда процесс снова слушает.
+        self._tgws_down = False
         self.panel = Panel(self)
         self._icon = None
         self._signature = None
@@ -323,6 +334,9 @@ class TrayApp:
         любой попытки смены — кулдаун 10 минут, иначе перезапуски Xray рвут
         соединения YouTube.
         """
+        # Сторож tg-ws-proxy смотрит только процесс и локальный порт, без сети,
+        # поэтому идёт на каждом тике — и при выключенном VPN тоже.
+        self._watch_tgws()
         if self.updates_running or (self.busy or {}).get("updates"):
             self._proxy_failures = 0
             return
@@ -394,6 +408,62 @@ class TrayApp:
             self.refresh()
 
         threading.Thread(target=worker, daemon=True, name="tunnel-check").start()
+
+    def _watch_tgws(self) -> None:
+        """Быстрый сторож tg-ws-proxy: процесс и локальный порт, без сети.
+
+        Отчёт health собирается раз в ``health_minutes`` (10 минут по
+        умолчанию), и до него мёртвый прокси выглядел зелёным: порт 1443
+        закрыт, а в ``health.json`` написано «слушает». Здесь падение
+        замечается за тик (5 с): пункт помечается ``bad``, прокси
+        перезапускается, итог уходит в журнал. Ручная остановка
+        (``_tgws_user_off``) сторожа выключает — с пользователем не воюем.
+        """
+        if self._tgws_user_off or self._shutting_down:
+            return
+        # Эти проходы сами поднимают tgws (надзиратель, обновление, кнопка):
+        # второй параллельный запуск нам не нужен.
+        if self.health_running or self.guard_running:
+            return
+        if self.updates_running or (self.busy or {}).get("updates"):
+            return
+        if (self.busy or {}).get("tgws"):
+            return
+        exe = str(self.cfg.get("tgws_exe") or "").strip()
+        if not exe or not Path(exe).is_file():
+            return
+        port = actions.tgws_port(self.cfg)
+        if actions.tgws_running():
+            # Процесс вернулся (его подняли вручную или надзиратель).
+            if self._tgws_down and status.port_open(port):
+                self._tgws_down = False
+                self._mark_service("tgwsproxy", "ok", f"порт {port} слушает")
+            return
+        now = time.time()
+        if now - self._last_tgws_restart < TGWS_RESTART_COOLDOWN:
+            return
+        # Кулдаун ставим до запуска: он ждёт порт до 4 с, и следующий тик не
+        # должен стартовать второй процесс.
+        self._last_tgws_restart = now
+        self._tgws_down = True
+        self._mark_service("tgwsproxy", "bad",
+                           f"порт {port} не слушает, перезапускаю")
+        try:
+            started = actions.start_tgws(self.cfg)
+        except Exception as exc:  # noqa: BLE001
+            activity.log(f"tg-ws-proxy упал — перезапустить не удалось: {exc}",
+                         kind="warn")
+            self.refresh_activity()
+            return
+        if started:
+            self._tgws_down = False
+            activity.log("tg-ws-proxy упал — перезапустил", kind="ok")
+            self._mark_service("tgwsproxy", "ok", f"порт {port} слушает")
+        else:
+            activity.log("tg-ws-proxy упал — перезапустить не удалось", kind="warn")
+            # Причина уже не «перезапускаю»: попытка была и не удалась.
+            self._mark_service("tgwsproxy", "bad", f"порт {port} не слушает")
+        self.refresh_activity()
 
     def sync_proxy_state(self) -> None:
         """Синхронизирует состояние прокси и наш системный прокси."""
@@ -583,6 +653,33 @@ class TrayApp:
             level = report_level(report) or "ok"
             verdict = str(report.get("verdict") or "ok")
         self._apply_level({"level": level, "verdict": verdict, "items": []})
+
+    def _mark_service(self, item_id: str, state: str, detail: str = "") -> None:
+        """Правит пункт последнего отчёта и пересчитывает уровень иконки.
+
+        Отчёт живёт до следующего ``health.collect`` (10 минут по умолчанию),
+        поэтому наблюдение сторожа (порт закрылся или снова слушает) пишется
+        в него сразу: иначе панель и иконка показывают устаревшее «слушает».
+        Уровень считается по всем пунктам заново и применяется через
+        ``_apply_level`` — гистерезис и кулдаун остаются его заботой, поэтому
+        красный VPN не позеленеет от того, что Telegram ожил.
+        """
+        report = dict(self.health_report or {})
+        items = [dict(item) if isinstance(item, dict) else item
+                 for item in (report.get("items") or [])]
+        target = next((item for item in items
+                       if isinstance(item, dict)
+                       and str(item.get("id") or "") == item_id), None)
+        if target is None:
+            # Отчёта нет или в нём нет такого пункта: полный отчёт не выдумываем.
+            return
+        target["state"] = state
+        target["detail"] = detail
+        report["items"] = items
+        report["verdict"] = health.verdict(items)
+        report["level"] = health.level(items, self.cfg, dict(self.proxy or {}))
+        self.health_report = report
+        self._apply_level(report)
 
     def _apply_level(self, report: dict) -> None:
         """Уровень иконки с гистерезисом, чтобы одиночная проба не мигала.
@@ -1073,10 +1170,22 @@ class TrayApp:
                                      actions.restart_zapret, self.cfg)
 
     def start_tgws(self) -> bool:
+        # Ручной запуск снимает запрет, поставленный «Остановить».
+        self._tgws_user_off = False
+        self._tgws_down = False
         return self._run_action_busy("tgws", "запускаю tg-ws-proxy…",
                                      actions.start_tgws, self.cfg)
 
+    def stop_tgws(self) -> bool:
+        """Ручная остановка: авто-перезапуск выключается до следующего запуска."""
+        self._tgws_user_off = True
+        return self._run_action_busy("tgws", "останавливаю tg-ws-proxy…",
+                                     actions.stop_tgws)
+
     def restart_tgws(self) -> bool:
+        self._tgws_user_off = False
+        self._tgws_down = False
+
         def action() -> None:
             actions.stop_tgws()
             time.sleep(0.6)
@@ -1348,7 +1457,8 @@ class TrayApp:
                 enabled=proxy_running and not proxy_busy,
             ),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("tg-ws-proxy: запустить", lambda icon, item: self.run_action(actions.start_tgws, self.cfg)),
+            pystray.MenuItem("tg-ws-proxy: запустить", lambda icon, item: self.start_tgws()),
+            pystray.MenuItem("tg-ws-proxy: остановить", lambda icon, item: self.stop_tgws()),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Проверить обновления", lambda icon, item: self.check_all(notify=True)),
             *([pystray.MenuItem("Обновить всё",
