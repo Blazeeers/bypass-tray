@@ -222,11 +222,11 @@ Loyalsoldier из `geosite.dat` рядом с ядром).
 | Что | Значение |
 |---|---|
 | Проект | `F:\Plugins\bypass-tray` |
-| Python | 3.14 (`C:\Users\<имя>\AppData\Local\Python\pythoncore-3.14-64`) |
+| Python | 3.12 (`C:\Users\<имя>\AppData\Local\Programs\Python\Python312`) |
 | venv | `F:\Plugins\bypass-tray\.venv` |
 | zapret | `C:\Program Files\Zapret` (служба `zapret`, автозапуск) |
 | Xray | `<проект>\bin\xray.exe`, прокси `127.0.0.1:10818` |
-| tg-ws-proxy | `C:\Users\<имя>\Desktop\TgWsProxy_windows.exe` |
+| tg-ws-proxy | `C:\Tools\TgWsProxy_windows.exe` |
 | Автозапуск | ярлык `bypass-tray.lnk` в `shell:startup` → `run.bat` |
 
 ### Особенности zapret на этой машине
