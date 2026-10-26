@@ -21,10 +21,10 @@ from PIL import ImageTk
 
 from . import icons
 from .settings_ui import SettingsPage
-from .theme import Theme, resolve_dark
+from .theme import SPACE, Theme, resolve_dark
 from .widgets import (
     AnimatedSection, Card, Chip, Divider, HoverRow, IconButton, PillButton,
-    ScrollBody,
+    ScrollBody, StatusDot,
 )
 
 WINDOW_W = 720
@@ -32,8 +32,10 @@ POLL_MS = 1000
 TICK_MS = 120
 #: Тело панели не выше этой доли высоты экрана.
 BODY_RATIO = 0.88
-CARD_GAP = 10
-PAD = 16
+#: Высота кнопок в рядах действий: та же, что у полей ввода (36 px).
+CONTROL_HEIGHT = SPACE["xl"] + SPACE["md"]
+#: Высота компактной кнопки внутри строки (28–32 px по гайдлайну).
+ROW_CONTROL_HEIGHT = SPACE["xl"] + SPACE["sm"]
 
 #: Эмодзи и флаги из имён серверов: в интерфейсе их быть не должно.
 _EMOJI_RE = re.compile(
@@ -210,6 +212,8 @@ class Panel:
         self._settings_visible = False
         self._page_visible = "main"
         self._title: tk.Label | None = None
+        #: Короткий статус рядом с заголовком: цветная точка + фраза.
+        self._status_chip: Chip | None = None
         self._header_update: IconButton | None = None
         self._header_gear: IconButton | None = None
         self._header_back: IconButton | None = None
@@ -331,6 +335,7 @@ class Panel:
         self._footer = None
         self._subtitle = None
         self._title = None
+        self._status_chip = None
         self._header_update = None
         self._header_gear = None
         self._header_back = None
@@ -516,6 +521,8 @@ class Panel:
         self._body = ScrollBody(self._main_page, theme)
         self._body.pack(fill="both", expand=True)
 
+        # Верхний отступ первой карточки: карточки дают зазор только снизу.
+        tk.Frame(self._body.inner, bg=theme.bg, height=SPACE["md"]).pack(fill="x")
         self._build_vpn(self._card())
         self._build_services(self._card())
         self._build_activity(self._card())
@@ -523,9 +530,9 @@ class Panel:
 
         self._footer = tk.Label(
             self._main_page, text="", bg=theme.bg, fg=theme.text_faint,
-            font=theme.font(8), anchor="w", justify="left",
+            font=theme.caption(), anchor="w", justify="left",
         )
-        self._footer.pack(fill="x", padx=PAD + 2, pady=(2, 10))
+        self._footer.pack(fill="x", padx=SPACE["lg"], pady=(0, SPACE["md"]))
         # Колесо вешаем один раз на готовое дерево главной; строки серверов
         # пересоздаются в _render_servers и привязываются там.
         self._body.bind_tree()
@@ -545,7 +552,7 @@ class Panel:
     def _card(self) -> tk.Frame:
         theme = self._theme
         card = Card(self._body.inner, theme)
-        card.pack(fill="x", padx=PAD, pady=(0, CARD_GAP))
+        card.pack(fill="x", padx=SPACE["lg"], pady=(0, SPACE["md"]))
         return card.inner
 
     # ---- шапка -------------------------------------------------------------
@@ -554,24 +561,33 @@ class Panel:
         header.pack(fill="x")
         self._header = header
         inner = tk.Frame(header, bg=theme.header)
-        inner.pack(fill="x", padx=PAD, pady=12)
+        inner.pack(fill="x", padx=SPACE["lg"], pady=SPACE["md"])
 
         badge_image = ImageTk.PhotoImage(icons.make_app_icon(44))
         self._images.append(badge_image)
+
         badge = tk.Label(inner, image=badge_image, bg=theme.header, bd=0)
-        badge.pack(side="left", padx=(0, 12))
+        badge.pack(side="left", padx=(0, SPACE["md"]))
 
         titles = tk.Frame(inner, bg=theme.header)
         titles.pack(side="left", fill="y")
+        title_row = tk.Frame(titles, bg=theme.header)
+        title_row.pack(anchor="w", fill="x")
         self._title = tk.Label(
-            titles, text="Обходы", bg=theme.header, fg=theme.header_text,
-            font=theme.font(16, "bold"), anchor="w")
-        self._title.pack(anchor="w")
+            title_row, text="Обходы", bg=theme.header, fg=theme.header_text,
+            font=theme.display(), anchor="w")
+        self._title.pack(side="left")
+        # Статус — плашка рядом с названием, а не отдельная строка: короткая
+        # фраза читается сразу, подробности остаются в подзаголовке.
+        self._status_chip = Chip(
+            title_row, theme, "Проверяю…", theme.dim, bg=theme.header)
+        self._status_chip.pack(side="left", padx=(SPACE["sm"], 0),
+                               pady=(SPACE["xs"] - 1, 0))
         self._subtitle = tk.Label(
             titles, text="", bg=theme.header, fg=theme.header_dim,
-            font=theme.font(8, "bold"), anchor="w",
+            font=theme.body(), anchor="w",
         )
-        self._subtitle.pack(anchor="w", pady=(2, 0))
+        self._subtitle.pack(anchor="w", pady=(SPACE["xs"], 0))
 
         self._header_back = IconButton(
             inner, theme, self._icon("chevron_left", theme.header_dim, 20),
@@ -585,12 +601,11 @@ class Panel:
             inner, theme, self._icon("gear", theme.header_dim, 20),
             self._open_settings, tooltip="Настройки", bg=theme.header, size=32,
         )
-        self._header_back.pack(side="right", padx=(0, 6))
-        self._header_update.pack(side="right", padx=(0, 6))
-        self._header_gear.pack(side="right", padx=(0, 8))
+        self._header_back.pack(side="right", padx=(0, SPACE["sm"]))
+        self._header_update.pack(side="right", padx=(0, SPACE["sm"]))
+        self._header_gear.pack(side="right", padx=(0, SPACE["sm"]))
         self._header_back.pack_forget()
         self._set_header_mode("main")
-
     def _set_header_mode(self, mode: str) -> None:
         theme = self._theme
         settings = mode == "settings"
@@ -604,7 +619,7 @@ class Panel:
             if button is None:
                 continue
             if visible:
-                button.pack(side="right", padx=(0, 6))
+                button.pack(side="right", padx=(0, SPACE["sm"]))
             else:
                 button.pack_forget()
         if not settings:
@@ -715,7 +730,7 @@ class Panel:
 
         shield = tk.Label(top, bg=theme.card, bd=0)
         self._set_icon(shield, "shield", theme.accent, 22)
-        shield.pack(side="left", padx=(0, 10), anchor="n")
+        shield.pack(side="left", padx=(0, SPACE["md"]), anchor="n")
         self._vpn["icon"] = shield
 
         titles = tk.Frame(top, bg=theme.card)
@@ -723,31 +738,32 @@ class Panel:
         title_row = tk.Frame(titles, bg=theme.card)
         title_row.pack(fill="x")
         tk.Label(title_row, text="VPN", bg=theme.card, fg=theme.text,
-                 font=theme.font(11, "bold")).pack(side="left")
+                 font=theme.title()).pack(side="left")
         self._vpn["chip"] = Chip(title_row, theme, "выключен", theme.dim)
-        self._vpn["chip"].pack(side="left", padx=(8, 0))
+        self._vpn["chip"].pack(side="left", padx=(SPACE["sm"], 0),
+                               pady=(SPACE["xs"] // 2, 0))
         self._vpn["line"] = tk.Label(
             titles, text="выключен", bg=theme.card, fg=theme.text_dim,
-            font=theme.font(9), anchor="w",
+            font=theme.body(), anchor="w",
         )
-        self._vpn["line"].pack(fill="x", pady=(3, 0))
+        self._vpn["line"].pack(fill="x", pady=(SPACE["xs"], 0))
 
         self._vpn["button"] = PillButton(
             top, theme, "Включить", lambda: self._call(self.controller.set_proxy, True),
-            kind="primary", min_width=112, height=32,
+            kind="primary", min_width=120, height=CONTROL_HEIGHT,
         )
-        self._vpn["button"].pack(side="right", padx=(12, 0))
+        self._vpn["button"].pack(side="right", padx=(SPACE["md"], 0))
 
-        Divider(inner, theme).pack(fill="x", pady=(10, 4))
+        Divider(inner, theme).pack(fill="x", pady=(SPACE["md"], SPACE["sm"]))
 
         toggle = HoverRow(inner, theme, command=self._toggle_servers)
         toggle.pack(fill="x")
         label = tk.Label(toggle, text="Регионы и серверы", bg=theme.card,
-                         fg=theme.text_dim, font=theme.font(9, "bold"), anchor="w")
-        label.pack(side="left", fill="x", expand=True)
+                         fg=theme.text, font=theme.title(), anchor="w")
+        label.pack(side="left", fill="x", expand=True, pady=SPACE["sm"])
         chevron = tk.Label(toggle, bg=theme.card, bd=0)
         self._set_icon(chevron, "chevron", theme.text_dim, 14)
-        chevron.pack(side="right", padx=(6, 2))
+        chevron.pack(side="right", padx=(SPACE["sm"], SPACE["xs"]))
         self._vpn["toggle"] = toggle
         self._vpn["toggle_label"] = label
         self._vpn["chevron"] = chevron
@@ -761,59 +777,63 @@ class Panel:
         self._servers_list = tk.Frame(self._servers_frame, bg=theme.card)
         self._servers_list.pack(fill="x")
         buttons = tk.Frame(self._servers_frame, bg=theme.card)
-        buttons.pack(fill="x", pady=(6, 0))
+        buttons.pack(fill="x", pady=(SPACE["sm"], 0))
         self._vpn["pick"] = PillButton(
             buttons, theme, "Подобрать лучший",
             lambda: self._call(self.controller.pick_best_server),
-            kind="secondary", height=28, pad_x=11,
+            kind="secondary", height=ROW_CONTROL_HEIGHT, pad_x=SPACE["md"],
         )
         self._vpn["pick"].pack(side="left")
         self._vpn["refresh"] = PillButton(
             buttons, theme, "Обновить список",
             lambda: self._call(self.controller.load_servers, True),
-            kind="secondary", height=28, pad_x=11,
+            kind="secondary", height=ROW_CONTROL_HEIGHT, pad_x=SPACE["md"],
         )
-        self._vpn["refresh"].pack(side="left", padx=(8, 0))
+        self._vpn["refresh"].pack(side="left", padx=(SPACE["sm"], 0))
 
     # -- карточка сервисов ---------------------------------------------------
     def _build_services(self, inner: tk.Frame) -> None:
         theme = self._theme
-        for index, (key, title, icon_name) in enumerate(SERVICES):
+        for index, (key, title, _icon_name) in enumerate(SERVICES):
             row = HoverRow(inner, theme)
             row.pack(fill="x")
             grid = tk.Frame(row, bg=theme.card)
-            grid.pack(fill="x", pady=6)
+            grid.pack(fill="x", pady=SPACE["sm"])
             grid.columnconfigure(1, weight=1)
 
-            icon = tk.Label(grid, bg=theme.card, bd=0)
-            self._set_icon(icon, icon_name, theme.dim, 20)
-            icon.grid(row=0, column=0, rowspan=2, padx=(0, 11), sticky="n")
+            # Состояние сервиса читается по точке; иконки брендов набора
+            # состояний дублировали бы смысл и добавляли визуальный шум.
+            dot = StatusDot(grid, theme, size=SPACE["md"], bg=theme.card)
+            dot.grid(row=0, column=0, rowspan=2, sticky="w",
+                     padx=(0, SPACE["md"]))
 
             name = tk.Label(grid, text=title, bg=theme.card, fg=theme.text,
-                            font=theme.font(10, "bold"), anchor="w")
+                            font=theme.body("bold"), anchor="w")
             name.grid(row=0, column=1, sticky="w")
 
             detail = tk.Label(grid, text="", bg=theme.card, fg=theme.text_faint,
-                              font=theme.font(8), anchor="w")
+                              font=theme.caption(), anchor="w")
             detail.grid(row=1, column=1, sticky="w")
 
             state = tk.Label(grid, text="—", bg=theme.card, fg=theme.dim,
-                             font=theme.font(9, "bold"), anchor="e")
-            state.grid(row=0, column=2, rowspan=2, sticky="e", padx=(10, 0))
+                             font=theme.caption("bold"), anchor="e")
+            state.grid(row=0, column=2, rowspan=2, sticky="e",
+                       padx=(SPACE["md"], 0))
 
             button = None
             if key in ("zapret", "tgwsproxy"):
                 button = PillButton(grid, theme, "Запустить", None,
-                                    kind="secondary", height=26, pad_x=10,
-                                    min_width=104)
-                button.grid(row=0, column=2, rowspan=2, sticky="e", padx=(10, 0))
+                                    kind="ghost", height=ROW_CONTROL_HEIGHT,
+                                    pad_x=SPACE["md"], min_width=104)
+                button.grid(row=0, column=2, rowspan=2, sticky="e",
+                            padx=(SPACE["md"], 0))
                 button.grid_remove()
 
             self._services[key] = {
-                "row": row, "grid": grid, "icon": icon, "name": name,
+                "row": row, "grid": grid, "dot": dot, "name": name,
                 "detail": detail, "state": state, "button": button,
             }
-            for widget in (icon, name, detail, state):
+            for widget in (dot, name, detail, state):
                 row.track(widget)
             if index < len(SERVICES) - 1:
                 Divider(inner, theme).pack(fill="x")
@@ -822,26 +842,26 @@ class Panel:
     def _build_activity(self, inner: tk.Frame) -> None:
         theme = self._theme
         header = tk.Frame(inner, bg=theme.card)
-        header.pack(fill="x", pady=(0, 7))
-        tk.Label(header, text="ЧТО ВИДЖЕТ СДЕЛАЛ САМ", bg=theme.card,
-                 fg=theme.text_faint, font=theme.font(8, "bold"), anchor="w"
+        header.pack(fill="x", pady=(0, SPACE["sm"]))
+        tk.Label(header, text="Что виджет сделал сам", bg=theme.card,
+                 fg=theme.text, font=theme.title(), anchor="w"
                  ).pack(side="left")
         self._activity_period = tk.Label(
             header, text="", bg=theme.card, fg=theme.text_faint,
-            font=theme.font(8), anchor="w")
-        self._activity_period.pack(side="left", padx=(8, 0))
+            font=theme.caption(), anchor="w")
+        self._activity_period.pack(side="left", padx=(SPACE["sm"], 0))
         self._activity_empty = tk.Label(
             inner, text="", bg=theme.card, fg=theme.text_faint,
-            font=theme.font(9), anchor="w",
+            font=theme.body(), anchor="w",
         )
         self._activity_empty.pack(fill="x")
         for _index in range(5):
             row = tk.Frame(inner, bg=theme.card)
             stamp = tk.Label(row, text="", bg=theme.card, fg=theme.text_faint,
-                             font=theme.font(8), width=6, anchor="w")
+                             font=theme.caption(), width=6, anchor="w")
             stamp.pack(side="left")
             text = tk.Label(row, text="", bg=theme.card, fg=theme.text_dim,
-                            font=theme.font(9), anchor="w", justify="left")
+                            font=theme.body(), anchor="w", justify="left")
             text.pack(side="left", fill="x", expand=True)
             self._activity_rows.append({"frame": row, "stamp": stamp, "text": text})
 
@@ -849,30 +869,27 @@ class Panel:
     def _build_actions(self) -> None:
         theme = self._theme
         frame = tk.Frame(self._body.inner, bg=theme.bg)
-        frame.pack(fill="x", padx=PAD, pady=(2, CARD_GAP))
+        frame.pack(fill="x", padx=SPACE["lg"], pady=(0, SPACE["md"]))
 
-        primary = PillButton(
-            frame, theme, "Проверить всё",
-            lambda: self._call(self.controller.run_health), kind="primary",
-            width=WINDOW_W - 2 * PAD, height=32,
-        )
-        primary.pack(fill="x")
-        self._buttons["check_all"] = primary
-
-        row = tk.Frame(frame, bg=theme.bg)
-        row.pack(fill="x", pady=(8, 0))
-        width = (WINDOW_W - 2 * PAD - 16) // 3
+        # Один ряд равных кнопок одной высоты: primary выделяется цветом,
+        # а не шириной, поэтому ряд не «прыгает» при смене состояния.
+        gap = SPACE["sm"]
+        width = (WINDOW_W - 2 * SPACE["lg"] - 3 * gap) // 4
         specs = (
-            ("sweep", "Тест стратегий", self.controller.start_sweep),
-            ("routes", "Проверить маршруты", self._confirm_routes),
-            ("subscription", "Обновить подписку", self.controller.refresh_subscription),
+            ("check_all", "Проверить всё", self.controller.run_health, "primary"),
+            ("sweep", "Тест стратегий", self.controller.start_sweep, "secondary"),
+            ("routes", "Проверить маршруты", self._confirm_routes, "secondary"),
+            ("subscription", "Обновить подписку",
+             self.controller.refresh_subscription, "secondary"),
         )
-        for key, text, command in specs:
+        for index, (key, text, command, kind) in enumerate(specs):
             # Подтверждение маршрутов показывает messagebox — только в UI-потоке.
             callback = command if key == "routes" else (lambda c=command: self._call(c))
-            button = PillButton(row, theme, text, callback,
-                                kind="secondary", width=width, height=32)
-            button.pack(side="left", padx=(0, 8) if key != "subscription" else (0, 0))
+            button = PillButton(frame, theme, text, callback, kind=kind,
+                                width=width, height=CONTROL_HEIGHT)
+            button.grid(row=0, column=index, sticky="ew",
+                        padx=(0 if index == 0 else gap, 0))
+            frame.columnconfigure(index, weight=1, uniform="actions")
             self._buttons[key] = button
 
     # ---- обновление данных -------------------------------------------------
@@ -900,21 +917,33 @@ class Panel:
 
     def _render_subtitle(self, running: bool, level: str, busy: dict,
                          health_running: bool) -> None:
-        if self._subtitle is None:
-            return
+        """Короткий статус — в чип, сервер и задержка — в подзаголовок."""
+        theme = self._theme
+        proxy = getattr(self.controller, "proxy", {}) or {}
+        name = clean_server_name(proxy.get("server") or "") or "сервер не выбран"
+        latency = proxy.get("latency")
+        latency_text = (f"{latency} мс"
+                        if isinstance(latency, int) and latency >= 0 else "")
+        server = f"VPN ВКЛЮЧЁН · {name}"
+        if latency_text:
+            server += f" · {latency_text}"
         if busy or health_running:
-            text = "ПРОВЕРЯЮ…"
+            chip_text, color, detail = "Проверяю…", theme.accent, "проверяю связь…"
         elif not running:
-            text = "VPN ВЫКЛЮЧЕН"
+            chip_text, color = "VPN выключен", theme.dim
+            detail = proxy.get("message") or "не подключён"
         elif level == "down":
-            text = "VPN ВКЛЮЧЁН · ЕСТЬ СБОЙ"
+            chip_text, color, detail = "Есть сбой", theme.bad, server
         elif level == "degraded":
-            text = "VPN ВКЛЮЧЁН · ТРЕБУЕТ ВНИМАНИЯ"
+            chip_text, color, detail = "Требует внимания", theme.warn, server
         elif level == "ok":
-            text = "VPN ВКЛЮЧЁН · ВСЁ РАБОТАЕТ"
+            chip_text, color, detail = "Всё работает", theme.ok, server
         else:
-            text = "VPN ВКЛЮЧЁН · ПРОВЕРКА НЕ ЗАПУСКАЛАСЬ"
-        self._subtitle.configure(text=text)
+            chip_text, color, detail = "Нет данных", theme.dim, server
+        if self._status_chip is not None:
+            self._status_chip.set(chip_text, color)
+        if self._subtitle is not None:
+            self._subtitle.configure(text=detail)
 
     def _render_vpn(self, proxy: dict, busy: dict) -> None:
         theme = self._theme
@@ -996,8 +1025,8 @@ class Panel:
             child.destroy()
         if not prepared:
             tk.Label(holder, text="список пуст — нажмите «Обновить список»",
-                     bg=theme.card, fg=theme.text_faint, font=theme.font(8),
-                     anchor="w").pack(fill="x", pady=3)
+                     bg=theme.card, fg=theme.text_faint, font=theme.caption(),
+                     anchor="w").pack(fill="x", pady=SPACE["xs"])
             if self._body is not None:
                 self._body.bind_tree(holder)
             return
@@ -1014,18 +1043,19 @@ class Panel:
             marker_label = tk.Label(
                 row, text=marker, width=3, bg=theme.card,
                 fg=theme.dim if busy else (theme.accent if is_best else theme.ok),
-                font=theme.font(9, "bold"), anchor="w",
+                font=theme.caption("bold"), anchor="w",
             )
             marker_label.pack(side="left")
             name_label = tk.Label(
                 row, text=item["display"], bg=theme.card,
                 fg=theme.text_faint if busy else theme.text,
-                font=theme.font(9), anchor="w",
+                font=theme.body(), anchor="w",
             )
-            name_label.pack(side="left", fill="x", expand=True, pady=2)
+            name_label.pack(side="left", fill="x", expand=True,
+                            pady=SPACE["xs"] // 2)
             latency_label = tk.Label(
                 row, text=f"{item['latency']} мс" if item["latency"] is not None else "—",
-                bg=theme.card, fg=theme.text_faint, font=theme.font(8), anchor="e",
+                bg=theme.card, fg=theme.text_faint, font=theme.caption(), anchor="e",
             )
             latency_label.pack(side="right")
             for widget in (marker_label, name_label, latency_label):
@@ -1058,7 +1088,7 @@ class Panel:
     def _render_services(self, items: dict, status: dict, busy: dict) -> None:
         theme = self._theme
         zapret_status = status.get("zapret") or {}
-        for key, _title, icon_name in SERVICES:
+        for key, _title, _icon_name in SERVICES:
             row = self._services.get(key)
             if not row:
                 continue
@@ -1073,7 +1103,7 @@ class Panel:
                 detail = (detail + " · через VPN") if detail else "через VPN"
             color = {"ok": theme.ok, "warn": theme.warn, "bad": theme.bad}.get(
                 state, theme.dim)
-            self._set_icon(row["icon"], icon_name, color, 20)
+            row["dot"].set(color)
             row["detail"].configure(text=detail)
             row["state"].configure(text=_STATE_WORDS.get(state, "—"), fg=color)
 
@@ -1151,7 +1181,7 @@ class Panel:
             holder["stamp"].configure(text=stamp)
             holder["text"].configure(text=text)
             if not holder["frame"].winfo_manager():
-                holder["frame"].pack(fill="x", pady=1)
+                holder["frame"].pack(fill="x", pady=SPACE["xs"])
 
     def _render_footer(self, status: dict, busy: dict) -> None:
         if self._footer is None:
@@ -1199,7 +1229,7 @@ class Panel:
     def _main_target_height(self) -> int:
         body = self._body.content_height() if self._body is not None else 0
         footer = self._footer.winfo_reqheight() if self._footer is not None else 0
-        total = self._header_height() + body + footer + 12
+        total = self._header_height() + body + footer + SPACE["md"]
         limit = self._body_limit()
         return min(total, limit) if limit else total
 
@@ -1208,7 +1238,8 @@ class Panel:
         root = self._root
         if page is None or root is None:
             return self._main_target_height()
-        max_page = max(320, self._body_limit() - self._header_height() - 8)
+        max_page = max(320, self._body_limit() - self._header_height()
+                       - SPACE["sm"])
         return self._header_height() + min(max(320, page.height_request()), max_page)
 
     def _sync_stage_size(self) -> None:
@@ -1265,7 +1296,7 @@ class Panel:
         except tk.TclError:
             y, title_h = self._origin_y, 0
         work_bottom = _work_area(root)[3]
-        return max(300, work_bottom - y - title_h - 16)
+        return max(300, work_bottom - y - title_h - SPACE["lg"])
 
     def _apply_height(self, height: int) -> None:
         """Меняет высоту окна, не трогая его положение.

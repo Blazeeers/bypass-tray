@@ -922,7 +922,7 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
           and b"for /d" in run_bat_bytes
           and b"dist\\*" in run_bat_bytes
           and b"*.exe" in run_bat_bytes)
-    check("widget_version 0.6.4", updates.widget_version() == "0.6.4",
+    check("widget_version 0.6.5", updates.widget_version() == "0.6.5",
           updates.widget_version())
     empty_components = components.installed({"zapret_dir": "", "tgws_exe": ""})
     check("components.installed: пустые пути — не cwd",

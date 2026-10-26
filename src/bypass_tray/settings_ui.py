@@ -11,16 +11,21 @@ from __future__ import annotations
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk
 
 from . import activity, blocked, components, config, routes, xray
-from .theme import Theme
+from .theme import SPACE, Theme
 from .widgets import (
-    Chip, PillButton, ScrollBody, Segmented, ToggleSwitch, Tooltip, rounded_rect,
+    Card, Divider, HoverRow, PillButton, ScrollBody, Section, Segmented,
+    TextField, ToggleSwitch, Tooltip, blend, rounded_rect,
 )
 
 PORT_MIN = 1024
 PORT_MAX = 65535
+
+#: Высота элементов управления в настройках: та же, что у полей (36 px).
+CONTROL_HEIGHT = SPACE["xl"] + SPACE["md"]
+#: Высота компактного элемента в строке правила (28–32 px).
+ROW_CONTROL_HEIGHT = SPACE["xl"] + SPACE["sm"]
 
 
 def _text_value(cfg: dict, key: str) -> str:
@@ -82,12 +87,21 @@ def _merge_legacy_routes(cfg: dict) -> None:
 BEHAVIOR_TIPS = {
     "autostart": "Запускать «Обходы» при входе в Windows и подключать VPN, "
                  "если включено автоподключение.",
-    "quiet": "Когда всё работает, иконка серая и не отвлекает; при проблеме "
-             "снова цветная.",
+    "quiet": "Не показывать всплывающие уведомления, пока всё в порядке. "
+             "Иконка всегда отражает настоящий статус — серая только когда "
+             "VPN выключен.",
     "guard": "Раз в 10 минут проверять сервисы и лечить: поднимать "
              "tg-ws-proxy, менять сервер, обновлять маршруты.",
     "youtube": "Вести YouTube и Discord через VPN, если видео застревает. "
                "Скорость зависит от сервера.",
+}
+
+#: Короткие подписи под тумблерами: полный текст — в подсказке.
+BEHAVIOR_HINTS = {
+    "autostart": "Запуск при входе в Windows",
+    "quiet": "Без всплывающих уведомлений",
+    "guard": "Проверка сервисов раз в 10 минут",
+    "youtube": "Трафик YouTube и Discord через сервер",
 }
 
 
@@ -104,9 +118,12 @@ class SettingsPage(tk.Frame):
         self._on_close = on_close
         self._busy = False
         self.toggles: dict[str, ToggleSwitch] = {}
+        #: Тумблеры полей VPN: держим ссылки, чтобы reload() их догонял.
+        self.switches: dict[str, ToggleSwitch] = {}
+        self.sections: dict[str, Section] = {}
         self.rules: dict[str, str] = {}
         self.vars: dict[str, tk.Variable] = {}
-        self.entries: dict[str, ttk.Entry] = {}
+        self.entries: dict[str, TextField] = {}
         #: Правила, которые на момент последней синхронизации лежали в конфиге:
         #: по ним видно, есть ли несохранённые правки маршрутов.
         self._saved_rules: dict[str, str] | None = None
@@ -119,66 +136,153 @@ class SettingsPage(tk.Frame):
 
     # ---- сборка ------------------------------------------------------------
     def _section(self, parent: tk.Misc, title: str) -> tk.Frame:
+        """Карточка с раскрывающейся секцией; содержимое кладётся в тело."""
         theme = self.theme
-        holder = tk.Frame(parent, bg=theme.card)
-        holder.pack(fill="x", pady=(0, 12))
-        tk.Label(holder, text=title, bg=theme.card, fg=theme.text_faint,
-                 font=theme.font(8, "bold"), anchor="w").pack(fill="x", pady=(0, 6))
-        body = tk.Frame(holder, bg=theme.card)
-        body.pack(fill="x")
+        card = Card(parent, theme)
+        card.pack(fill="x", pady=(0, SPACE["md"]))
+        section = Section(card.inner, theme, title, bg=theme.card,
+                          start_open=True)
+        section.pack(fill="x")
+        self.sections[title] = section
+        body = tk.Frame(section.body, bg=theme.card)
+        body.pack(fill="x", padx=SPACE["xs"], pady=(0, SPACE["md"]))
         return body
 
-    def _label(self, parent: tk.Misc, text: str) -> None:
-        tk.Label(parent, text=text, bg=self.theme.card, fg=self.theme.text_dim,
-                 font=self.theme.font(8), anchor="w", justify="left",
-                 wraplength=self.WIDTH - 90).pack(fill="x", pady=(6, 2))
+    def _label(self, parent: tk.Misc, text: str, caption: bool = False) -> None:
+        theme = self.theme
+        tk.Label(parent, text=text, bg=theme.card,
+                 fg=theme.text_faint if caption else theme.text_dim,
+                 font=theme.caption() if caption else theme.body(),
+                 anchor="w", justify="left",
+                 wraplength=self.WIDTH - 120).pack(fill="x", pady=(0, SPACE["xs"]))
 
-    def _entry(self, parent: tk.Misc, key: str, width: int = 60) -> ttk.Entry:
-        entry = ttk.Entry(parent, style="Settings.TEntry",
-                          textvariable=self.vars[key], font=self.theme.font(9))
-        entry.pack(fill="x", ipady=3)
-        self.entries[key] = entry
-        return entry
+    def _entry(self, parent: tk.Misc, key: str, placeholder: str = "",
+               width: int | None = None) -> TextField:
+        theme = self.theme
+        field = TextField(parent, theme, self.vars[key],
+                          placeholder=placeholder, bg=theme.card,
+                          width=width or 200)
+        if width is None:
+            field.pack(fill="x", pady=(0, SPACE["md"]))
+        else:
+            field.pack(side="left")
+        self.entries[key] = field
+        return field
+
+    def _switch_row(self, parent: tk.Misc, key: str, title: str,
+                    hint: str) -> ToggleSwitch:
+        """Строка «подпись + тумблер» с серым описанием под ней."""
+        theme = self.theme
+        row = tk.Frame(parent, bg=theme.card)
+        row.pack(fill="x", pady=(0, SPACE["md"]))
+        row.columnconfigure(0, weight=1)
+        name = tk.Label(row, text=title, bg=theme.card, fg=theme.text,
+                        font=theme.body(), anchor="w")
+        name.grid(row=0, column=0, sticky="w")
+        switch = ToggleSwitch(
+            row, theme, bool(self.vars[key].get()),
+            command=lambda value, k=key: self.vars[k].set(bool(value)))
+        switch.grid(row=0, column=1, sticky="e", padx=(SPACE["md"], 0))
+        self.switches[key] = switch
+        tk.Label(row, text=hint, bg=theme.card, fg=theme.text_faint,
+                 font=theme.caption(), anchor="w", justify="left",
+                 wraplength=self.WIDTH - 160).grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(SPACE["xs"], 0))
+        return switch
 
     def _mark_entry_error(self, key: str, error: bool) -> None:
         """Подсветить поле с неверным значением (или снять подсветку)."""
         entry = self.entries.get(key)
-        if entry is None:
-            return
+        if entry is not None:
+            entry.set_error(error)
+
+    def _scroll_area(self, parent: tk.Misc, bg: str, min_height: int,
+                     expand: bool = False) -> ScrollBody:
+        """ScrollBody с тонким ползунком, нарисованным на своём Canvas.
+
+        Полоса ttk в этом стиле просит 1 px ширины (ширину в clam задают
+        только стрелки), поэтому ползунок рисуем сами: виден лишь когда
+        содержимое не влезает.
+        """
+        theme = self.theme
+        rail = tk.Canvas(parent, width=SPACE["sm"], bg=bg,
+                         highlightthickness=0, bd=0, takefocus=0)
+        # Полосу пакуем первой: тогда она получает свои пиксели, а не 1 px
+        # остатка после растянутого canvas.
+        rail.pack(side="right", fill="y")
+        body = ScrollBody(parent, theme, bg=bg, min_height=min_height,
+                          scrollbar=False)
+        if expand:
+            body.pack(side="left", fill="both", expand=True)
+        else:
+            body.pack(side="top", fill="x")
+        state = {"first": 0.0, "last": 1.0}
+
+        def redraw(_event=None) -> None:
+            self._draw_rail(rail, bg, state)
+
+        def on_scroll(first, last) -> None:
+            state["first"], state["last"] = float(first), float(last)
+            redraw()
+
+        body.canvas.configure(yscrollcommand=on_scroll)
+        body.canvas.bind("<Configure>", redraw, add="+")
+        body.inner.bind("<Configure>", redraw, add="+")
+        rail.bind("<Configure>", redraw)
+        redraw()
+        return body
+
+    def _draw_rail(self, rail: tk.Canvas, bg: str, state: dict) -> None:
+        theme = self.theme
         try:
-            entry.configure(style="SettingsError.TEntry" if error
-                            else "Settings.TEntry")
+            rail.delete("all")
+            height = rail.winfo_height()
+            width = rail.winfo_width()
         except tk.TclError:
-            pass
+            return
+        if height <= 4 or width <= 1:
+            return
+        first, last = state["first"], state["last"]
+        if last - first >= 0.999:
+            return
+        top = int(first * height)
+        bottom = int(last * height)
+        min_size = SPACE["lg"] + SPACE["xs"]
+        if bottom - top < min_size:
+            center = (top + bottom) / 2
+            top = int(max(0, min(height - min_size, center - min_size / 2)))
+            bottom = top + min_size
+        inset = 1
+        rounded_rect(
+            rail, inset, top + inset, width - inset, bottom - inset,
+            (width - 2 * inset) / 2,
+            fill=blend(theme.text, bg, 0.30 if not theme.dark else 0.34),
+            outline="",
+        )
 
     def _build(self) -> None:
         theme = self.theme
-        style = ttk.Style(self)
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
-        style.configure("Settings.TCheckbutton", background=theme.card,
-                        foreground=theme.text, focuscolor=theme.card,
-                        font=theme.font(9))
-        style.map("Settings.TCheckbutton",
-                  background=[("active", theme.card)],
-                  foreground=[("active", theme.text)],
-                  indicatorcolor=[("selected", theme.accent),
-                                  ("!selected", theme.btn)])
-        style.configure("Settings.TEntry", fieldbackground=theme.btn,
-                        foreground=theme.text, bordercolor=theme.card_border,
-                        lightcolor=theme.card_border, darkcolor=theme.card_border)
-        style.configure("SettingsError.TEntry", fieldbackground=theme.btn,
-                        foreground=theme.text, bordercolor=theme.bad,
-                        lightcolor=theme.bad, darkcolor=theme.bad)
 
-        self._actions = tk.Frame(self, bg=theme.bg)
-        self._actions.pack(side="bottom", fill="x", padx=16, pady=(8, 12))
-        self.body = ScrollBody(self, theme, scrollbar=True, min_height=120)
-        self.body.pack(fill="both", expand=True)
+        # Подвал — полоса цвета карточки: ghost-«Закрыть» не рисует на фоне
+        # лишний белый прямоугольник, primary остаётся единственным акцентом.
+        self._actions = tk.Frame(self, bg=theme.card)
+        self._actions.pack(side="bottom", fill="x")
+        Divider(self._actions, theme).pack(fill="x")
+        action_row = tk.Frame(self._actions, bg=theme.card)
+        action_row.pack(fill="x", padx=SPACE["lg"], pady=SPACE["md"])
+        PillButton(action_row, theme, "Сохранить", self._save,
+                   kind="primary", height=CONTROL_HEIGHT).pack(side="left")
+        self.close_button = PillButton(
+            action_row, theme, "Закрыть", self._close, kind="ghost",
+            height=CONTROL_HEIGHT)
+        self.close_button.pack(side="left", padx=(SPACE["sm"], 0))
+
+        self.body_host = tk.Frame(self, bg=theme.bg)
+        self.body_host.pack(fill="both", expand=True)
+        self.body = self._scroll_area(self.body_host, theme.bg, 120,
+                                      expand=True)
         pad = tk.Frame(self.body.inner, bg=theme.bg)
-        pad.pack(fill="both", expand=True, padx=16, pady=12)
+        pad.pack(fill="both", expand=True, padx=SPACE["md"], pady=SPACE["lg"])
 
         cfg = dict(self.controller.cfg or {})
         self.vars = {
@@ -193,7 +297,7 @@ class SettingsPage(tk.Frame):
         }
 
         # --- поведение (три тумблера применяются сразу, YouTube — по «Сохранить»)
-        behavior = self._section(pad, "ПОВЕДЕНИЕ")
+        behavior = self._section(pad, "Поведение")
         is_autostart = getattr(self.controller, "is_autostart", None)
         try:
             autostart_now = bool(is_autostart()) if callable(is_autostart) else bool(
@@ -202,173 +306,170 @@ class SettingsPage(tk.Frame):
             autostart_now = bool(cfg.get("autoconnect"))
         rows = (
             ("autostart", "Подключаться при входе", autostart_now, self._set_autostart),
-            ("quiet", "Тихая иконка", bool(cfg.get("quiet_icon", True)), self._set_quiet),
+            ("quiet", "Без уведомлений", bool(cfg.get("quiet_icon", True)), self._set_quiet),
             ("guard", "Автолечение", bool(cfg.get("guard_enabled", True)), self._set_guard),
             ("youtube", "YouTube через VPN",
              bool(cfg.get("youtube_via_vpn", False)), None),
         )
         for index, (key, title, value, setter) in enumerate(rows):
+            if index:
+                Divider(behavior, theme).pack(fill="x", pady=SPACE["sm"])
             row = tk.Frame(behavior, bg=theme.card)
-            row.pack(fill="x", pady=(4, 2))
-            row.grid_columnconfigure(0, weight=1)
-            row.grid_columnconfigure(1, minsize=24)
-            row.grid_columnconfigure(2, minsize=40)
+            row.pack(fill="x")
+            row.columnconfigure(0, weight=1)
             name = tk.Label(row, text=title, bg=theme.card, fg=theme.text,
-                            font=theme.font(9), anchor="w")
+                            font=theme.body(), anchor="w")
             name.grid(row=0, column=0, sticky="w")
             tip = BEHAVIOR_TIPS[key]
             self.tooltips.append(Tooltip(name, tip))
-            hint = tk.Label(row, text="?", width=2, bg=theme.card,
-                            fg=theme.text_faint, font=theme.font(8, "bold"),
-                            padx=0, cursor="question_arrow", anchor="e")
-            hint.grid(row=0, column=1, sticky="e", padx=(8, 8))
-            self.tooltips.append(Tooltip(hint, tip))
             switch = ToggleSwitch(row, theme, value, command=setter)
-            switch.grid(row=0, column=2, sticky="e")
+            switch.grid(row=0, column=1, sticky="e", padx=(SPACE["md"], 0))
             self.tooltips.append(Tooltip(switch, tip))
             self.toggles[key] = switch
-            if index < len(rows) - 1:
-                tk.Frame(behavior, height=1, bg=theme.hairline).pack(fill="x", pady=3)
-        tk.Label(behavior,
-                 text="«YouTube через VPN» применится после «Сохранить»: если видео "
-                      "застревает, трафик YouTube и Discord пойдёт через сервер.",
-                 bg=theme.card, fg=theme.text_faint, font=theme.font(8),
-                 anchor="w", justify="left",
-                 wraplength=self.WIDTH - 90).pack(fill="x", pady=(6, 0))
+            tk.Label(row, text=BEHAVIOR_HINTS[key], bg=theme.card,
+                     fg=theme.text_faint, font=theme.caption(), anchor="w",
+                     justify="left", wraplength=self.WIDTH - 160).grid(
+                row=1, column=0, columnspan=2, sticky="w", pady=(SPACE["xs"], 0))
+        self._label(
+            behavior,
+            "«YouTube через VPN» применится после «Сохранить»: если видео "
+            "застревает, трафик YouTube и Discord пойдёт через сервер.",
+            caption=True)
 
         # --- VPN ---
-        vpn = self._section(pad, "VPN — ССЫЛКА НА ПОДПИСКУ")
-        self._label(vpn, "Вставьте ссылку на подписку (та, что выдаёт провайдер). "
-                         "Она хранится только у вас в config.json.")
-        self._entry(vpn, "xray_subscription")
-        self._label(vpn, "Порт локального прокси (браузеры подключаются к нему):")
-        self._entry(vpn, "xray_port")
-        for key, text in (
-            ("xray_system_proxy",
-             "Прописывать прокси в систему (браузеры сразу начнут им пользоваться)"),
-            ("xray_stream_fallback",
-             "Уводить YouTube/Discord через VPN, когда zapret не работает"),
+        vpn = self._section(pad, "VPN и подписка")
+        self._label(vpn, "Ссылка на подписку (её выдаёт провайдер). Хранится "
+                         "только у вас в config.json.", caption=True)
+        self._entry(vpn, "xray_subscription", placeholder="https://…")
+
+        self._label(vpn, "Порт локального прокси")
+        port_row = tk.Frame(vpn, bg=theme.card)
+        port_row.pack(fill="x", pady=(0, SPACE["md"]))
+        self._entry(port_row, "xray_port", width=120)
+        tk.Label(port_row, text=f"от {PORT_MIN} до {PORT_MAX}; браузеры "
+                               "подключаются к нему",
+                 bg=theme.card, fg=theme.text_faint, font=theme.caption(),
+                 anchor="w", justify="left").pack(
+            side="left", padx=(SPACE["sm"], 0), pady=SPACE["sm"])
+
+        for key, text, hint in (
+            ("xray_system_proxy", "Прописывать прокси в систему",
+             "Браузеры сразу начнут им пользоваться"),
+            ("xray_stream_fallback", "Уводить YouTube/Discord через VPN",
+             "Когда zapret не справляется"),
         ):
-            tk.Checkbutton(
-                vpn, text=text, variable=self.vars[key],
-                bg=theme.card, fg=theme.text, selectcolor=theme.btn,
-                activebackground=theme.card, activeforeground=theme.text,
-                highlightthickness=0, bd=0, anchor="w",
-                font=theme.font(9), cursor="hand2",
-            ).pack(fill="x", pady=2)
+            self._switch_row(vpn, key, text, hint)
 
         # --- список заблокированных ---
-        blocked_section = self._section(pad, "СПИСОК ЗАБЛОКИРОВАННЫХ САЙТОВ")
+        blocked_section = self._section(pad, "Список заблокированных сайтов")
         blocked_row = tk.Frame(blocked_section, bg=theme.card)
         blocked_row.pack(fill="x")
+        blocked_row.columnconfigure(0, weight=1)
         tk.Label(blocked_row, text="Использовать список Re:filter",
-                 bg=theme.card, fg=theme.text, font=theme.font(9),
-                 anchor="w").pack(side="left")
+                 bg=theme.card, fg=theme.text, font=theme.body(),
+                 anchor="w").grid(row=0, column=0, sticky="w")
         self.blocked_toggle = ToggleSwitch(
             blocked_row, theme, bool(cfg.get("blocked_list_enabled", True)))
-        self.blocked_toggle.pack(side="right")
-        tk.Label(blocked_section,
-                 text="≈81 тыс. доменов · MIT · заблокированные идут через VPN",
-                 bg=theme.card, fg=theme.text_faint, font=theme.font(8),
-                 anchor="w", justify="left",
-                 wraplength=self.WIDTH - 90).pack(fill="x", pady=(2, 0))
+        self.blocked_toggle.grid(row=0, column=1, sticky="e",
+                                 padx=(SPACE["md"], 0))
+        self._label(blocked_section,
+                    "≈81 тыс. доменов · MIT · заблокированные идут через VPN",
+                    caption=True)
         self.blocked_status = tk.Label(
             blocked_section, text="", bg=theme.card, fg=theme.text_dim,
-            font=theme.font(8), anchor="w", justify="left",
-            wraplength=self.WIDTH - 90)
-        self.blocked_status.pack(fill="x", pady=(6, 0))
+            font=theme.caption(), anchor="w", justify="left",
+            wraplength=self.WIDTH - 160)
+        self.blocked_status.pack(fill="x", pady=(0, SPACE["sm"]))
         blocked_actions = tk.Frame(blocked_section, bg=theme.card)
-        blocked_actions.pack(fill="x", pady=(6, 0))
+        blocked_actions.pack(fill="x")
         self.blocked_button = PillButton(
             blocked_actions, theme, "Обновить список", self._update_blocked,
-            kind="secondary", height=30)
+            kind="secondary", height=CONTROL_HEIGHT)
         self.blocked_button.pack(side="left")
         self.blocked_progress = tk.Label(
             blocked_actions, text="", bg=theme.card, fg=theme.text_faint,
-            font=theme.font(8), anchor="w", justify="left")
-        self.blocked_progress.pack(side="left", padx=(10, 0), fill="x", expand=True)
-        tk.Label(blocked_section,
-                 text="Свои правила выше списка. YouTube и Discord остаются под zapret.",
-                 bg=theme.card, fg=theme.text_faint, font=theme.font(8),
-                 anchor="w", justify="left",
-                 wraplength=self.WIDTH - 90).pack(fill="x", pady=(6, 0))
+            font=theme.caption(), anchor="w", justify="left")
+        self.blocked_progress.pack(side="left", padx=(SPACE["sm"], 0),
+                                   fill="x", expand=True)
+        self._label(blocked_section,
+                    "Свои правила выше списка. YouTube и Discord остаются "
+                    "под zapret.", caption=True)
 
         # --- маршруты сайтов ---
-        site_routes = self._section(pad, "МАРШРУТЫ САЙТОВ")
-        tk.Label(
+        site_routes = self._section(pad, "Маршруты сайтов")
+        self._label(
             site_routes,
-            text="Куда вести конкретные сайты. Своё правило важнее автоподбора. "
-                 "Изменения применятся после «Сохранить» — прокси перезапустится.",
-            bg=theme.card, fg=theme.text_dim, font=theme.font(8),
-            anchor="w", justify="left", wraplength=self.WIDTH - 90,
-        ).pack(fill="x")
+            "Куда вести конкретные сайты. Своё правило важнее автоподбора. "
+            "Изменения применятся после «Сохранить» — прокси перезапустится.",
+            caption=True)
 
         add_row = tk.Frame(site_routes, bg=theme.card)
-        add_row.pack(fill="x", pady=(8, 0))
+        add_row.pack(fill="x", pady=(SPACE["xs"], 0))
         self.route_var = tk.StringVar()
-        self.route_entry = ttk.Entry(add_row, style="Settings.TEntry",
-                                     textvariable=self.route_var, font=theme.font(9))
-        self.route_entry.pack(side="left", fill="x", expand=True, ipady=3)
+        self.route_entry = TextField(
+            add_row, theme, self.route_var, placeholder="например: x.com",
+            bg=theme.card)
+        self.route_entry.pack(side="left", fill="x", expand=True)
+        self.route_entry.on_enter(self._add_rule)
+        # Тесты и клавиатура: Enter обрабатывается и на самой плашке поля.
         self.route_entry.bind("<Return>", lambda _event: self._add_rule())
         self.route_segment = Segmented(
             add_row, theme, [("direct", "Напрямую"), ("proxy", "Через VPN")],
-            "direct", bg=theme.card)
-        self.route_segment.pack(side="left", padx=(8, 0))
-        PillButton(add_row, theme, "Добавить", self._add_rule, kind="secondary",
-                   height=30).pack(side="left", padx=(8, 0))
-        tk.Label(site_routes, text="например: x.com или https://x.com/…",
-                 bg=theme.card, fg=theme.text_faint, font=theme.font(8),
-                 anchor="w").pack(fill="x", pady=(3, 0))
+            "direct", bg=theme.card, height=CONTROL_HEIGHT)
+        self.route_segment.pack(side="left", padx=(SPACE["sm"], 0))
+        PillButton(add_row, theme, "Добавить", self._add_rule,
+                   kind="secondary", height=CONTROL_HEIGHT).pack(
+            side="left", padx=(SPACE["sm"], 0))
+        self._label(site_routes, "например: x.com или https://x.com/…",
+                    caption=True)
         self.route_status = tk.Label(
             site_routes, text="", bg=theme.card, fg=theme.text_faint,
-            font=theme.font(8), anchor="w", justify="left",
-            wraplength=self.WIDTH - 90)
-        self.route_status.pack(fill="x", pady=(4, 6))
+            font=theme.caption(), anchor="w", justify="left",
+            wraplength=self.WIDTH - 160)
+        self.route_status.pack(fill="x", pady=(0, SPACE["xs"]))
         self.routes_counter = tk.Label(
             site_routes, text="", bg=theme.card, fg=theme.text_faint,
-            font=theme.font(8, "bold"), anchor="w")
-        self.routes_counter.pack(fill="x")
+            font=theme.caption("bold"), anchor="w")
+        self.routes_counter.pack(fill="x", pady=(0, SPACE["xs"]))
         self.rules_holder = tk.Frame(site_routes, bg=theme.card)
-        self.rules_holder.pack(fill="x", pady=(4, 0))
-        self.rules_scroll = ScrollBody(self.rules_holder, theme, bg=theme.card,
-                                       min_height=48)
-        self.rules_scroll.pack(fill="x")
+        self.rules_holder.pack(fill="x")
+        self.rules_scroll = self._scroll_area(self.rules_holder, theme.card, 48)
+        # Признак «есть правила» проверяется по менеджеру упаковки: пустой
+        # список не должен оставлять рамку прокрутки.
         self.rules_list = self.rules_scroll.inner
         self.routes_empty = tk.Label(
             site_routes,
             text="пока нет своих правил — все сайты идут по общим правилам",
-            bg=theme.card, fg=theme.text_faint, font=theme.font(8),
-            anchor="w", justify="left", wraplength=self.WIDTH - 90)
+            bg=theme.card, fg=theme.text_faint, font=theme.body(),
+            anchor="w", justify="left", wraplength=self.WIDTH - 160)
 
         # --- компоненты ---
-        comp = self._section(pad, "КОМПОНЕНТЫ ОБХОДА")
+        comp = self._section(pad, "Компоненты обхода")
         self.status_label = tk.Label(
-            comp, text="", bg=theme.card, fg=theme.text_dim, font=theme.font(8),
-            anchor="w", justify="left", wraplength=self.WIDTH - 90)
+            comp, text="", bg=theme.card, fg=theme.text_dim,
+            font=theme.caption(), anchor="w", justify="left",
+            wraplength=self.WIDTH - 160)
         self.status_label.pack(fill="x")
-        row = tk.Frame(comp, bg=theme.card)
-        row.pack(fill="x", pady=(8, 0))
+        component_row = tk.Frame(comp, bg=theme.card)
+        component_row.pack(fill="x", pady=(SPACE["sm"], 0))
         self.install_button = PillButton(
-            row, theme, "Установить обходы", self._install_components, kind="primary")
+            component_row, theme, "Установить обходы", self._install_components,
+            kind="primary", height=CONTROL_HEIGHT)
         self.install_button.pack(side="left")
         self.progress_label = tk.Label(
-            row, text="", bg=theme.card, fg=theme.text_faint, font=theme.font(8),
-            anchor="w", justify="left")
-        self.progress_label.pack(side="left", padx=(10, 0), fill="x", expand=True)
+            component_row, text="", bg=theme.card, fg=theme.text_faint,
+            font=theme.caption(), anchor="w", justify="left")
+        self.progress_label.pack(side="left", padx=(SPACE["sm"], 0),
+                                 fill="x", expand=True)
 
         # --- пути ---
-        paths = self._section(pad, "ПУТИ (заполняется автоматически)")
-        self._label(paths, "Папка zapret (с general*.bat и bin\\winws.exe):")
-        self._entry(paths, "zapret_dir")
-        self._label(paths, "Путь к TgWsProxy_windows.exe:")
-        self._entry(paths, "tgws_exe")
-
-        # --- кнопки ---
-        PillButton(self._actions, theme, "Сохранить", self._save,
-                   kind="primary").pack(side="left")
-        self.close_button = PillButton(
-            self._actions, theme, "Закрыть", self._close, kind="secondary")
-        self.close_button.pack(side="left", padx=(8, 0))
+        paths = self._section(pad, "Пути")
+        self._label(paths, "Заполняется автоматически: папка zapret "
+                           "(с general*.bat и bin\\winws.exe).", caption=True)
+        self._entry(paths, "zapret_dir", placeholder="C:\\Program Files\\Zapret")
+        self._label(paths, "Путь к TgWsProxy_windows.exe", caption=True)
+        self._entry(paths, "tgws_exe",
+                    placeholder="C:\\Tools\\TgWsProxy_windows.exe")
 
         self.body.bind_tree()
         self.reload()
@@ -438,6 +539,10 @@ class SettingsPage(tk.Frame):
         }
         for key, switch in self.toggles.items():
             switch.set(values.get(key, False))
+        # Тумблеры VPN привязаны к BooleanVar: после перечитывания конфига
+        # их надо догнать, иначе на экране останется старое положение.
+        for key, switch in self.switches.items():
+            switch.set(bool(self.vars[key].get()))
         self.blocked_toggle.set(bool(cfg.get("blocked_list_enabled", True)))
         mapping = cfg.get("xray_routes")
         if not isinstance(mapping, dict):
@@ -609,14 +714,20 @@ class SettingsPage(tk.Frame):
         self.route_var.set("")
         self._render_rules()
 
+    def _set_rule(self, domain: str, route: str) -> None:
+        """Новый маршрут домена; одинаковое значение ничего не меняет."""
+        if route not in ("direct", "proxy") or self.rules.get(domain) == route:
+            return
+        self.rules[domain] = route
+        self._route_feedback("Изменения применятся после «Сохранить»",
+                             self.theme.text_faint)
+        self._render_rules()
+
     def _toggle_rule(self, domain: str) -> None:
         current = self.rules.get(domain)
         if current is None:
             return
-        self.rules[domain] = "proxy" if current == "direct" else "direct"
-        self._route_feedback("Изменения применятся после «Сохранить»",
-                             self.theme.text_faint)
-        self._render_rules()
+        self._set_rule(domain, "proxy" if current == "direct" else "direct")
 
     def _delete_rule(self, domain: str) -> None:
         if self.rules.pop(domain, None) is None:
@@ -635,32 +746,35 @@ class SettingsPage(tk.Frame):
         if not domains:
             self.rules_scroll.pack_forget()
             if not self.routes_empty.winfo_manager():
-                self.routes_empty.pack(fill="x", pady=(2, 0))
+                self.routes_empty.pack(fill="x", pady=(SPACE["xs"], 0))
             return
         self.routes_empty.pack_forget()
         if not self.rules_scroll.winfo_manager():
             self.rules_scroll.pack(fill="x")
         for domain in domains:
             route = self.rules[domain]
-            row = tk.Frame(self.rules_list, bg=theme.card)
-            row.pack(fill="x", pady=1)
+            # Клик по домену переключает маршрут — как прежняя плашка, но
+            # строка стала обычной hover-row с сегментами и ghost-кнопкой.
+            row = HoverRow(self.rules_list, theme,
+                           command=lambda d=domain: self._toggle_rule(d))
+            row.pack(fill="x")
             display = domain if len(domain) <= 46 else domain[:45].rstrip() + "…"
             label = tk.Label(row, text=display, bg=theme.card, fg=theme.text,
-                             font=theme.font(9, "bold"), anchor="w")
-            label.pack(side="left", fill="x", expand=True, pady=3)
+                             font=theme.body(), anchor="w")
+            label.pack(side="left", fill="x", expand=True, pady=SPACE["sm"])
             if display != domain:
                 Tooltip(label, domain)
-            chip = Chip(row, theme,
-                        "напрямую" if route == "direct" else "через VPN",
-                        theme.ok if route == "direct" else theme.accent,
-                        bg=theme.card)
-            chip.configure(cursor="hand2")
-            chip.pack(side="left", padx=(8, 6))
-            chip.bind("<Button-1>", lambda _event, name=domain: self._toggle_rule(name))
-            remove = tk.Label(row, text="×", bg=theme.card, fg=theme.text_faint,
-                              font=theme.font(11, "bold"), cursor="hand2", padx=4)
-            remove.pack(side="right")
-            remove.bind("<Button-1>", lambda _event, name=domain: self._delete_rule(name))
+            row.track(label)
+            segment = Segmented(
+                row, theme, [("direct", "Напрямую"), ("proxy", "Через VPN")],
+                route, command=lambda value, d=domain: self._set_rule(d, value),
+                bg=theme.card, height=ROW_CONTROL_HEIGHT, width=176)
+            segment.pack(side="left", padx=(SPACE["sm"], SPACE["sm"]))
+            remove = PillButton(row, theme, "Удалить",
+                                lambda d=domain: self._delete_rule(d),
+                                kind="ghost", height=ROW_CONTROL_HEIGHT,
+                                pad_x=SPACE["sm"])
+            remove.pack(side="right", pady=SPACE["xs"])
             Tooltip(remove, "Удалить правило")
         self.rules_list.update_idletasks()
         self.rules_scroll.set_height(
