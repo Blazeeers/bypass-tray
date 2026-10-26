@@ -226,6 +226,53 @@ def install_all(progress=None) -> dict:
     return result
 
 
+def _result_items(result: dict) -> dict:
+    """Разложить результат установки на элементы zapret/tgws.
+
+    ``install_all`` отдаёт ``components``, а одиночные ``install_zapret``/
+    ``install_tgws`` — плоский словарь: различаем по ключам ``dir``/``exe``.
+    """
+    components = (result or {}).get("components")
+    if isinstance(components, dict) and components:
+        return {
+            "zapret": components.get("zapret") or {},
+            "tgws": components.get("tgws") or {},
+        }
+    result = result or {}
+    item = {key: result.get(key) for key in ("ok", "version", "dir", "exe", "error")}
+    if "exe" in result:
+        return {"zapret": {}, "tgws": item}
+    if "dir" in result:
+        return {"zapret": item, "tgws": {}}
+    return {"zapret": {}, "tgws": {}}
+
+
+def remember_install(result: dict) -> dict:
+    """Записать версии из результата установки в ``state["installed"]``.
+
+    Без этой записи ``updates.check_all`` не понимает, что уже стоит: на
+    чистой машине «Обновить всё» считало всё актуальным. Ошибка чтения или
+    записи не должна ронять установку — тогда возвращается пустой словарь.
+    """
+    from . import config as config_module
+
+    try:
+        state = config_module.load_state()
+        installed = state.get("installed")
+        installed = dict(installed) if isinstance(installed, dict) else {}
+        for name, item in _result_items(result).items():
+            version = str(item.get("version") or "")
+            if item.get("ok") and version:
+                installed[name] = version
+        installed.setdefault("xray", "")
+        state["installed"] = installed
+        if not config_module.save_state(state):
+            return {}
+        return state
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def installed(cfg: dict | None = None) -> dict:
     """Что уже стоит (без обращения к сети)."""
     from . import config as config_module

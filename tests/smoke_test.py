@@ -922,7 +922,7 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
           and b"for /d" in run_bat_bytes
           and b"dist\\*" in run_bat_bytes
           and b"*.exe" in run_bat_bytes)
-    check("widget_version 0.6.5", updates.widget_version() == "0.6.5",
+    check("widget_version 0.6.6", updates.widget_version() == "0.6.6",
           updates.widget_version())
     empty_components = components.installed({"zapret_dir": "", "tgws_exe": ""})
     check("components.installed: пустые пути — не cwd",
@@ -2510,6 +2510,13 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
     real_ensure_core = updates.xray.ensure_core
     real_xray_running = updates.xray.is_running
     real_xray_version = updates._xray_version
+    real_latest_tags = updates._latest_tags
+    real_blocked_update = updates.blocked.update
+    # Тесты герметичны: теги GitHub и список Re:filter — заглушки,
+    # иначе «Обновить всё» ходит в сеть и перезаписывает bin\geosite-refilter.dat.
+    updates._latest_tags = lambda: (
+        {"zapret": "zapret-new", "tgwsproxy": "tgws-new", "xray": "xray-test"}, "")
+    updates.blocked.update = lambda progress=None: {"ok": True, "size": 0}
     service_cfg = {"zapret_dir": r"C:\Custom\Zapret", "zapret_bat": "old.bat",
                    "tgws_exe": ""}
     service_state: dict = {}
@@ -2532,20 +2539,30 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
         updates.xray.is_running = real_xray_running
         updates.xray.ensure_core = real_ensure_core
         updates._xray_version = real_xray_version
+        updates._latest_tags = real_latest_tags
+        updates.blocked.update = real_blocked_update
     check("update_all: служба zapret не переустанавливается",
           not install_z_calls and service_cfg["zapret_dir"] == r"C:\Custom\Zapret"
           and any("службой" in text for text in service_result.get("warnings", [])),
           str(service_result.get("warnings")))
+    check("update_all: служба zapret в skipped, а не в updated",
+          "zapret" in (service_result.get("skipped") or [])
+          and "zapret" not in (service_result.get("updated") or []),
+          f"skipped={service_result.get('skipped')} updated={service_result.get('updated')}")
 
     portable = tmp / "portable-zapret"
     portable.mkdir()
     (portable / "general.bat").write_text("@echo off", encoding="utf-8")
     portable_cfg = {"zapret_dir": str(portable), "zapret_bat": "missing.bat",
                     "tgws_exe": "old-tgws.exe"}
-    portable_state: dict = {}
+    # Известные версии: без них zapret считается актуальным и не обновляется.
+    portable_state: dict = {"installed": {"zapret": "old", "tgws": "old"}}
     target_calls = []
     tgws_calls = []
     updates.status.service_image_path = lambda: ""
+    updates._latest_tags = lambda: (
+        {"zapret": "zapret-new", "tgwsproxy": "tgws-new", "xray": "xray-test"}, "")
+    updates.blocked.update = lambda progress=None: {"ok": True, "size": 0}
     def fake_install_z(progress=None, target=None):
         target_calls.append(target)
         return {"ok": True, "dir": str(target), "version": "z-test"}
@@ -2570,6 +2587,8 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
         updates.xray.is_running = real_xray_running
         updates.xray.ensure_core = real_ensure_core
         updates._xray_version = real_xray_version
+        updates._latest_tags = real_latest_tags
+        updates.blocked.update = real_blocked_update
     check("update_all: портативный путь сохранён",
           target_calls == [portable] and portable_cfg["zapret_dir"] == str(portable),
           str(target_calls))
@@ -2580,6 +2599,150 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
           tgws_calls == ["stop", "start"], str(tgws_calls))
     check("update_all: portable завершился", portable_result.get("ok") is True,
           str(portable_result.get("errors")))
+
+    # --- установка компонентов: missing, refilter, служба, офлайн --------
+    print("\n-- установка компонентов --")
+    real_present = updates.present_components
+    real_latest_tags2 = updates._latest_tags
+    real_install_z2 = updates.components.install_zapret
+    real_install_t2 = updates.components.install_tgws
+    real_ensure_core2 = updates.xray.ensure_core
+    real_blocked_update2 = updates.blocked.update
+    real_xray_version2 = updates._xray_version
+    real_xray_running2 = updates.xray.is_running
+    real_service2 = updates.status.service_image_path
+    real_check_all2 = updates.check_all
+    real_update_all2 = updates.update_all
+    real_notify2 = up_app.notify
+    install_calls: list[str] = []
+
+    def fake_install_zapret(progress=None, target=None):
+        install_calls.append("zapret")
+        return {"ok": True, "dir": str(tmp / "zapret-inst"), "version": "v-inst"}
+
+    def fake_install_tgws(progress=None, target=None):
+        install_calls.append("tgws")
+        return {"ok": True, "exe": str(tmp / "tgws-inst" / "TgWsProxy_windows.exe"),
+                "version": "v-inst"}
+
+    def fake_update_blocked(progress=None):
+        install_calls.append("refilter")
+        return {"ok": True, "size": 1024}
+
+    updates.components.install_zapret = fake_install_zapret
+    updates.components.install_tgws = fake_install_tgws
+    updates.xray.ensure_core = lambda force=False: (
+        install_calls.append("xray") or Path("xray.exe"))
+    updates.blocked.update = fake_update_blocked
+    updates.xray.is_running = lambda: False
+    updates.status.service_image_path = lambda: ""
+    updates.present_components = lambda cfg: {"zapret": False, "tgwsproxy": False,
+                                              "xray": False, "refilter": False}
+    updates._latest_tags = lambda: (
+        {"zapret": "v1", "tgwsproxy": "v1", "xray": "v1"}, "")
+    updates._xray_version = lambda: ""
+    clean_cfg = {"zapret_dir": "", "tgws_exe": ""}
+    try:
+        clean_report = updates.check_all(clean_cfg, {})
+        check("missing: чистая машина — zapret, tgwsproxy, xray, refilter",
+              set(clean_report.get("missing") or [])
+              == {"zapret", "tgwsproxy", "xray", "refilter"},
+              str(clean_report.get("missing")))
+        check("missing: устаревших нет", clean_report.get("outdated") == [])
+        updates._xray_version = lambda: "xray-v1"
+        fresh_state: dict = {}
+        fresh = updates.update_all(clean_cfg, fresh_state)
+        check("update_all: поставил отсутствующее",
+              fresh.get("installed") == ["zapret", "tgwsproxy", "xray", "refilter"],
+              str(fresh.get("installed")))
+        check("update_all: установка вызвана по разу на компонент",
+              install_calls == ["zapret", "tgws", "xray", "refilter"],
+              str(install_calls))
+        check("update_all: state['installed'] записан по факту",
+              (fresh_state.get("installed") or {}).get("zapret") == "v-inst"
+              and (fresh_state.get("installed") or {}).get("tgws") == "v-inst"
+              and (fresh_state.get("installed") or {}).get("xray") == "xray-v1",
+              str(fresh_state.get("installed")))
+        check("update_all: новые пути сохранены в конфиг",
+              clean_cfg.get("zapret_dir") == str(tmp / "zapret-inst")
+              and clean_cfg.get("tgws_exe")
+              == str(tmp / "tgws-inst" / "TgWsProxy_windows.exe"),
+              f"{clean_cfg.get('zapret_dir')} / {clean_cfg.get('tgws_exe')}")
+
+        install_calls.clear()
+        updates.present_components = lambda cfg: {"zapret": True, "tgwsproxy": True,
+                                                  "xray": True, "refilter": True}
+        updates._latest_tags = lambda: (
+            {"zapret": "v1", "tgwsproxy": "v1", "xray": "xray-v1"}, "")
+        up_to_date = {"installed": {"zapret": "v1", "tgws": "v1", "xray": "xray-v1"}}
+        second = updates.update_all({"zapret_dir": "", "tgws_exe": ""}, up_to_date)
+        check("update_all: актуальное пропущено",
+              second.get("skipped") == ["zapret", "tgwsproxy", "xray"],
+              str(second.get("skipped")))
+        check("update_all: Re:filter обновлён",
+              second.get("updated") == ["refilter"], str(second.get("updated")))
+        check("update_all: кроме списка ничего не ставилось",
+              install_calls == ["refilter"], str(install_calls))
+
+        install_calls.clear()
+        updates.status.service_image_path = lambda: r"C:\Windows\winws.exe"
+        service_res = updates.update_all(
+            {"zapret_dir": "", "tgws_exe": ""},
+            {"installed": {"zapret": "v1", "tgws": "v1", "xray": "xray-v1"}})
+        check("служба zapret: skipped, не updated",
+              "zapret" in (service_res.get("skipped") or [])
+              and "zapret" not in (service_res.get("updated") or [])
+              and any("службой" in text for text in service_res.get("warnings") or []),
+              f"skipped={service_res.get('skipped')} updated={service_res.get('updated')}")
+        check("служба zapret: install_zapret не вызывался",
+              "zapret" not in install_calls, str(install_calls))
+
+        updates._latest_tags = lambda: (
+            {"zapret": "", "tgwsproxy": "", "xray": ""}, "URLError: нет сети")
+        offline = updates.check_all(clean_cfg, {})
+        check("офлайн: network_error заполнен",
+              bool(offline.get("network_error")), str(offline.get("network_error")))
+        check("офлайн: outdated пуст", offline.get("outdated") == [])
+        offline_text = up_app._update_message({}, str(offline.get("network_error") or ""))
+        check("офлайн: сообщение про связь, не «обновлений нет»",
+              "нет связи" in offline_text.lower()
+              and "обновлений нет" not in offline_text.lower()
+              and "обновления не найдены" not in offline_text.lower(),
+              offline_text)
+
+        # Тот же путь через update_everything: офлайн не выглядит как
+        # «обновлений нет», и установка не запускается.
+        messages: list[str] = []
+        update_calls: list[str] = []
+        updates.check_all = lambda cfg, state: {
+            "checked": time.time(), "components": {}, "outdated": [], "missing": [],
+            "network_error": "URLError: нет сети"}
+        updates.update_all = lambda cfg, state, progress=None: (
+            update_calls.append("update") or {"ok": True})
+        up_app.notify = lambda message, title="bypass-tray": messages.append(message)
+        up_app.update_everything()
+        deadline = time.time() + 3
+        while up_app.updates_running and time.time() < deadline:
+            time.sleep(0.02)
+        check("офлайн: update_everything говорит про связь",
+              bool(messages)
+              and "нет связи" in messages[-1].lower()
+              and "обновлений нет" not in messages[-1].lower(),
+              str(messages))
+        check("офлайн: update_all не запускался", update_calls == [], str(update_calls))
+    finally:
+        updates.present_components = real_present
+        updates._latest_tags = real_latest_tags2
+        updates.components.install_zapret = real_install_z2
+        updates.components.install_tgws = real_install_t2
+        updates.xray.ensure_core = real_ensure_core2
+        updates.blocked.update = real_blocked_update2
+        updates._xray_version = real_xray_version2
+        updates.xray.is_running = real_xray_running2
+        updates.status.service_image_path = real_service2
+        updates.check_all = real_check_all2
+        updates.update_all = real_update_all2
+        up_app.notify = real_notify2
 
     # --- настройки: маршруты сайтов -------------------------------------
     print("\n-- настройки: маршруты сайтов --")
@@ -2687,6 +2850,44 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
           saved_cfg.get("blocked_list_enabled") is False)
     check("настройки: YouTube через VPN сохранён",
           saved_cfg.get("youtube_via_vpn") is True)
+
+    # --- установка из настроек: state и пути сразу ----------------------
+    print("\n-- установка из настроек --")
+    rule_fake.cfg["zapret_dir"] = ""
+    rule_fake.cfg["tgws_exe"] = ""
+    settings.vars["zapret_dir"].set("")
+    settings.vars["tgws_exe"].set("")
+    settings_dirs = {
+        "zapret": str(tmp / "zapret-settings"),
+        "tgws": str(tmp / "tgws-settings" / "TgWsProxy_windows.exe"),
+    }
+    settings._installed({
+        "ok": True,
+        "components": {
+            "zapret": {"ok": True, "dir": settings_dirs["zapret"],
+                       "version": "v-set", "error": ""},
+            "tgws": {"ok": True, "exe": settings_dirs["tgws"],
+                     "version": "v-set", "error": ""},
+        },
+    })
+    after_install = config.load_config()
+    after_state = config.load_state()
+    check("установка из настроек: state['installed'] записан",
+          (after_state.get("installed") or {}).get("zapret") == "v-set"
+          and (after_state.get("installed") or {}).get("tgws") == "v-set",
+          str(after_state.get("installed")))
+    check("установка из настроек: пути сохранены в конфиг",
+          after_install.get("zapret_dir") == settings_dirs["zapret"]
+          and after_install.get("tgws_exe") == settings_dirs["tgws"],
+          f"{after_install.get('zapret_dir')} / {after_install.get('tgws_exe')}")
+    check("установка из настроек: поля путей заполнены без «Сохранить»",
+          settings.vars["zapret_dir"].get() == settings_dirs["zapret"]
+          and settings.vars["tgws_exe"].get() == settings_dirs["tgws"])
+    check("установка из настроек: без ошибки записи",
+          "Готово" in settings.progress_label.cget("text")
+          and "не сохранены" not in settings.progress_label.cget("text"),
+          settings.progress_label.cget("text"))
+
     settings._close()
     reopened = SettingsWindow(settings_root, theme.Theme(False), rule_fake)
     reopened.open()

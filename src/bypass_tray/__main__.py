@@ -64,16 +64,7 @@ def run_setup(autostart: bool = True) -> int:
     config.save_config(cfg)
 
     # Без записанных версий check_all не может понять, что устарело.
-    state_data = config.load_state()
-    installed = state_data.get("installed")
-    installed = dict(installed) if isinstance(installed, dict) else {}
-    if zapret.get("ok"):
-        installed["zapret"] = str(zapret.get("version") or "")
-    if tgws.get("ok"):
-        installed["tgws"] = str(tgws.get("version") or "")
-    installed.setdefault("xray", "")
-    state_data["installed"] = installed
-    config.save_state(state_data)
+    components.remember_install(result)
 
     if autostart:
         ok = enable_autostart()

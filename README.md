@@ -102,6 +102,22 @@ Xray, обходит DPI для YouTube и Discord и ускоряет Telegram.
   режим убирает всплывающие уведомления, но значок всегда показывает настоящее
   состояние.
 
+## Благодарности и лицензии
+
+Само приложение распространяется под MIT. Внутри — компоненты других авторов,
+у каждого своя лицензия:
+
+| Компонент | Что делает | Автор | Лицензия |
+|---|---|---|---|
+| [Xray-core](https://github.com/XTLS/Xray-core) | ядро VPN/прокси | команда XTLS (RPRX) | MPL-2.0 |
+| [zapret](https://github.com/bol-van/zapret) | обход DPI (оригинал) | bol-van | MIT |
+| [zapret-discord-youtube](https://github.com/Flowseal/zapret-discord-youtube) | Windows-сборка zapret и стратегии | Flowseal | MIT |
+| [tg-ws-proxy](https://github.com/Flowseal/tg-ws-proxy) | прокси для Telegram | Flowseal | MIT |
+| [Re:filter-lists](https://github.com/1andrevich/Re-filter-lists) | список заблокированных доменов | Andrevich | MIT |
+
+Тексты лицензий лежат в [data/licenses/](data/licenses/) и входят в релизный
+архив; подробности — в [THIRD_PARTY.md](THIRD_PARTY.md).
+
 ## Для разработчиков
 
 ```powershell

@@ -691,6 +691,33 @@ class TrayApp:
         if not self.guard_running and time.time() - self.guard_at >= minutes * 60:
             self.run_guard()
 
+    @staticmethod
+    def _component_names(names) -> str:
+        return ", ".join(updates.label(str(name)) for name in names)
+
+    def _update_message(self, result: dict, network_error: str = "") -> str:
+        """Человеческий итог установки: что поставил, что обновил, что не вышло."""
+        installed = list(result.get("installed") or [])
+        updated = list(result.get("updated") or [])
+        errors = list(result.get("errors") or [])
+        warnings = list(result.get("warnings") or [])
+        parts: list[str] = []
+        if installed:
+            parts.append("Установил: " + self._component_names(installed))
+        if updated:
+            parts.append("Обновил: " + self._component_names(updated))
+        if errors:
+            prefix = "Нет связи с GitHub: " if network_error else "Не удалось: "
+            parts.append(prefix + "; ".join(errors)[:140])
+        elif network_error and not (installed or updated):
+            parts.append("нет связи с GitHub — обновления не проверены")
+        elif not installed and not updated:
+            parts.append("Всё уже актуально")
+        message = ". ".join(parts)
+        if warnings:
+            message += " (" + "; ".join(warnings)[:160] + ")"
+        return message
+
     def check_all(self, notify: bool = False) -> bool:
         """Проверяет обновления через GitHub (в фоне)."""
         if self.updates_running:
@@ -704,14 +731,22 @@ class TrayApp:
                 report = updates.check_all(self.cfg, self.state)
                 self.updates_report = report
                 outdated = list(report.get("outdated") or [])
-                if outdated:
-                    self.state["updates_note"] = "Обновления: " + ", ".join(outdated)
+                missing = list(report.get("missing") or [])
+                network_error = str(report.get("network_error") or "")
+                if network_error and not (outdated or missing):
+                    self.state["updates_note"] = "нет связи с GitHub"
+                elif outdated or missing:
+                    names = outdated or missing
+                    self.state["updates_note"] = "Обновления: " + ", ".join(names)
                 else:
                     self.state.pop("updates_note", None)
                 config.save_state(self.state)
                 if notify:
-                    if outdated:
-                        self.notify("Обновления: " + ", ".join(outdated))
+                    if network_error and not (outdated or missing):
+                        self.notify("нет связи с GitHub — обновления не проверены")
+                    elif outdated or missing:
+                        self.notify("Обновления: "
+                                    + ", ".join(outdated or missing))
                     else:
                         self.notify("Обновлений нет")
             except Exception:  # noqa: BLE001
@@ -726,7 +761,7 @@ class TrayApp:
         return True
 
     def update_everything(self) -> bool:
-        """Проверяет обновления и, если есть, ставит все компоненты (в фоне)."""
+        """Проверяет обновления и ставит всё отсутствующее/устаревшее (в фоне)."""
         if self.updates_running:
             return False
         self.updates_running = True
@@ -742,22 +777,19 @@ class TrayApp:
                 report = updates.check_all(self.cfg, self.state)
                 self.updates_report = report
                 outdated = list(report.get("outdated") or [])
-                if outdated:
-                    self.busy["updates"] = "обновляю…"
+                missing = list(report.get("missing") or [])
+                network_error = str(report.get("network_error") or "")
+                if outdated or missing:
+                    self.busy["updates"] = "устанавливаю компоненты…"
                     result = updates.update_all(self.cfg, self.state, progress=progress)
-                    errors = list(result.get("errors") or [])
-                    warnings = list(result.get("warnings") or [])
-                    if result.get("ok"):
-                        message = "Обновил: " + ", ".join(outdated)
-                        if warnings:
-                            message += " (" + "; ".join(warnings)[:160] + ")"
-                    else:
-                        message = "Обновление: " + (
-                            "; ".join(errors)[:160] or "не удалось")
+                    message = self._update_message(
+                        result, network_error or str(result.get("network_error") or ""))
                     try:
                         self.updates_report = updates.check_all(self.cfg, self.state)
                     except Exception:  # noqa: BLE001
                         pass
+                elif network_error:
+                    message = "нет связи с GitHub — обновления не проверены"
                 else:
                     message = "Обновления не найдены"
                 activity.log(message)
@@ -786,13 +818,9 @@ class TrayApp:
         def worker() -> None:
             try:
                 result = updates.update_all(self.cfg, self.state)
-                errors = list(result.get("errors") or [])
-                warnings = list(result.get("warnings") or [])
-                if result.get("ok"):
-                    self.notify("Компоненты обновлены"
-                                + (": " + "; ".join(warnings)[:160] if warnings else ""))
-                else:
-                    self.notify("Обновление: " + ("; ".join(errors)[:160] or "не удалось"))
+                message = self._update_message(
+                    result, str(result.get("network_error") or ""))
+                self.notify(message)
                 try:
                     self.updates_report = updates.check_all(self.cfg, self.state)
                 except Exception:  # noqa: BLE001

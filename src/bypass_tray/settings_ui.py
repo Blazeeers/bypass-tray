@@ -829,19 +829,52 @@ class SettingsPage(tk.Frame):
         components_state = result.get("components") or {}
         zapret = components_state.get("zapret") or {}
         tgws = components_state.get("tgws") or {}
-        if zapret.get("ok") and not self.vars["zapret_dir"].get().strip():
-            self.vars["zapret_dir"].set(zapret["dir"])
-        if tgws.get("ok") and not self.vars["tgws_exe"].get().strip():
-            self.vars["tgws_exe"].set(tgws["exe"])
+        # Версии — в state сразу: иначе следующая проверка снова сочтёт
+        # компоненты «неизвестными» и «Обновить всё» их не увидит.
+        components.remember_install(result)
+        # Пути не ждут «Сохранить»: иначе установленный компонент до
+        # перезапуска считался отсутствующим.
+        save_error = ""
+        cfg = dict(getattr(self.controller, "cfg", None) or {})
+        changed = False
+        for item, key, field in ((zapret, "zapret_dir", "dir"),
+                                 (tgws, "tgws_exe", "exe")):
+            if not item.get("ok"):
+                continue
+            value = self.vars[key].get().strip() or str(item.get(field) or "")
+            if value and value != str(cfg.get(key) or ""):
+                cfg[key] = value
+                self.vars[key].set(value)
+                changed = True
+        if changed:
+            save = getattr(self.controller, "save_config", None)
+            written = save(cfg) if callable(save) else config.save_config(cfg)
+            if written is not False:
+                self.controller.cfg = cfg
+            else:
+                save_error = "пути не сохранены: config.json недоступен"
+        # Статус пересобираем сразу: строка службы и «Запустить» должны
+        # стать активными без перезапуска виджета.
+        refresh = getattr(self.controller, "refresh", None)
+        if callable(refresh):
+            try:
+                refresh()
+            except Exception:  # noqa: BLE001
+                pass
         if result.get("ok"):
-            self.progress_label.configure(text="Готово: оба компонента установлены",
-                                          fg=self.theme.ok)
+            text = "Готово: оба компонента установлены"
+            color = self.theme.ok
+            if save_error:
+                text += " · " + save_error
+                color = self.theme.warn
         else:
             errors = [c.get("error", "") for c in components_state.values()
                       if not c.get("ok")]
-            self.progress_label.configure(
-                text="Не всё удалось: " + "; ".join(e for e in errors if e)[:120],
-                fg=self.theme.bad)
+            text = "Не всё удалось: " + "; ".join(e for e in errors if e)[:120]
+            if save_error:
+                text += " · " + save_error
+            color = self.theme.bad
+        self.progress_label.configure(text=text, fg=color)
         self._refresh_status()
 
     # ---- сохранение --------------------------------------------------------
