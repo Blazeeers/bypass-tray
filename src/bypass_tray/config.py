@@ -117,6 +117,9 @@ DEFAULTS: dict = {
     # Подписка: отдаёт список серверов vless://. Укажите свою — в репозитории
     # её нет намеренно, это персональный ключ доступа.
     "xray_subscription": "",
+    # Свои ссылки vless/vmess/trojan/ss — без подписки. Список строк; одна
+    # строка тоже принимается (разбирается при чтении).
+    "xray_links": [],
     # Пусто = <проект>\bin\xray.exe; иначе путь к своему ядру.
     "xray_exe": "",
     # Локальный порт прокси (SOCKS и HTTP на одном порту).
@@ -277,6 +280,20 @@ def _migrate_routes(cfg: dict) -> None:
     cfg["xray_extra_domains"] = []
 
 
+def _normalise_links(value) -> list[str] | str:
+    """Свои ссылки из конфига: список строк, одна строка или пустой список.
+
+    Одна строка (склеенные ссылки/base64) остаётся строкой — её разбирает
+    ``xray.links_from_text``. В списке нестроковые элементы отбрасываются,
+    поэтому испорченный вручную config.json не роняет ни чтение, ни запуск.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [item for item in value if isinstance(item, str)]
+    return []
+
+
 def load_config() -> dict:
     """Читает конфиг, дозаполняя пути компонентов.
 
@@ -323,6 +340,7 @@ def load_config() -> dict:
     # Пишем файл только когда это действительно нужно: первый запуск,
     # миграция старых списков или найденные пути компонентов. Иначе чтение
     # конфига не должно трогать файл и его mtime.
+    cfg["xray_links"] = _normalise_links(cfg.get("xray_links"))
     changed = raw is None
     if "xray_routes" not in cfg:
         _migrate_routes(cfg)

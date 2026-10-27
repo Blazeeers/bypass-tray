@@ -256,8 +256,17 @@ HiDPI.
 
 `xray.py`:
 
-- `fetch_subscription()` / `parse_vless()` — читает подписку и разбирает
-  `vless://` (grpc/ws, reality/tls) в outbound для ядра.
+- `links_from_text()` / `fetch_subscription()` — достаёт ссылки `vless`,
+  `vmess`, `trojan`, `ss` из текста, файла-подписки или base64; мусор
+  отбрасывается, повторы убираются, на битые данные исключений нет.
+- `user_links()` / `collect_links()` — свои конфиги из `xray_links` плюс
+  подписка одним списком. Подписка необязательна: её сетевой сбой не
+  обнуляет свои ссылки; пустой набор — `ValueError` с понятным текстом.
+- `parse_link()` — диспетчер по схеме. `parse_vless()` (grpc/ws,
+  reality/tls), `parse_vmess()` (base64 JSON, ws/grpc/kcp, tls),
+  `parse_trojan()` (tls/reality, ws/grpc, flow), `parse_ss()` (оба вида
+  ссылок) собирают outbound для ядра. `build_config()` протоколу
+  безразличен: ему передаётся готовый `server["outbound"]`.
 - `rank_servers()` / `pick_server()` — TCP-проверка задержки, сортировка,
   выбор самого быстрого; список кэшируется в `xray-servers.json`.
 - `build_config()` — конфиг ядра: mixed-инбаунд на `127.0.0.1:<port>`,

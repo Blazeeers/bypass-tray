@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import base64
 import gc
 import json
 import os
@@ -754,6 +755,216 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
                           ("route_audit_minutes", 60), ("autoconnect", False)):
         check(f"ключ «{key}» = {expected}", config.DEFAULTS.get(key) == expected,
               repr(config.DEFAULTS.get(key)))
+
+    # --- свои конфиги: разбор ссылок ------------------------------------
+    print("\n-- свои конфиги --")
+    check("ключ xray_links по умолчанию пуст",
+          config.DEFAULTS.get("xray_links") == [],
+          repr(config.DEFAULTS.get("xray_links")))
+
+    vless_link = ("vless://11111111-2222-3333-4444-555555555555@one.example:443"
+                  "?type=tcp&security=none#Первый")
+    trojan_link = ("trojan://s3cr3t@tj.example.com:443?security=tls"
+                   "&sni=tj.example.com&fp=chrome&type=ws&path=%2Fws#Троян")
+
+    vmess_payload = {
+        "v": "2", "ps": "Тест VMess", "add": "vm.example.com", "port": "8443",
+        "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "aid": "0",
+        "scy": "auto", "net": "ws", "type": "none", "host": "vm.example.com",
+        "path": "/ray", "tls": "tls", "sni": "vm.example.com", "fp": "chrome",
+    }
+    vmess_link = "vmess://" + base64.b64encode(
+        json.dumps(vmess_payload).encode()).decode()
+
+    vmess = xray.parse_link(vmess_link)
+    vmess_stream = vmess["outbound"]["streamSettings"]
+    vmess_user = vmess["outbound"]["settings"]["vnext"][0]["users"][0]
+    check("vmess: протокол, адрес и имя",
+          vmess["outbound"]["protocol"] == "vmess"
+          and vmess["host"] == "vm.example.com" and vmess["port"] == 8443
+          and vmess["name"] == "Тест VMess",
+          f"{vmess['host']}:{vmess['port']} / {vmess['name']}")
+    check("vmess: id, alterId и security перенесены",
+          vmess_user["id"] == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+          and vmess_user["alterId"] == 0 and vmess_user["security"] == "auto")
+    check("vmess: ws и tls в streamSettings",
+          vmess_stream["network"] == "ws"
+          and vmess_stream["security"] == "tls"
+          and vmess_stream["wsSettings"]["path"] == "/ray"
+          and vmess_stream["tlsSettings"]["serverName"] == "vm.example.com")
+
+    tls_payload = {**vmess_payload, "ps": "Тест TLS", "tls": "true",
+                   "port": 443.0}
+    tls_link = "vmess://" + base64.b64encode(
+        json.dumps(tls_payload).encode()).decode()
+    tls_server = xray.parse_link(tls_link)
+    check("vmess: tls=\"true\" считается TLS",
+          tls_server["outbound"]["streamSettings"]["security"] == "tls")
+    check("vmess: порт 443.0 (float) принимается",
+          tls_server["port"] == 443, str(tls_server["port"]))
+    bad_port_payload = {**vmess_payload, "port": "не порт"}
+    bad_port_link = "vmess://" + base64.b64encode(
+        json.dumps(bad_port_payload).encode()).decode()
+    try:
+        xray.parse_link(bad_port_link)
+        bad_port_error = ""
+    except ValueError as exc:
+        bad_port_error = str(exc)
+    check("vmess: неверный порт — отдельный текст",
+          "неверный порт" in bad_port_error, bad_port_error)
+
+    trojan = xray.parse_link(trojan_link)
+    trojan_stream = trojan["outbound"]["streamSettings"]
+    trojan_server = trojan["outbound"]["settings"]["servers"][0]
+    check("trojan: протокол, адрес, пароль",
+          trojan["outbound"]["protocol"] == "trojan"
+          and trojan["host"] == "tj.example.com" and trojan["port"] == 443
+          and trojan_server["password"] == "s3cr3t")
+    check("trojan: ws+tls и имя из ссылки",
+          trojan_stream["wsSettings"]["path"] == "/ws"
+          and trojan_stream["tlsSettings"]["serverName"] == "tj.example.com"
+          and trojan["name"] == "Троян")
+
+    ss_creds = base64.b64encode(b"aes-256-gcm:sspass").decode()
+    ss_link = f"ss://{ss_creds}@ss.example.com:8388#СС"
+    ss_blob = base64.b64encode(
+        b"chacha20-ietf-poly1305:sspass2@ss2.example.com:8389").decode()
+    ss_full = f"ss://{ss_blob}#СС2"
+    ss_short = xray.parse_link(ss_link)
+    ss_long = xray.parse_link(ss_full)
+    short_server = ss_short["outbound"]["settings"]["servers"][0]
+    long_server = ss_long["outbound"]["settings"]["servers"][0]
+    check("ss: base64(метод:пароль)@хост",
+          ss_short["outbound"]["protocol"] == "shadowsocks"
+          and short_server["address"] == "ss.example.com"
+          and short_server["port"] == 8388
+          and short_server["method"] == "aes-256-gcm"
+          and short_server["password"] == "sspass")
+    check("ss: полностью base64",
+          ss_long["outbound"]["protocol"] == "shadowsocks"
+          and long_server["address"] == "ss2.example.com"
+          and long_server["port"] == 8389
+          and long_server["method"] == "chacha20-ietf-poly1305"
+          and long_server["password"] == "sspass2")
+
+    try:
+        xray.parse_link("http://example.com")
+        unknown_error = ""
+    except ValueError as exc:
+        unknown_error = str(exc)
+    check("parse_link: неизвестная схема — ValueError с текстом",
+          "неподдерживаемая" in unknown_error, unknown_error)
+
+    mixed = ("\ufeffмусор\n" + vless_link + "\n\n  " + trojan_link
+             + "  \nhttp://example.com/x\n" + vless_link)
+    text_links = xray.links_from_text(mixed)
+    check("links_from_text: строки, мусор и дедупликация",
+          text_links == [vless_link, trojan_link], f"{len(text_links)} шт.")
+    blob = base64.b64encode((vless_link + "\n" + ss_link).encode()).decode()
+    check("links_from_text: base64-блоб",
+          xray.links_from_text(blob) == [vless_link, ss_link])
+    check("links_from_text: мусор не роняет",
+          xray.links_from_text("просто текст, \x00 &&&") == [])
+    inner_b64 = base64.b64encode((vless_link + "\n" + trojan_link).encode()).decode()
+    double_b64 = base64.b64encode(inner_b64.encode()).decode()
+    check("links_from_text: двойной base64",
+          xray.links_from_text(double_b64) == [vless_link, trojan_link])
+    one_line_json = json.dumps([vless_link, trojan_link])
+    check("links_from_text: JSON-массив одной строкой",
+          xray.links_from_text(one_line_json) == [vless_link, trojan_link],
+          one_line_json[:60])
+    check("links_from_text: две ссылки через запятую",
+          xray.links_from_text(vless_link + "," + trojan_link)
+          == [vless_link, trojan_link])
+    check("links_from_text: две ссылки через точку с запятой",
+          xray.links_from_text(vless_link + "; " + trojan_link)
+          == [vless_link, trojan_link])
+
+    config.save_config({"zapret_dir": cfg.get("zapret_dir", ""),
+                        "tgws_exe": cfg.get("tgws_exe", ""),
+                        "xray_subscription": "",
+                        "xray_links": [vless_link, trojan_link]})
+    links_cfg = config.load_config()
+    check("config: свои ссылки прочитаны списком",
+          links_cfg.get("xray_links") == [vless_link, trojan_link],
+          repr(links_cfg.get("xray_links")))
+    check("collect_links: свои ссылки без подписки",
+          xray.collect_links(links_cfg) == [vless_link, trojan_link])
+    check("user_links: строка вместо списка",
+          xray.user_links({"xray_links": vless_link}) == [vless_link])
+
+    real_fetch = xray.fetch_subscription
+
+    def no_network(url=None, timeout=25):
+        raise OSError("нет сети")
+
+    xray.fetch_subscription = no_network
+    try:
+        check("collect_links: сбой подписки не теряет свои ссылки",
+              xray.collect_links({"xray_links": [trojan_link],
+                                  "xray_subscription": "https://sub.example"})
+              == [trojan_link])
+        check("collect_links: сбой подписки пишется в журнал",
+              "подписка не скачалась" in activity.last_text(),
+              activity.last_text())
+        try:
+            xray.collect_links({"xray_links": [],
+                                "xray_subscription": "https://sub.example"})
+            sub_error = ""
+        except ValueError as exc:
+            sub_error = str(exc)
+        check("collect_links: подписка упала, своих нет — причина в тексте",
+              "подписка не скачалась" in sub_error
+              and "OSError" in sub_error
+              and "своих конфигов нет" in sub_error, sub_error)
+    finally:
+        xray.fetch_subscription = real_fetch
+
+    try:
+        xray.collect_links({"xray_links": [], "xray_subscription": ""})
+        empty_error = ""
+    except ValueError as exc:
+        empty_error = str(exc)
+    check("collect_links: пусто — понятная ошибка",
+          "нет конфигов" in empty_error, empty_error)
+
+    vmess_config = xray.build_config(vmess, 10899)
+    check("build_config: vmess-сервер не падает",
+          vmess_config["outbounds"][1]["protocol"] == "vmess"
+          and vmess_config["inbounds"][0]["port"] == 10899)
+
+    # Переключение берёт сервер из кеша по ссылке: vmess/trojan/ss там уже
+    # есть, и разбор обязан идти через parse_link, а не parse_vless.
+    real_cached = xray.cached_servers
+    real_switch_to = xray.switch_to
+    switched: list[dict] = []
+    xray.cached_servers = lambda: [{
+        "name": vmess["name"], "host": vmess["host"], "port": vmess["port"],
+        "latency": 10, "link": vmess_link}]
+    xray.switch_to = lambda server, cfg=None: (switched.append(server)
+                                               or {"ok": True})
+    try:
+        switched_result = xray._switch_server(set(), {})
+        check("переключение на vmess-сервер сохраняет outbound",
+              switched_result.get("ok") is True and bool(switched)
+              and switched[0]["outbound"]["protocol"] == "vmess",
+              switched[0]["outbound"]["protocol"] if switched else "не вызвано")
+    finally:
+        xray.cached_servers = real_cached
+        xray.switch_to = real_switch_to
+
+    config.CONFIG_FILE.write_text(
+        json.dumps({"xray_links": ["vless://a", 5, None]}), encoding="utf-8")
+    filtered_links = config.load_config()
+    check("config: нестроковые ссылки отброшены",
+          filtered_links.get("xray_links") == ["vless://a"],
+          repr(filtered_links.get("xray_links")))
+    config.CONFIG_FILE.write_text(
+        json.dumps({"xray_links": "vless://a"}), encoding="utf-8")
+    check("config: строка ссылок принята",
+          config.load_config().get("xray_links") == "vless://a")
+    config.save_config({"zapret_dir": cfg.get("zapret_dir", ""),
+                        "tgws_exe": cfg.get("tgws_exe", "")})
 
     # --- атомарная запись ----------------------------------------------
     target = tmp / "atomic.txt"
@@ -3248,6 +3459,49 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
           and reopened.routes_empty.winfo_manager() == ""
           and reopened.rules_scroll.winfo_manager() != "")
     reopened._close()
+
+    # --- настройки: свои конфиги ----------------------------------------
+    print("\n-- настройки: свои конфиги --")
+    links_fake = FakeController()
+    links_fake.cfg["xray_links"] = []
+    links_fake.cfg["xray_subscription"] = ""
+    links_window = SettingsWindow(settings_root, theme.Theme(False), links_fake)
+    links_window.open()
+    for _ in range(4):
+        settings_root.update()
+        time.sleep(0.02)
+    check("настройки: есть многострочное поле своих конфигов",
+          isinstance(getattr(links_window, "links_text", None), tk.Text))
+    links_window.links_text.delete("1.0", "end")
+    links_window.links_text.insert("1.0", vless_link + "\n" + trojan_link)
+    links_window._update_links_status()
+    check("настройки: счётчик «Распознано: 2»",
+          "Распознано: 2" in links_window.links_status.cget("text"),
+          links_window.links_status.cget("text"))
+    saved_links = links_window._save()
+    check("настройки: свои ссылки сохранены",
+          saved_links is True
+          and links_fake.cfg.get("xray_links") == [vless_link, trojan_link],
+          str(links_fake.cfg.get("xray_links")))
+    check("настройки: ссылки дошли до config.json",
+          config.load_config().get("xray_links") == [vless_link, trojan_link],
+          repr(config.load_config().get("xray_links")))
+
+    links_window.links_text.delete("1.0", "end")
+    links_window.links_text.insert("1.0", "это не ссылка и не подписка")
+    blocked_save = links_window._save()
+    check("настройки: мусор в поле блокирует сохранение",
+          blocked_save is False
+          and links_fake.cfg.get("xray_links") == [vless_link, trojan_link],
+          f"save={blocked_save}, {links_fake.cfg.get('xray_links')}")
+    check("настройки: при нераспознанном тексте счётчик красный",
+          "Распознано: 0" in links_window.links_status.cget("text")
+          and links_window.links_status.cget("fg") == links_window.theme.bad,
+          links_window.links_status.cget("text"))
+    links_window._clear_links()
+    check("настройки: «Очистить» опустошает поле",
+          links_window._links_value() == "")
+    links_window._close()
 
     bad_fake = FakeController()
     bad_fake.cfg["xray_routes"] = ["x.com", "instagram.com"]

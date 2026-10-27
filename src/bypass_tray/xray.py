@@ -14,6 +14,7 @@ import base64
 import ctypes
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -31,6 +32,10 @@ from . import actions, config
 #: нет намеренно: это персональный ключ доступа.
 DEFAULT_SUBSCRIPTION = ""
 DEFAULT_PORT = 10818
+
+#: Протоколы, которые умеем разбирать в outbound Xray. Подписка и свои
+#: ссылки проходят через один разбор: маршрутизации протокол безразличен.
+SUPPORTED_SCHEMES = ("vless", "vmess", "trojan", "ss")
 
 #: Сколько ждём ответа от одного сервера и сколько всего тратим на подбор.
 #: Подбор идёт под _LOCK: сорок серверов по пять секунд — это двести секунд,
@@ -185,14 +190,149 @@ def _download_core(target: Path, timeout: int = 120) -> bool:
             pass
 
 
-# ---- подписка -------------------------------------------------------------
+# ---- ссылки: подписка и свои конфиги --------------------------------------
+
+
+#: Разделитель нескольких ссылок в одной строке. Режем только там, где после
+#: запятой/точки с запятой начинается новая ссылка: запятая во фрагменте
+#: («#Сервер, Германия») остаётся частью имени.
+_LINK_SEPARATOR = re.compile(
+    r"[,;]\s*(?=(?:vless|vmess|trojan|ss)://)", re.IGNORECASE)
+
+
+def _b64_text(value: str) -> str:
+    """Мягко декодирует base64: мусор и битые данные дают пустую строку.
+
+    Подписки приходят и обычным текстом, и base64 (иногда urlsafe, без
+    выравнивания), поэтому ошибка разбора здесь — рядовой случай, а не сбой.
+    """
+    raw = "".join((value or "").split())
+    if not raw:
+        return ""
+    raw = raw.replace("-", "+").replace("_", "/")
+    raw += "=" * (-len(raw) % 4)
+    try:
+        return base64.b64decode(raw).decode("utf-8", "replace")
+    except (TypeError, ValueError):
+        return ""
+
+
+def links_from_text(text: str) -> list[str]:
+    """Достаёт ссылки поддерживаемых протоколов из произвольного текста.
+
+    Принимает построчный список ссылок, base64-подписку (в том числе
+    закодированную дважды), JSON-массив, несколько ссылок в одной строке
+    через запятую — содержимое файла или буфера обмена. Всё, что не является
+    ссылкой ``vless``/``vmess``/``trojan``/``ss``, молча отбрасывается;
+    повторы убираются с сохранением порядка. На мусор не бросает исключений.
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def take(block: str, depth: int) -> None:
+        block = (block or "").replace("\ufeff", "")
+        stripped = block.strip()
+        # JSON-массив: и одной строкой, и разложенный по строкам.
+        if depth < 3 and stripped.startswith("[") and stripped.endswith("]"):
+            try:
+                data = json.loads(stripped)
+            except ValueError:
+                data = None
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, str):
+                        take(item, depth + 1)
+                return
+        if "://" not in block:
+            # Рекурсия по факту удачного декодирования, а не по наличию
+            # «://»: иначе base64 от base64 не разбирался бы.
+            if depth < 3:
+                decoded = _b64_text(block)
+                if decoded and decoded != block:
+                    take(decoded, depth + 1)
+            return
+        for raw in block.splitlines():
+            # Скобки, кавычки и запятые — от JSON-массивов и CSV.
+            line = raw.strip().strip('[]",').strip()
+            if not line:
+                continue
+            if "://" not in line:
+                if depth < 3:
+                    decoded = _b64_text(line)
+                    if decoded and decoded != line:
+                        take(decoded, depth + 1)
+                continue
+            for piece in _LINK_SEPARATOR.split(line):
+                link = piece.strip().strip('[]",').strip()
+                if "://" not in link:
+                    continue
+                scheme = link.split("://", 1)[0].strip().lower()
+                if scheme in SUPPORTED_SCHEMES and link not in seen:
+                    seen.add(link)
+                    found.append(link)
+
+    take(text if isinstance(text, str) else "", 0)
+    return found
+
+
+def user_links(cfg: dict | None = None) -> list[str]:
+    """Свои ссылки из ``cfg['xray_links']`` — списком или одной строкой."""
+    cfg = cfg if cfg is not None else config.load_config()
+    value = cfg.get("xray_links")
+    if isinstance(value, str):
+        return links_from_text(value)
+    if isinstance(value, (list, tuple)):
+        text = "\n".join(item for item in value if isinstance(item, str))
+        return links_from_text(text)
+    return []
+
+
+def collect_links(cfg: dict | None = None) -> list[str]:
+    """Все доступные ссылки: свои конфиги плюс подписка, без повторов.
+
+    Подписка необязательна: не скачалась — работаем на своих ссылках и
+    предупреждаем в журнале. Без источников — ``ValueError`` с причиной.
+    """
+    cfg = cfg if cfg is not None else config.load_config()
+    links = user_links(cfg)
+    url = cfg.get("xray_subscription") or DEFAULT_SUBSCRIPTION
+    failure = ""
+    if url:
+        try:
+            links += fetch_subscription(url)
+        except Exception as exc:  # noqa: BLE001
+            # Подписка — дополнительный источник: её сетевые и форматные
+            # сбои не должны обнулять уже введённые свои ссылки. В журнал
+            # идёт только тип ошибки: в ссылке персональный ключ.
+            failure = type(exc).__name__
+    result: list[str] = []
+    seen: set[str] = set()
+    for link in links:
+        if isinstance(link, str) and link and link not in seen:
+            seen.add(link)
+            result.append(link)
+    if not result:
+        if failure:
+            raise ValueError(
+                f"подписка не скачалась ({failure}); своих конфигов нет")
+        raise ValueError("нет конфигов: укажите подписку или свои ссылки")
+    if failure:
+        # Локальный импорт: activity тянет config, а xray импортируется из
+        # него же — на уровне модуля это дало бы цикл.
+        from . import activity
+
+        activity.log(
+            f"подписка не скачалась ({failure}) — работаю на своих конфигах",
+            kind="warn")
+    return result
 
 
 def fetch_subscription(url: str | None = None, timeout: int = 25) -> list[str]:
-    """Возвращает список ссылок ``vless://`` из подписки.
+    """Возвращает ссылки vless/vmess/trojan/ss из подписки.
 
-    Ссылка берётся из ``config.json`` (поле ``xray_subscription``): в коде её
-    нет, потому что это персональный ключ.
+    Подписка отдаёт либо готовый список ссылок, либо base64 с ним. Ссылка
+    берётся из ``config.json`` (поле ``xray_subscription``): в коде её нет,
+    потому что это персональный ключ.
     """
     url = url or config.load_config().get("xray_subscription") or DEFAULT_SUBSCRIPTION
     if not url:
@@ -202,10 +342,7 @@ def fetch_subscription(url: str | None = None, timeout: int = 25) -> list[str]:
     request = urllib.request.Request(url, headers={"User-Agent": "v2rayNG/1.8"})
     with urllib.request.urlopen(request, timeout=timeout) as response:
         text = response.read().decode("utf-8", "replace")
-    if "://" not in text:
-        padded = text + "=" * (-len(text) % 4)
-        text = base64.b64decode(padded).decode("utf-8", "replace")
-    return [line.strip() for line in text.splitlines() if line.strip().startswith("vless://")]
+    return links_from_text(text)
 
 
 def parse_vless(link: str) -> dict:
@@ -263,6 +400,214 @@ def parse_vless(link: str) -> dict:
     }
 
 
+def parse_vmess(link: str) -> dict:
+    """Разбирает ``vmess://`` (base64 JSON) в описание сервера и outbound."""
+    body = link.strip()
+    if body.lower().startswith("vmess://"):
+        body = body[len("vmess://"):]
+    body = body.split("#", 1)[0]
+    try:
+        data = json.loads(_b64_text(body))
+    except (TypeError, ValueError):
+        raise ValueError("vmess: ссылка не декодируется") from None
+    if not isinstance(data, dict):
+        raise ValueError("vmess: ссылка не декодируется")
+
+    host = str(data.get("add") or "").strip()
+    try:
+        # Порт встречается и числом, и строкой, и как 443.0 из чужого JSON.
+        port = int(float(str(data.get("port") or 0)))
+    except (TypeError, ValueError):
+        port = 0
+    user_id = str(data.get("id") or "").strip()
+    if not host:
+        raise ValueError("vmess: в ссылке нет адреса сервера")
+    if not 0 < port < 65536:
+        raise ValueError("vmess: неверный порт")
+    if not user_id:
+        raise ValueError("vmess: в ссылке нет id пользователя")
+
+    net = str(data.get("net") or "tcp").strip() or "tcp"
+    # Провайдеры пишут TLS по-разному: tls, reality, true, 1.
+    tls = str(data.get("tls") or "").strip().lower()
+    header_host = str(data.get("host") or "").strip()
+    path = str(data.get("path") or "").strip()
+    stream: dict = {
+        "network": net,
+        "security": "tls" if tls in ("tls", "reality", "true", "1") else "none",
+    }
+    if stream["security"] == "tls":
+        stream["tlsSettings"] = {
+            "serverName": (str(data.get("sni") or "").strip()
+                           or header_host or host),
+            "fingerprint": str(data.get("fp") or "chrome"),
+        }
+    if net == "ws":
+        ws: dict = {"path": path or "/"}
+        if header_host:
+            ws["headers"] = {"Host": header_host}
+        stream["wsSettings"] = ws
+    elif net == "grpc":
+        stream["grpcSettings"] = {"serviceName": path}
+    elif net == "kcp":
+        stream["kcpSettings"] = {
+            "header": {"type": str(data.get("type") or "none")}}
+
+    try:
+        alter_id = int(str(data.get("aid") or 0))
+    except ValueError:
+        alter_id = 0
+    outbound = {
+        "tag": "proxy",
+        "protocol": "vmess",
+        "settings": {
+            "vnext": [{
+                "address": host,
+                "port": port,
+                "users": [{
+                    "id": user_id,
+                    "alterId": alter_id,
+                    "security": str(data.get("scy") or "auto"),
+                }],
+            }]
+        },
+        "streamSettings": stream,
+    }
+    return {
+        "name": str(data.get("ps") or "").strip() or host,
+        "host": host,
+        "port": port,
+        "outbound": outbound,
+        "link": link,
+    }
+
+
+def parse_trojan(link: str) -> dict:
+    """Разбирает ``trojan://`` в описание сервера и outbound."""
+    parts = urllib.parse.urlsplit(link.strip())
+    query = dict(urllib.parse.parse_qsl(parts.query))
+    try:
+        port = int(parts.port or 443)
+    except ValueError:
+        raise ValueError("trojan: неверный порт") from None
+    host = parts.hostname or ""
+    password = urllib.parse.unquote(parts.username or "")
+    if not host or not password:
+        raise ValueError("trojan: в ссылке нет адреса или пароля")
+
+    net = query.get("type") or "tcp"
+    security = query.get("security") or "tls"
+    stream: dict = {"network": net, "security": security}
+    if security == "reality":
+        stream["realitySettings"] = {
+            "serverName": query.get("sni", ""),
+            "fingerprint": query.get("fp", "chrome"),
+            "publicKey": query.get("pbk", ""),
+            "shortId": query.get("sid", ""),
+        }
+    elif security == "tls":
+        stream["tlsSettings"] = {
+            "serverName": query.get("sni") or host,
+            "fingerprint": query.get("fp", "chrome"),
+        }
+    if net == "ws":
+        ws: dict = {"path": query.get("path") or "/"}
+        if query.get("host"):
+            ws["headers"] = {"Host": query["host"]}
+        stream["wsSettings"] = ws
+    elif net == "grpc":
+        stream["grpcSettings"] = {
+            "serviceName": query.get("serviceName") or query.get("path", "")}
+
+    server: dict = {"address": host, "port": port, "password": password}
+    flow = query.get("flow", "")
+    if flow:
+        server["flow"] = flow
+    outbound = {
+        "tag": "proxy",
+        "protocol": "trojan",
+        "settings": {"servers": [server]},
+        "streamSettings": stream,
+    }
+    name = urllib.parse.unquote(parts.fragment or "").strip() or host
+    return {"name": name, "host": host, "port": port,
+            "outbound": outbound, "link": link}
+
+
+def _ss_credentials(userinfo: str) -> tuple[str, str] | None:
+    """Метод и пароль Shadowsocks: открытым текстом или base64."""
+    value = urllib.parse.unquote(userinfo)
+    if ":" not in value:
+        value = _b64_text(value)
+    if ":" not in value:
+        return None
+    method, password = value.split(":", 1)
+    method = method.strip()
+    if not method or not password:
+        return None
+    return method, password
+
+
+def parse_ss(link: str) -> dict:
+    """Разбирает ``ss://`` в обоих видах: base64(метод:пароль)@хост и base64(всё)."""
+    text = link.strip()
+    body = text.split("://", 1)[1] if "://" in text else text
+    name = ""
+    if "#" in body:
+        body, fragment = body.split("#", 1)
+        name = urllib.parse.unquote(fragment).strip()
+    body = body.split("?", 1)[0].strip().rstrip("/")
+    if not body:
+        raise ValueError("ss: пустая ссылка")
+    if "@" in body:
+        userinfo, location = body.rsplit("@", 1)
+    else:
+        decoded = _b64_text(body)
+        if "@" not in decoded:
+            raise ValueError("ss: ссылка не декодируется")
+        userinfo, location = decoded.rsplit("@", 1)
+    credentials = _ss_credentials(userinfo)
+    if credentials is None:
+        raise ValueError("ss: в ссылке нет метода и пароля")
+    method, password = credentials
+    address = urllib.parse.urlsplit("//" + location)
+    try:
+        port = int(address.port or 8388)
+    except ValueError:
+        raise ValueError("ss: неверный порт") from None
+    host = address.hostname or ""
+    if not host:
+        raise ValueError("ss: в ссылке нет адреса сервера")
+    outbound = {
+        "tag": "proxy",
+        "protocol": "shadowsocks",
+        "settings": {"servers": [{
+            "address": host, "port": port,
+            "method": method, "password": password,
+        }]},
+    }
+    return {"name": name or host, "host": host, "port": port,
+            "outbound": outbound, "link": link}
+
+
+def parse_link(link: str) -> dict:
+    """Разбирает ссылку любого поддерживаемого протокола.
+
+    Схему называем в ошибке, но саму ссылку не печатаем: в ней пароль/id.
+    """
+    text = (link or "").strip()
+    scheme = text.split("://", 1)[0].strip().lower() if "://" in text else ""
+    if scheme == "vless":
+        return parse_vless(text)
+    if scheme == "vmess":
+        return parse_vmess(text)
+    if scheme == "trojan":
+        return parse_trojan(text)
+    if scheme == "ss":
+        return parse_ss(text)
+    raise ValueError("неподдерживаемая ссылка: нужен vless, vmess, trojan или ss")
+
+
 def probe_server(server: dict, timeout: float = 5.0) -> int:
     """TCP-доступность сервера. Возвращает задержку в мс или -1."""
     started = time.perf_counter()
@@ -288,7 +633,7 @@ def rank_servers(links: list[str], limit: int | None = None,
         if remaining < 0.5:
             break
         try:
-            server = parse_vless(link)
+            server = parse_link(link)
         except Exception:  # noqa: BLE001
             continue
         latency = probe_server(server, timeout=min(PROBE_TIMEOUT, remaining))
@@ -303,8 +648,11 @@ def rank_servers(links: list[str], limit: int | None = None,
 
 def pick_server(links: list[str] | None = None,
                 time_budget: float = SEARCH_BUDGET) -> dict | None:
-    """Возвращает самый быстрый из доступных серверов."""
-    links = links if links is not None else fetch_subscription()
+    """Возвращает самый быстрый из доступных серверов.
+
+    Без явного списка берёт свои конфиги и подписку (``collect_links``).
+    """
+    links = links if links is not None else collect_links()
     alive = rank_servers(links, time_budget=time_budget)
     return alive[0] if alive else None
 
@@ -549,7 +897,7 @@ def saved_server() -> dict | None:
     if not link:
         return None
     try:
-        server = parse_vless(link)
+        server = parse_link(link)
     except Exception:  # noqa: BLE001
         return None
     server["latency"] = saved.get("latency", -1)
@@ -665,7 +1013,7 @@ def _restart_with_stream(enable: bool, cfg: dict | None = None) -> dict:
     link = saved.get("link") or ""
     if link:
         try:
-            server = parse_vless(link)
+            server = parse_link(link)
             server["latency"] = saved.get("latency", -1)
         except Exception:  # noqa: BLE001
             server = None
@@ -776,9 +1124,11 @@ def _start(cfg: dict | None = None, extra_domains: list[str] | None = None,
 
     if server is None:
         try:
-            links = fetch_subscription(cfg.get("xray_subscription"))
+            links = collect_links(cfg)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
         except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "error": f"подписка недоступна: {type(exc).__name__}"}
+            return {"ok": False, "error": f"конфиги недоступны: {type(exc).__name__}"}
         server = pick_server(links)
     if server is None:
         return {"ok": False, "error": "нет доступных серверов"}
@@ -970,8 +1320,12 @@ def servers_path() -> Path:
 
 
 def scan_servers(timeout: float = 5.0) -> list[dict]:
-    """Опрашивает подписку, проверяет серверы и сохраняет список."""
-    links = fetch_subscription()
+    """Опрашивает свои конфиги и подписку, проверяет серверы и сохраняет список.
+
+    Пустой набор источников даёт ``ValueError`` от ``collect_links`` —
+    вызывающий показывает его текст как есть.
+    """
+    links = collect_links()
     alive = rank_servers(links, )
     rows = [{
         "name": s["name"], "host": s["host"], "port": s["port"],
@@ -1066,7 +1420,7 @@ def _switch_server(exclude: set[str] | None = None, cfg: dict | None = None) -> 
         return {"ok": False, "error": "нет доступных серверов"}
     candidates.sort(key=lambda r: r.get("latency", 9999))
     chosen = candidates[0]
-    server = parse_vless(chosen["link"])
+    server = parse_link(chosen["link"])
     server["latency"] = chosen.get("latency", -1)
     return switch_to(server, cfg)
 

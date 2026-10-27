@@ -11,6 +11,8 @@ from __future__ import annotations
 import threading
 import time
 import tkinter as tk
+from pathlib import Path
+from tkinter import filedialog
 
 from . import activity, blocked, components, config, routes, xray
 from .theme import SPACE, Theme
@@ -32,6 +34,20 @@ def _text_value(cfg: dict, key: str) -> str:
     """Строковое поле конфига: ``None`` и не-строки читаются как пустая строка."""
     value = cfg.get(key)
     return value if isinstance(value, str) else ""
+
+
+def _links_text(cfg: dict) -> str:
+    """Свои конфиги для многострочного поля: по одной ссылке в строке.
+
+    Строка из конфига (склеенные ссылки или base64) разбирается тем же
+    ``links_from_text``, что и ввод: в поле видно ровно то, что пойдёт в дело.
+    """
+    value = cfg.get("xray_links")
+    if isinstance(value, str):
+        return "\n".join(xray.links_from_text(value))
+    if isinstance(value, (list, tuple)):
+        return "\n".join(item for item in value if isinstance(item, str))
+    return ""
 
 
 def _port_text(cfg: dict) -> str:
@@ -196,6 +212,90 @@ class SettingsPage(tk.Frame):
         if entry is not None:
             entry.set_error(error)
 
+    # ---- свои конфиги -----------------------------------------------------
+    def _links_value(self) -> str:
+        """Текст поля своих конфигов."""
+        try:
+            return self.links_text.get("1.0", "end-1c")
+        except tk.TclError:
+            return ""
+
+    def _set_links(self, text: str) -> None:
+        """Заменить содержимое поля ссылками, по одной в строке."""
+        try:
+            self.links_text.delete("1.0", "end")
+            self.links_text.insert("1.0", text)
+        except tk.TclError:
+            return
+        self._update_links_status()
+
+    def _update_links_status(self) -> None:
+        """Счётчик распознанных ссылок под полем.
+
+        Непустой текст без единой ссылки — красным: сохранить его нельзя,
+        и пользователь должен увидеть это до нажатия «Сохранить».
+        """
+        text = self._links_value()
+        if not text.strip():
+            self.links_status.configure(text="", fg=self.theme.text_faint)
+            return
+        count = len(xray.links_from_text(text))
+        color = self.theme.text_faint if count else self.theme.bad
+        self.links_status.configure(text=f"Распознано: {count}", fg=color)
+
+    def _append_links(self, text: str) -> None:
+        """Дописать найденные ссылки к введённым, без повторов."""
+        merged = xray.links_from_text("\n".join((self._links_value(), text)))
+        self._set_links("\n".join(merged))
+
+    def _links_from_file(self) -> None:
+        """Импорт своих конфигов из файла: текст, base64 или JSON-список."""
+        path = filedialog.askopenfilename(
+            parent=self.winfo_toplevel(), title="Свои конфиги",
+            filetypes=(("Ссылки и подписки", "*.txt *.conf *.json *.base64"),
+                       ("Все файлы", "*.*")))
+        if not path:
+            return
+        try:
+            raw = None
+            # UTF-8 (с BOM и без), затем UTF-16 из «Блокнота», затем ANSI:
+            # подписку сохраняют из чего угодно, а терять импорт из-за
+            # кодировки нельзя.
+            for encoding in ("utf-8-sig", "utf-16", "latin-1"):
+                try:
+                    raw = Path(path).read_text(encoding=encoding)
+                    break
+                except UnicodeError:
+                    continue
+            if raw is None:
+                self.links_status.configure(text="Не прочитать файл",
+                                            fg=self.theme.bad)
+                return
+        except OSError:
+            self.links_status.configure(text="Не прочитать файл",
+                                        fg=self.theme.bad)
+            return
+        if not xray.links_from_text(raw):
+            self.links_status.configure(text="Распознано: 0", fg=self.theme.bad)
+            return
+        self._append_links(raw)
+
+    def _links_from_clipboard(self) -> None:
+        """Вставка своих конфигов из буфера обмена."""
+        try:
+            raw = self.winfo_toplevel().clipboard_get()
+        except tk.TclError:
+            self.links_status.configure(text="В буфере нет текста",
+                                        fg=self.theme.warn)
+            return
+        if not xray.links_from_text(raw):
+            self.links_status.configure(text="Распознано: 0", fg=self.theme.bad)
+            return
+        self._append_links(raw)
+
+    def _clear_links(self) -> None:
+        self._set_links("")
+
     def _scroll_area(self, parent: tk.Misc, bg: str, min_height: int,
                      expand: bool = False) -> ScrollBody:
         """ScrollBody с тонким ползунком, нарисованным на своём Canvas.
@@ -341,6 +441,35 @@ class SettingsPage(tk.Frame):
         self._label(vpn, "Ссылка на подписку (её выдаёт провайдер). Хранится "
                          "только у вас в config.json.", caption=True)
         self._entry(vpn, "xray_subscription", placeholder="https://…")
+
+        self._label(vpn, "Свои конфиги: ссылки vless/vmess/trojan/ss или "
+                         "base64-подписка")
+        links_box = tk.Frame(vpn, bg=theme.card)
+        links_box.pack(fill="x", pady=(0, SPACE["sm"]))
+        self.links_text = tk.Text(
+            links_box, height=5, wrap="char", bd=0, highlightthickness=1,
+            bg=theme.card, fg=theme.text, insertbackground=theme.text,
+            selectbackground=theme.accent_soft, selectforeground=theme.text,
+            highlightbackground=theme.card_border, highlightcolor=theme.focus,
+            font=theme.body(), padx=SPACE["sm"], pady=SPACE["sm"])
+        self.links_text.pack(fill="x")
+        self.links_text.insert("1.0", _links_text(cfg))
+        self.links_text.bind("<KeyRelease>",
+                             lambda _event: self._update_links_status())
+        self.links_status = tk.Label(
+            vpn, text="", bg=theme.card, fg=theme.text_faint,
+            font=theme.caption(), anchor="w", justify="left",
+            wraplength=self.WIDTH - 120)
+        self.links_status.pack(fill="x", pady=(0, SPACE["sm"]))
+        links_actions = tk.Frame(vpn, bg=theme.card)
+        links_actions.pack(fill="x", pady=(0, SPACE["md"]))
+        for text, command in (("Из файла…", self._links_from_file),
+                              ("Из буфера", self._links_from_clipboard),
+                              ("Очистить", self._clear_links)):
+            PillButton(links_actions, theme, text, command,
+                       kind="secondary", height=CONTROL_HEIGHT).pack(
+                side="left", padx=(0, SPACE["sm"]))
+        self._update_links_status()
 
         self._label(vpn, "Порт локального прокси")
         port_row = tk.Frame(vpn, bg=theme.card)
@@ -530,6 +659,7 @@ class SettingsPage(tk.Frame):
                 bool(cfg.get("xray_stream_fallback", True)))
             self.vars["zapret_dir"].set(_text_value(cfg, "zapret_dir"))
             self.vars["tgws_exe"].set(_text_value(cfg, "tgws_exe"))
+            self._set_links(_links_text(cfg))
             self._mark_entry_error("xray_port", False)
         values = {
             "autostart": bool(cfg.get("autoconnect")),
@@ -891,7 +1021,19 @@ class SettingsPage(tk.Frame):
             self.progress_label.configure(text=port_error, fg=self.theme.bad)
             return False
         self._mark_entry_error("xray_port", False)
+        links_raw = self._links_value()
+        links = xray.links_from_text(links_raw)
+        if links_raw.strip() and not links:
+            # Непустое поле без единой ссылки — почти всегда мусор или
+            # недокопированный текст: сохранять его нельзя, иначе при
+            # следующем запуске «конфигов нет» без объяснения.
+            self._update_links_status()
+            self.progress_label.configure(
+                text="Свои конфиги: не найдено ни одной ссылки "
+                     "vless/vmess/trojan/ss", fg=self.theme.bad)
+            return False
         cfg["xray_subscription"] = self.vars["xray_subscription"].get().strip()
+        cfg["xray_links"] = links
         cfg["xray_port"] = port
         cfg["xray_system_proxy"] = bool(self.vars["xray_system_proxy"].get())
         cfg["xray_stream_fallback"] = bool(self.vars["xray_stream_fallback"].get())

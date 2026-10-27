@@ -305,7 +305,7 @@ class TrayApp:
 
         def worker() -> None:
             try:
-                server = xray.parse_vless(row["link"])
+                server = xray.parse_link(row["link"])
                 server["latency"] = row.get("latency", -1)
                 result = xray.switch_to(server, self.cfg)
             except Exception as exc:  # noqa: BLE001
@@ -1006,10 +1006,10 @@ class TrayApp:
         return True
 
     def refresh_subscription(self) -> bool:
-        """Перекачивает список серверов из подписки."""
+        """Перепроверяет серверы: свои конфиги и подписка, если она задана."""
         if self.busy.get("subscription"):
             return False
-        self.busy["subscription"] = "обновляю подписку…"
+        self.busy["subscription"] = "обновляю серверы…"
         self._signature = None
 
         def worker() -> None:
@@ -1021,9 +1021,12 @@ class TrayApp:
                     self.refresh_activity()
                     self.notify(f"Серверы обновлены: {len(rows)}")
                 else:
-                    self.notify("Подписка не вернула серверов")
+                    self.notify("Серверы не найдены: проверьте свои конфиги")
+            except ValueError as exc:
+                # Текст наш собственный («нет конфигов: …»): секретов в нём нет.
+                self.notify(str(exc))
             except Exception as exc:  # noqa: BLE001
-                self.notify(f"Подписка недоступна: {type(exc).__name__}")
+                self.notify(f"Серверы недоступны: {type(exc).__name__}")
             finally:
                 self.busy.pop("subscription", None)
                 self._signature = None
