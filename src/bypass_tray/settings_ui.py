@@ -24,6 +24,12 @@ from .widgets import (
 PORT_MIN = 1024
 PORT_MAX = 65535
 
+#: Человеческие имена режимов маршрутизации — подписи и строка журнала.
+ROUTING_MODE_NAMES = {
+    "blocked": "только заблокированное",
+    "all": "всё, кроме РФ",
+}
+
 #: Высота элементов управления в настройках: та же, что у полей (36 px).
 CONTROL_HEIGHT = SPACE["xl"] + SPACE["md"]
 #: Высота компактного элемента в строке правила (28–32 px).
@@ -481,6 +487,21 @@ class SettingsPage(tk.Frame):
                  anchor="w", justify="left").pack(
             side="left", padx=(SPACE["sm"], 0), pady=SPACE["sm"])
 
+        self._label(vpn, "Режим")
+        mode_row = tk.Frame(vpn, bg=theme.card)
+        mode_row.pack(fill="x", pady=(0, SPACE["xs"]))
+        self.routing_segment = Segmented(
+            mode_row, theme,
+            [("blocked", "Только заблокированное"), ("all", "Всё, кроме РФ")],
+            config.normalise_routing_mode(cfg.get("routing_mode")),
+            bg=theme.card, height=CONTROL_HEIGHT, width=340)
+        self.routing_segment.pack(side="left")
+        self._label(
+            vpn,
+            "Только заблокированное — через VPN идут заблокированные сайты. "
+            "Всё, кроме РФ — через VPN идёт весь трафик, кроме РФ и локальной "
+            "сети.", caption=True)
+
         for key, text, hint in (
             ("xray_system_proxy", "Прописывать прокси в систему",
              "Браузеры сразу начнут им пользоваться"),
@@ -657,6 +678,10 @@ class SettingsPage(tk.Frame):
             self.vars["xray_system_proxy"].set(bool(cfg.get("xray_system_proxy", True)))
             self.vars["xray_stream_fallback"].set(
                 bool(cfg.get("xray_stream_fallback", True)))
+            segment = getattr(self, "routing_segment", None)
+            if segment is not None:
+                segment.set(config.normalise_routing_mode(
+                    cfg.get("routing_mode")))
             self.vars["zapret_dir"].set(_text_value(cfg, "zapret_dir"))
             self.vars["tgws_exe"].set(_text_value(cfg, "tgws_exe"))
             self._set_links(_links_text(cfg))
@@ -1015,6 +1040,7 @@ class SettingsPage(tk.Frame):
 
     def _save(self) -> bool:
         cfg = dict(self.controller.cfg or {})
+        previous_mode = config.normalise_routing_mode(cfg.get("routing_mode"))
         port, port_error = _parse_port(self.vars["xray_port"].get())
         if port is None:
             self._mark_entry_error("xray_port", True)
@@ -1037,6 +1063,8 @@ class SettingsPage(tk.Frame):
         cfg["xray_port"] = port
         cfg["xray_system_proxy"] = bool(self.vars["xray_system_proxy"].get())
         cfg["xray_stream_fallback"] = bool(self.vars["xray_stream_fallback"].get())
+        cfg["routing_mode"] = config.normalise_routing_mode(
+            self.routing_segment.get())
         cfg["blocked_list_enabled"] = bool(self.blocked_toggle.get())
         cfg["youtube_via_vpn"] = bool(self.toggles["youtube"].get())
         cfg["xray_routes"] = dict(self.rules)
@@ -1056,6 +1084,14 @@ class SettingsPage(tk.Frame):
         self.progress_label.configure(text="Сохранено", fg=self.theme.ok)
         restart = getattr(self.controller, "restart_proxy", None)
         if callable(restart) and self._proxy_running():
+            if cfg["routing_mode"] != previous_mode:
+                # Применяется только перезапуском ядра: записываем в журнал,
+                # чтобы смена режима не осталась невидимой.
+                activity.log(
+                    "режим маршрутизации: "
+                    + ROUTING_MODE_NAMES.get(cfg["routing_mode"],
+                                             cfg["routing_mode"]),
+                    kind="info")
             if restart() is False:
                 self.progress_label.configure(
                     text="Сохранено, но прокси занят — перезапустите вручную",

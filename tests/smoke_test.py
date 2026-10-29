@@ -40,8 +40,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from bypass_tray import (  # noqa: E402
-    actions, activity, autostart, blocked, components, config, guard, health,
-    icons, networks, routes, status, strategy, theme, updates,
+    __version__, actions, activity, autostart, blocked, components, config,
+    guard, health, icons, networks, routes, status, strategy, theme, updates,
 )
 from bypass_tray.app import TrayApp  # noqa: E402
 from bypass_tray.settings_ui import SettingsWindow  # noqa: E402
@@ -518,7 +518,11 @@ def main() -> int:
             check("вход в настройки мгновенный",
                   panel._settings_visible and panel._page_visible == "settings"
                   and abs(panel._last_height - root.winfo_height()) <= 1
-                  and panel._last_height > main_height)
+                  # Не строго ">": на невысоких экранах обе страницы упираются
+                  # в _height_limit и получают одинаковую высоту. Смысл чека —
+                  # окно не меняет высоту после переключения (без отложенного
+                  # resize), а не «настройки обязательно выше».
+                  and panel._last_height >= main_height)
             check("нет анимационных полей",
                   not hasattr(panel, "_anim_after")
                   and not hasattr(panel, "_anim_token"))
@@ -1133,7 +1137,8 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
           and b"for /d" in run_bat_bytes
           and b"dist\\*" in run_bat_bytes
           and b"*.exe" in run_bat_bytes)
-    check("widget_version 0.6.8", updates.widget_version() == "0.6.8",
+    check(f"widget_version {__version__}",
+          updates.widget_version() == __version__,
           updates.widget_version())
     empty_components = components.installed({"zapret_dir": "", "tgws_exe": ""})
     check("components.installed: пустые пути — не cwd",

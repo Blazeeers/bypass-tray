@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 from .config import atomic_write, config_dir
+from .secrets import redact_text
 
 #: Сколько записей хранить. Старые вытесняются при каждой новой.
 LIMIT = 60
@@ -44,7 +45,8 @@ def _write(rows: list[dict]) -> None:
 
 def log(text: str, kind: str = "auto") -> None:
     """Добавляет запись в журнал. ``kind`` — auto | ok | warn | info."""
-    entry = {"at": time.time(), "text": str(text), "kind": str(kind or "auto")}
+    entry = {"at": time.time(), "text": redact_text(str(text)),
+             "kind": str(kind or "auto")}
     with _LOCK:
         _write((_read() + [entry])[-LIMIT:])
 

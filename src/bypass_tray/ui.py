@@ -20,6 +20,7 @@ from tkinter import messagebox
 from PIL import ImageTk
 
 from . import icons
+from .secrets import redact_text
 from .settings_ui import SettingsPage
 from .theme import SPACE, Theme, resolve_dark
 from .widgets import (
@@ -60,6 +61,51 @@ SERVICES = (
     ("deepseek", "DeepSeek API", "spark"),
     ("tgwsproxy", "tg-ws-proxy", "telegram"),
 )
+
+#: Поля карточки: ширина текста = окно минус отступы карточки.
+CARD_TEXT_WIDTH = WINDOW_W - 4 * SPACE["lg"] - SPACE["sm"]
+
+#: Режим маршрутизации человеческим языком — та же подпись, что в настройках.
+ROUTING_MODE_TEXT = {
+    "blocked": "через VPN: только заблокированное",
+    "all": "через VPN: всё, кроме РФ",
+}
+
+
+def _domain_word(count: int) -> str:
+    """Склонение слова «домен» для счётчика исключений."""
+    if count % 10 == 1 and count % 100 != 11:
+        return "домен"
+    if 2 <= count % 10 <= 4 and not 12 <= count % 100 <= 14:
+        return "домена"
+    return "доменов"
+
+
+def coverage_text(system_proxy: bool, bypass: list[str]) -> str:
+    """Две строки про фактическое покрытие: что через VPN, а что нет.
+
+    Компактно намеренно: главная карточка обязана оставаться ниже страницы
+    настроек, иначе окно при её открытии меняет высоту и дёргается.
+    """
+    if system_proxy:
+        first = "Покрытие: браузеры и приложения, уважающие системный прокси."
+    else:
+        first = "Покрытие: системный прокси не применён — трафик идёт мимо VPN."
+    parts: list[str] = []
+    from . import xray as xray_module
+
+    # В реестре каждое имя лежит дважды (``x.com`` и ``*.x.com``) вместе со
+    # служебными записями — считать надо настоящие домены.
+    count = xray_module.count_bypass_domains(list(bypass or []))
+    if count:
+        parts.append(f"Исключено: {count} {_domain_word(count)}")
+    parts.append("не покрыто: свои настройки прокси, игры, Electron; "
+                 "tg-ws-proxy не требует")
+    tail = " · ".join(parts)
+    if not count:
+        # Без счётчика строка начинается с «не покрыто» — с заглавной.
+        tail = tail[:1].upper() + tail[1:]
+    return first + "\n" + tail
 
 
 def clean_server_name(name: str) -> str:
@@ -747,6 +793,11 @@ class Panel:
             font=theme.body(), anchor="w",
         )
         self._vpn["line"].pack(fill="x", pady=(SPACE["xs"], 0))
+        # Режим маршрутизации — отдельной строкой под сервером.
+        self._vpn["mode"] = tk.Label(
+            titles, text="", bg=theme.card, fg=theme.text_faint,
+            font=theme.caption(), anchor="w")
+        self._vpn["mode"].pack(fill="x", pady=(SPACE["xs"] // 2, 0))
 
         self._vpn["button"] = PillButton(
             top, theme, "Включить", lambda: self._call(self.controller.set_proxy, True),
@@ -790,6 +841,14 @@ class Panel:
             kind="secondary", height=ROW_CONTROL_HEIGHT, pad_x=SPACE["md"],
         )
         self._vpn["refresh"].pack(side="left", padx=(SPACE["sm"], 0))
+
+        # Покрытие: две строки без заголовка — компактно, чтобы главная
+        # страница оставалась ниже страницы настроек.
+        self._vpn["coverage"] = tk.Label(
+            inner, text="", bg=theme.card, fg=theme.text_faint,
+            font=theme.caption(), anchor="w", justify="left",
+            wraplength=CARD_TEXT_WIDTH)
+        self._vpn["coverage"].pack(fill="x", pady=(SPACE["sm"], 0))
 
     # -- карточка сервисов ---------------------------------------------------
     def _build_services(self, inner: tk.Frame) -> None:
@@ -976,6 +1035,24 @@ class Panel:
         else:
             line = proxy.get("message") or "не подключён"
         info["line"].configure(text=line)
+
+        # Режим и покрытие — из фактического состояния, а не из ожиданий:
+        # ``proxy`` собирается из ``xray.status()``, ``status`` — из
+        # ``status.collect``.
+        cfg = getattr(self.controller, "cfg", {}) or {}
+        state = getattr(self.controller, "status", {}) or {}
+        mode = str(proxy.get("routing_mode") or cfg.get("routing_mode")
+                   or "blocked")
+        info["mode"].configure(
+            text=ROUTING_MODE_TEXT.get(mode, ROUTING_MODE_TEXT["blocked"]))
+        system_proxy = proxy.get("system_proxy")
+        if system_proxy is None:
+            system_proxy = state.get("system_proxy", False)
+        bypass = proxy.get("bypass")
+        if bypass is None:
+            bypass = state.get("bypass")
+        info["coverage"].configure(
+            text=coverage_text(bool(system_proxy), list(bypass or [])))
 
         button = info["button"]
         button.set_text("Выключить" if running else "Включить")
@@ -1173,7 +1250,7 @@ class Panel:
                 stamp = time.strftime("%H:%M", time.localtime(float(entry.get("at") or 0)))
             except (TypeError, ValueError):
                 stamp = "--:--"
-            text = str(entry.get("text") or "")
+            text = redact_text(str(entry.get("text") or ""))
             # Эмодзи и флаги из имён серверов в журнале тоже не показываем.
             text = " ".join(_EMOJI_RE.sub("", text).split())
             if len(text) > 92:

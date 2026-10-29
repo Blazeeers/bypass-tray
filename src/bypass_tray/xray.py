@@ -680,23 +680,32 @@ def build_config(server: dict, port: int, extra_domains: list[str] | None = None
                  stream_via_proxy: bool = False,
                  direct_domains: list[str] | None = None,
                  user_routes: dict | None = None,
-                 blocked_rule: str | None = None) -> dict:
+                 blocked_rule: str | None = None,
+                 routing_mode: str = "blocked") -> dict:
     """Конфиг Xray: локальный прокси + маршрутизация.
 
-    Маршрут по умолчанию — **напрямую** (``direct`` стоит первым в outbounds),
-    поэтому через сервер идёт только явно перечисленное.
+    Маршрут по умолчанию задаёт **первый outbound** — catch-all правила в
+    ``routing.rules`` нет. Режим ``routing_mode``:
+
+    * ``blocked`` — ``direct`` первым: через сервер идёт только перечисленное;
+    * ``all`` — сервер первым: через прокси идёт всё, что не поймано явными
+      правилами (РФ, ``private`` и пользовательские ``direct`` остаются
+      напрямую выше по списку правил).
 
     Порядок правил:
-    1) пользовательские direct, 2) пользовательские proxy, 3) audit direct,
-    4) YouTube/Discord напрямую (если не резервный режим), 5) встроенный
-    список заблокированных ``blocked_rule`` через прокси, 6) РФ/private
-    напрямую, 7) встроенные прокси-домены + stream (в резервном режиме) +
-    audit proxy.
+    1) пользовательские direct, 2) пользовательские proxy, 3) audit direct
+    (только вне ``all``)
+    4) YouTube/Discord напрямую (если не резервный режим и не ``all``),
+    5) встроенный список заблокированных ``blocked_rule`` через прокси,
+    6) РФ/private напрямую, 7) встроенные прокси-домены + stream (в резервном
+    режиме) + audit proxy.
 
     Preset перебивает РФ-direct (среди заблокированных есть российские
     домены), но пользовательские правила и YouTube/Discord остаются выше.
     """
     from . import routes
+
+    mode = config.normalise_routing_mode(routing_mode)
 
     user_direct: list[str] = []
     user_proxy: list[str] = []
@@ -721,9 +730,17 @@ def build_config(server: dict, port: int, extra_domains: list[str] | None = None
         d for d in _normalise_domains(direct_domains)
         if d not in user_direct_set and d not in user_proxy_set
     ]
+    if mode == "all":
+        # В режиме "all" прямой маршрут аудита уводит трафик мимо VPN. Файл
+        # мог остаться от сессии в "blocked", поэтому защищаемся здесь, а не
+        # только при записи. Пользовательские direct выше — это осознанный
+        # выбор, их не трогаем.
+        audit_direct = []
     audit_direct_set = set(audit_direct)
     stream_direct = []
-    if not stream_via_proxy:
+    if not stream_via_proxy and mode != "all":
+        # В режиме "all" YouTube/Discord не исключение: иначе «всё, кроме РФ»
+        # оставляло бы их на прямом канале мимо VPN.
         stream_direct = [
             d for d in _normalise_domains(STREAM_DOMAINS)
             if d not in user_direct_set and d not in user_proxy_set
@@ -785,18 +802,23 @@ def build_config(server: dict, port: int, extra_domains: list[str] | None = None
             "settings": {"udp": True, "auth": "noauth"},
             "sniffing": {"enabled": True, "destOverride": ["http", "tls"]},
         }],
-        # ВАЖНО: первый outbound — маршрут по умолчанию. Здесь это `direct`,
-        # иначе в прокси уходил бы весь зарубежный трафик.
-        "outbounds": [
-            {"tag": "direct", "protocol": "freedom"},
-            server["outbound"],
-            {"tag": "block", "protocol": "blackhole"},
-        ],
+        # ВАЖНО: первый outbound — маршрут по умолчанию. В "blocked" это
+        # `direct`, в "all" — сервер: явные правила выше в списке всё равно
+        # отправляют РФ/private и пользовательские direct напрямую.
+        "outbounds": _ordered_outbounds(server, mode),
         "routing": {
             "domainStrategy": "IPIfNonMatch",
             "rules": rules,
         },
     }
+
+
+def _ordered_outbounds(server: dict, mode: str) -> list[dict]:
+    """Outbounds с маршрутом по умолчанию первым (catch-all правила нет)."""
+    direct = {"tag": "direct", "protocol": "freedom"}
+    proxy = server["outbound"]
+    order = [proxy, direct] if mode == "all" else [direct, proxy]
+    return order + [{"tag": "block", "protocol": "blackhole"}]
 
 
 def _normalise_domains(values: list[str] | None) -> list[str]:
@@ -864,7 +886,8 @@ def is_running() -> bool:
     return find_process() is not None
 
 
-def _save_state(server: dict, port: int, stream: bool = False) -> None:
+def _save_state(server: dict, port: int, stream: bool = False,
+                routing_mode: str = "blocked") -> None:
     config.atomic_write(state_path(), json.dumps({
         "name": server.get("name", ""),
         "host": server.get("host", ""),
@@ -872,6 +895,9 @@ def _save_state(server: dict, port: int, stream: bool = False) -> None:
         "port": port,
         "since": time.time(),
         "stream": bool(stream),
+        # Фактический режим, на котором поднято ядро: конфиг может
+        # измениться уже после запуска, а status() должен не врать.
+        "routing_mode": config.normalise_routing_mode(routing_mode),
         "link": server.get("link", ""),
         "extra": server.get("extra", []),
     }, ensure_ascii=False))
@@ -919,6 +945,47 @@ def status() -> dict:
         # True = YouTube/Discord тоже через прокси (zapret не работает).
         "stream": bool(RUNNING.get("stream", saved.get("stream", False))),
         "blocked_list": _blocked_available(),
+        # Режим маршрутизации: фактический у работающего ядра, иначе из конфига.
+        "routing_mode": _routing_mode(saved),
+        # Фактические исключения системного прокси (ProxyOverride из реестра).
+        "bypass": system_proxy_bypass(),
+    }
+
+
+def _routing_mode(saved: dict | None = None, use_config: bool = True) -> str:
+    """Режим работающего ядра; без запуска — сохранённый или из конфига.
+
+    ``use_config=False`` — только дешёвые чтения: ``config.load_config()`` на
+    пустом ``zapret_dir`` запускает автопоиск каталога (обход диска), а
+    ``coverage`` опрашивается каждые 5 секунд из ``status.collect``.
+    """
+    if RUNNING.get("routing_mode"):
+        return config.normalise_routing_mode(RUNNING.get("routing_mode"))
+    saved = _saved_state() if saved is None else saved
+    if saved.get("routing_mode"):
+        return config.normalise_routing_mode(saved.get("routing_mode"))
+    if not use_config:
+        return "blocked"
+    try:
+        return config.normalise_routing_mode(
+            config.load_config().get("routing_mode"))
+    except Exception:  # noqa: BLE001
+        return "blocked"
+
+
+def coverage() -> dict:
+    """Дешёвый срез покрытия: без чтения и автопоиска конфига.
+
+    ``status()`` при пустой записи о режиме зовёт ``config.load_config()``, а
+    тот на пустом ``zapret_dir`` обходит диск (замер: 26 076 каталогов, ~2 с).
+    ``status.collect`` опрашивается каждые 5 секунд, поэтому здесь только
+    реестр и файл состояния.
+    """
+    saved = _saved_state()
+    return {
+        "routing_mode": _routing_mode(saved, use_config=False),
+        "system_proxy": system_proxy_enabled(),
+        "bypass": system_proxy_bypass(),
     }
 
 
@@ -1155,9 +1222,11 @@ def _start(cfg: dict | None = None, extra_domains: list[str] | None = None,
     if not isinstance(user_map, dict):
         user_map = {}
     blocked_rule, blocked_ok = _blocked_preset(cfg)
+    mode = config.normalise_routing_mode(cfg.get("routing_mode"))
     config_path = config.config_dir() / "xray-config.json"
     payload = json.dumps(build_config(server, port, extra, stream,
-                                      direct_all, user_map, blocked_rule),
+                                      direct_all, user_map, blocked_rule,
+                                      mode),
                          ensure_ascii=False, indent=2)
     config.atomic_write(config_path, payload)
     try:
@@ -1188,8 +1257,9 @@ def _start(cfg: dict | None = None, extra_domains: list[str] | None = None,
 
     RUNNING.update({"process": process, "server": server, "port": port,
                     "since": time.time(), "config": str(config_path),
-                    "stream": bool(stream), "log": log_handle})
-    _save_state(server, port, stream)
+                    "stream": bool(stream), "routing_mode": mode,
+                    "log": log_handle})
+    _save_state(server, port, stream, mode)
 
     # Ждём, пока порт начнёт слушать.
     deadline = time.time() + 15
@@ -1441,7 +1511,7 @@ def system_proxy_enabled() -> bool:
 
 
 def system_proxy_server() -> str:
-    """Текущий ProxyServer из HKCU (пусто — нет/не читается)."""
+    """Текущий ProxyServer из HKCU (пусто - нет/не ставили)."""
     try:
         import winreg
 
@@ -1449,6 +1519,51 @@ def system_proxy_server() -> str:
             return str(winreg.QueryValueEx(key, "ProxyServer")[0] or "")
     except OSError:
         return ""
+
+
+def system_proxy_bypass() -> list[str]:
+    """Фактический ProxyOverride: что системный прокси обходит стороной.
+
+    Читается из реестра, а не пересчитывается: панель показывает реальное
+    состояние, даже если список исключений писал другой экземпляр.
+    """
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _INTERNET_SETTINGS) as key:
+            raw = str(winreg.QueryValueEx(key, "ProxyOverride")[0] or "")
+    except OSError:
+        return []
+    return [part.strip() for part in raw.split(";") if part.strip()]
+
+
+def _is_ip_like(name: str) -> bool:
+    """Адрес или его маска (``127.*``, ``::1``), а не домен."""
+    if ":" in name or "/" in name:
+        return True
+    return bool(re.fullmatch(r"[\d.*]+", name))
+
+
+def count_bypass_domains(entries: list[str]) -> int:
+    """Сколько настоящих доменов исключено из системного прокси.
+
+    Реестр хранит служебные записи (``<local>``, локальные адреса) и каждое
+    имя дважды — ``x.com`` и ``*.x.com``. Без свёртки «Исключено: N» выходило
+    вдвое больше доменов, чем есть на самом деле.
+    """
+    names: set[str] = set()
+    for raw in entries or []:
+        text = str(raw or "").strip().lower()
+        if text.startswith("*."):
+            text = text[2:]
+        text = text.strip(".")
+        if not text or text.startswith(("*", "<")) or text == "localhost":
+            continue
+        if _is_ip_like(text):
+            continue
+        names.add(text)
+    return len(names)
+
 
 
 def _group_is_proxied(group: tuple[str, ...], proxy_set: set[str]) -> bool:
@@ -1482,6 +1597,10 @@ def _proxy_bypass_list(stream_via_proxy: bool | None = None) -> str:
         audit_direct = routes.direct_domains()
     except Exception:  # noqa: BLE001
         audit_direct = []
+    if config.normalise_routing_mode((cfg or {}).get("routing_mode")) == "all":
+        # В режиме "all" audit-direct в исключениях системного прокси означал
+        # бы прямой ход мимо VPN — та же утечка, что и в правилах Xray.
+        audit_direct = []
     # Если есть xray_routes, старые списки не учитываем вовсе.
     legacy = ([] if isinstance(cfg.get("xray_routes"), dict)
               else [str(item or "") for item in (cfg.get("xray_direct_domains") or [])])
@@ -1494,7 +1613,10 @@ def _proxy_bypass_list(stream_via_proxy: bool | None = None) -> str:
         name = routes.clean_domain(raw)
         if name and name not in proxy_set:
             entries.append((name, raw.strip().startswith("*.")))
-    if not bool(stream_via_proxy):
+    if not bool(stream_via_proxy) and config.normalise_routing_mode(
+            (cfg or {}).get("routing_mode")) != "all":
+        # В режиме "all" YouTube/Discord идут через VPN, поэтому в обход
+        # системного прокси их не добавляем: иначе браузер ходил бы мимо.
         # YouTube/Discord закрывает zapret: браузер должен идти мимо Xray.
         # Если пользователь отправил в VPN хотя бы один домен группы, из
         # обхода убираем всю группу — иначе часть трафика пойдёт напрямую.

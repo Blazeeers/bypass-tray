@@ -126,6 +126,10 @@ DEFAULTS: dict = {
     "xray_port": 10818,
     # Прописывать прокси в систему, чтобы им пользовались браузеры.
     "xray_system_proxy": True,
+    # Куда вести трафик: "blocked" — через VPN только заблокированное,
+    # "all" — всё, кроме РФ и локальной сети. РФ и private идут напрямую
+    # в обоих режимах.
+    "routing_mode": "blocked",
     # Дополнительные домены, которые тоже вести через прокси.
     # Устарело: мигрирует в xray_routes при первом чтении конфига.
     "xray_extra_domains": [],
@@ -161,6 +165,16 @@ DEFAULTS: dict = {
     # Встроенный список заблокированных доменов Re:filter (data/geosite-refilter.dat).
     "blocked_list_enabled": True,
 }
+
+#: Режимы маршрутизации Xray. Всё остальное при чтении конфига сводится к
+#: ``blocked``: неизвестное значение не должно ломать запуск.
+ROUTING_MODES = ("blocked", "all")
+
+
+def normalise_routing_mode(value) -> str:
+    """Значение ``routing_mode`` из конфига; неизвестное — ``blocked``."""
+    mode = str(value).strip().lower() if isinstance(value, str) else ""
+    return mode if mode in ROUTING_MODES else "blocked"
 
 
 def _home(*parts: str) -> Path:
@@ -341,6 +355,9 @@ def load_config() -> dict:
     # миграция старых списков или найденные пути компонентов. Иначе чтение
     # конфига не должно трогать файл и его mtime.
     cfg["xray_links"] = _normalise_links(cfg.get("xray_links"))
+    # Старые config.json читаются как раньше: без ключа режим — "blocked",
+    # неизвестное значение тоже сводится к нему (без записи файла).
+    cfg["routing_mode"] = normalise_routing_mode(cfg.get("routing_mode"))
     changed = raw is None
     if "xray_routes" not in cfg:
         _migrate_routes(cfg)

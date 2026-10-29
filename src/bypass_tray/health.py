@@ -175,12 +175,17 @@ def _stream_context(cfg: dict, proxy: dict) -> tuple[bool, int | None]:
     """Нужно ли проверять YouTube/Discord через VPN и на каком порту.
 
     Через VPN они идут в резервном режиме (``proxy["stream"]``) или когда
-    пользователь включил ``youtube_via_vpn``. Если режим выбран, а прокси не
-    запущен — второй элемент ``None``, проверка вернёт «нужен VPN».
+    пользователь включил ``youtube_via_vpn``. В режиме ``all`` через VPN идёт
+    всё, кроме РФ, — значит, и они тоже: прямая проба дала бы ложный «сбой».
+    Если режим выбран, а прокси не запущен — второй элемент ``None``, проверка
+    вернёт «нужен VPN».
     """
     cfg = cfg or {}
     proxy = proxy or {}
-    requested = bool(proxy.get("stream")) or bool(cfg.get("youtube_via_vpn"))
+    mode = str(proxy.get("routing_mode") or cfg.get("routing_mode") or "")
+    all_mode = config.normalise_routing_mode(mode) == "all"
+    requested = (all_mode or bool(proxy.get("stream"))
+                 or bool(cfg.get("youtube_via_vpn")))
     if not requested:
         return False, None
     if not proxy.get("running"):
@@ -271,9 +276,9 @@ def _check_zapret(status_state: dict, cfg: dict | None = None,
                   proxy: dict | None = None) -> dict:
     """Состояние zapret. Без работающего zapret при VPN-резерве — warn.
 
-    В резервном режиме YouTube/Discord идут через туннель, поэтому ни
-    остановленный, ни вовсе не найденный ``winws.exe`` не означают сбой
-    обхода, пока прокси жив.
+    В резервном режиме и в режиме ``all`` YouTube/Discord идут через туннель,
+    поэтому ни остановленный, ни вовсе не найденный ``winws.exe`` не означают
+    сбой обхода, пока прокси жив.
     """
     zapret = (status_state or {}).get("zapret") or {}
     if zapret.get("running"):
@@ -281,8 +286,10 @@ def _check_zapret(status_state: dict, cfg: dict | None = None,
         return _item("zapret", "zapret", "ok", detail, 0)
     cfg = cfg or {}
     proxy = proxy or {}
+    mode = str(proxy.get("routing_mode") or cfg.get("routing_mode") or "")
     reserved = bool(proxy.get("running")) and (
-        bool(proxy.get("stream")) or bool(cfg.get("youtube_via_vpn")))
+        bool(proxy.get("stream")) or bool(cfg.get("youtube_via_vpn"))
+        or config.normalise_routing_mode(mode) == "all")
     if reserved:
         prefix = "остановлен" if zapret.get("dir") else "не найден"
         return _item("zapret", "zapret", "warn",

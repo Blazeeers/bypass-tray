@@ -25,7 +25,8 @@ import time
 import urllib.parse
 from pathlib import Path
 
-from .config import atomic_write, config_dir, last_write_error
+from .config import (atomic_write, config_dir, last_write_error,
+                     normalise_routing_mode)
 
 #: Что проверяем по умолчанию. YouTube/Discord здесь нет намеренно: их закрывает
 #: zapret, а резервный режим включает сам Xray.
@@ -476,7 +477,9 @@ def apply_audit(result: dict, cfg: dict | None = None) -> dict:
     такие домены не перезаписываются (и старый оверрайд для них удаляется).
 
     Сохраняются и ``direct``, и ``proxy``: direct — тоже решение аудита, а не
-    отсутствие записи. ``unknown`` не сохраняется вовсе.
+    отсутствие записи. ``unknown`` не сохраняется вовсе. Исключение — режим
+    ``all``: там любой ``direct`` аудита увёл бы трафик мимо VPN, поэтому
+    direct-решения не пишутся, а оставшиеся от сессий в ``blocked`` удаляются.
 
     Прунинг — только у полного аудита (``result["full"]``) или по явному
     списку ``result["prune_domains"]``: тогда удаляется запись домена, который
@@ -490,6 +493,7 @@ def apply_audit(result: dict, cfg: dict | None = None) -> dict:
     at = float(result.get("at") or time.time())
     overrides = dict(_load_file()["routes"])
     user_direct, user_proxy = user_routes(cfg or {})
+    mode = normalise_routing_mode((cfg or {}).get("routing_mode"))
     locked = set(user_direct) | set(user_proxy)
     changed: list[str] = []
     audited: set[str] = set()
@@ -507,6 +511,12 @@ def apply_audit(result: dict, cfg: dict | None = None) -> dict:
                 changed.append(domain)
             continue
         if route not in ("direct", "proxy", "broken"):
+            continue
+        if route == "direct" and mode == "all":
+            # В режиме "all" direct-решение аудита увело бы домен мимо VPN.
+            # Такое не пишем и чистим оставшееся от прошлых сессий: маршрут
+            # домена в этом режиме и так идёт через прокси, перезапуск не нужен.
+            overrides.pop(domain, None)
             continue
         previous = overrides.get(domain) or {}
         if route == "broken" and previous.get("route") in ("direct", "proxy"):

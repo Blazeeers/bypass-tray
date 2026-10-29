@@ -15,7 +15,7 @@ except ImportError:  # pragma: no cover
 
 from . import (
     actions, activity, autostart, config, guard, health, icons, networks, routes,
-    status, strategy, updates, xray,
+    secrets, status, strategy, updates, xray,
 )
 from .theme import STATE_COLORS
 from .ui import Panel, clean_server_name, report_level
@@ -1352,6 +1352,7 @@ class TrayApp:
         беспокоить» и фокус-ассистом, поэтому при ошибке мигаем иконкой;
         подсказка и строка «Обновления» в панели видны в любом случае.
         """
+        message = secrets.redact_text(message)
         icon = self._icon
         if icon is None:
             return

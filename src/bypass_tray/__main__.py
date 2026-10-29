@@ -25,6 +25,9 @@ def _print_json(payload: dict) -> None:
         sys.stdout.reconfigure(encoding="utf-8")
     except (AttributeError, ValueError):
         pass
+    from .secrets import redact_obj
+
+    payload = redact_obj(payload)
     print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 

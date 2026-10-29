@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .config import normalise_routing_mode
+
 try:
     import psutil
 except ImportError:  # pragma: no cover
@@ -213,6 +215,26 @@ def collect(cfg: dict) -> dict:
     source = "process" if process_cmd else ("service" if service_cmd else "")
     strategy = identify_strategy(_read_bats(zapret_dir), cmdline) if valid_dir else ""
 
+    # Режим маршрутизации и системный прокси: режим берём из уже прочитанного
+    # конфига, остальное — дешёвым срезом Xray. ``xray.status()`` здесь не
+    # годится: он при пустой записи о режиме зовёт ``config.load_config()``, а
+    # тот на пустом ``zapret_dir`` обходит диск (~2 с), тогда как ``collect``
+    # опрашивается каждые 5 секунд. Импорт внутри функции: ``xray`` сам зовёт
+    # ``status.collect`` (через ``_desired_stream``), модульный импорт дал бы
+    # цикл.
+    routing_mode = str(cfg.get("routing_mode") or "")
+    system_proxy = False
+    bypass: list[str] = []
+    try:
+        from . import xray
+
+        proxy = xray.coverage()
+        routing_mode = routing_mode or str(proxy.get("routing_mode") or "")
+        system_proxy = bool(proxy.get("system_proxy"))
+        bypass = list(proxy.get("bypass") or [])
+    except Exception:  # noqa: BLE001
+        pass
+
     return {
         "zapret": {
             "running": bool(winws),
@@ -226,4 +248,9 @@ def collect(cfg: dict) -> dict:
         },
         "tgwsproxy": {"running": bool(tgws), "port": port, "listening": port_open(port)},
         "admin": is_admin(),
+        # Что реально покрыто прокси: режим, включён ли системный прокси и
+        # какие домены из него исключены (ProxyOverride из реестра).
+        "routing_mode": normalise_routing_mode(routing_mode),
+        "system_proxy": system_proxy,
+        "bypass": bypass,
     }
