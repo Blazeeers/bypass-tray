@@ -3369,7 +3369,7 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
     check("настройки: YouTube через VPN выключен по умолчанию",
           settings.toggles["youtube"].get() is False)
     check("колесо повешено на список и страницу настроек",
-          bool(settings.rules_scroll.inner.bind("<MouseWheel>"))
+          bool(settings.rules_list.bind("<MouseWheel>"))
           and bool(settings.body.canvas.bind("<MouseWheel>")))
     settings.route_var.set("https://www.example.org/path?x=1")
     settings.route_segment.set("proxy")
@@ -3448,7 +3448,9 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
     print("\n-- настройки: дашборд проверок --")
     check("настройки: строки проверок построены по конфигу",
           len(settings.health_rows) == 7
-          and settings.health_rows["zapret"]["delete"] is None,
+          and settings.health_rows["zapret"]["can_delete"] is False
+          and all(info["can_delete"] is False
+                  for info in settings.health_rows.values()),
           f"строк {len(settings.health_rows)}")
     settings._delete_health(0)
     check("настройки: встроенную проверку удалить нельзя",
@@ -3550,14 +3552,14 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
     check("настройки: пустой список показывает подсказку",
           reopened.rules == {}
           and reopened.routes_empty.winfo_manager() != ""
-          and reopened.rules_scroll.winfo_manager() == "")
+          and reopened.rules_list.winfo_manager() == "")
     reopened.route_var.set("one.example")
     reopened.route_segment.set("direct")
     reopened._add_rule()
     check("настройки: появление правила возвращает список",
           reopened.rules.get("one.example") == "direct"
           and reopened.routes_empty.winfo_manager() == ""
-          and reopened.rules_scroll.winfo_manager() != "")
+          and reopened.rules_list.winfo_manager() != "")
     reopened._close()
 
     # --- настройки: свои конфиги ----------------------------------------

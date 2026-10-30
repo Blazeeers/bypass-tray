@@ -35,12 +35,20 @@ ROUTING_MODE_NAMES = {
     "all": "всё, кроме РФ",
 }
 
+#: Подсказки сегментов «куда вести сайт»: по ключу, а не по индексу.
+ROUTE_SEGMENT_TIPS = {
+    "direct": "Вести этот сайт напрямую",
+    "proxy": "Вести этот сайт через VPN",
+}
+
 #: Высота элементов управления в настройках: та же, что у полей (36 px).
 CONTROL_HEIGHT = SPACE["xl"] + SPACE["md"]
 #: Высота компактного элемента в строке правила (28–32 px).
 ROW_CONTROL_HEIGHT = SPACE["xl"] + SPACE["sm"]
 #: Колонка тумблеров в списке проверок: два тумблера справа от имени.
 HEALTH_SWITCH_COLUMN = SPACE["xl"] * 2
+#: Порог перетаскивания строки проверки, пиксели. Меньше — это клик.
+HEALTH_DRAG_THRESHOLD = 4
 
 
 def _text_value(cfg: dict, key: str) -> str:
@@ -308,6 +316,11 @@ class SettingsPage(tk.Frame):
         self.health_error: tk.Label | None = None
         self.health_vars: dict[str, tk.StringVar] = {}
         self.health_segments: dict[str, Segmented] = {}
+        #: Перетаскивание строки проверки: точка нажатия и линия вставки.
+        self._health_drag: dict | None = None
+        self._health_marker: tk.Frame | None = None
+        self._health_row_widgets: list[tk.Frame] = []
+        self._health_menu_bar: tk.Menu | None = None
         self.tooltips: list[Tooltip] = []
         self._build()
 
@@ -532,10 +545,13 @@ class SettingsPage(tk.Frame):
         action_row = tk.Frame(self._actions, bg=theme.card)
         action_row.pack(fill="x", padx=SPACE["lg"], pady=SPACE["md"])
         PillButton(action_row, theme, "Сохранить", self._save,
-                   kind="primary", height=CONTROL_HEIGHT).pack(side="left")
+                   kind="primary", height=CONTROL_HEIGHT,
+                   tooltip="Записать изменения в конфиг и применить").pack(
+            side="left")
         self.close_button = PillButton(
             action_row, theme, "Закрыть", self._close, kind="ghost",
-            height=CONTROL_HEIGHT)
+            height=CONTROL_HEIGHT,
+            tooltip="Выйти из настроек без сохранения")
         self.close_button.pack(side="left", padx=(SPACE["sm"], 0))
 
         self.body_host = tk.Frame(self, bg=theme.bg)
@@ -681,11 +697,16 @@ class SettingsPage(tk.Frame):
         self.links_status.pack(fill="x", pady=(0, SPACE["sm"]))
         links_actions = tk.Frame(vpn, bg=theme.card)
         links_actions.pack(fill="x", pady=(0, SPACE["md"]))
-        for text, command in (("Из файла…", self._links_from_file),
-                              ("Из буфера", self._links_from_clipboard),
-                              ("Очистить", self._clear_links)):
+        for text, command, tip in (
+                ("Из файла…", self._links_from_file,
+                 "Загрузить конфиги серверов из файла"),
+                ("Из буфера", self._links_from_clipboard,
+                 "Вставить конфиги серверов из буфера обмена"),
+                ("Очистить", self._clear_links,
+                 "Удалить все загруженные конфиги серверов")):
             PillButton(links_actions, theme, text, command,
-                       kind="secondary", height=CONTROL_HEIGHT).pack(
+                       kind="secondary", height=CONTROL_HEIGHT,
+                       tooltip=tip).pack(
                 side="left", padx=(0, SPACE["sm"]))
         self._update_links_status()
 
@@ -748,7 +769,8 @@ class SettingsPage(tk.Frame):
         blocked_actions.pack(fill="x")
         self.blocked_button = PillButton(
             blocked_actions, theme, "Обновить список", self._update_blocked,
-            kind="secondary", height=CONTROL_HEIGHT)
+            kind="secondary", height=CONTROL_HEIGHT,
+            tooltip="Скачать свежий список заблокированных сайтов")
         self.blocked_button.pack(side="left")
         self.blocked_progress = tk.Label(
             blocked_actions, text="", bg=theme.card, fg=theme.text_faint,
@@ -779,10 +801,12 @@ class SettingsPage(tk.Frame):
         self.route_entry.bind("<Return>", lambda _event: self._add_rule())
         self.route_segment = Segmented(
             add_row, theme, [("direct", "Напрямую"), ("proxy", "Через VPN")],
-            "direct", bg=theme.card, height=CONTROL_HEIGHT)
+            "direct", bg=theme.card, height=CONTROL_HEIGHT,
+            tooltips=ROUTE_SEGMENT_TIPS)
         self.route_segment.pack(side="left", padx=(SPACE["sm"], 0))
         PillButton(add_row, theme, "Добавить", self._add_rule,
-                   kind="secondary", height=CONTROL_HEIGHT).pack(
+                   kind="secondary", height=CONTROL_HEIGHT,
+                   tooltip="Добавить правило для введённого сайта").pack(
             side="left", padx=(SPACE["sm"], 0))
         self._label(site_routes, "например: x.com или https://x.com/…",
                     caption=True)
@@ -797,10 +821,10 @@ class SettingsPage(tk.Frame):
         self.routes_counter.pack(fill="x", pady=(0, SPACE["xs"]))
         self.rules_holder = tk.Frame(site_routes, bg=theme.card)
         self.rules_holder.pack(fill="x")
-        self.rules_scroll = self._scroll_area(self.rules_holder, theme.card, 48)
-        # Признак «есть правила» проверяется по менеджеру упаковки: пустой
-        # список не должен оставлять рамку прокрутки.
-        self.rules_list = self.rules_scroll.inner
+        # Список правил — обычный фрейм: высота ровно по строкам, а прокрутка
+        # одна — у всей страницы настроек. Свой ScrollBody давал пустой хвост
+        # под коротким списком и второй ползунок справа при длинном.
+        self.rules_list = tk.Frame(self.rules_holder, bg=theme.card)
         self.routes_empty = tk.Label(
             site_routes,
             text="пока нет своих правил — все сайты идут по общим правилам",
@@ -818,7 +842,8 @@ class SettingsPage(tk.Frame):
         component_row.pack(fill="x", pady=(SPACE["sm"], 0))
         self.install_button = PillButton(
             component_row, theme, "Установить обходы", self._install_components,
-            kind="primary", height=CONTROL_HEIGHT)
+            kind="primary", height=CONTROL_HEIGHT,
+            tooltip="Скачать zapret, tg-ws-proxy и ядро Xray")
         self.install_button.pack(side="left")
         self.progress_label = tk.Label(
             component_row, text="", bg=theme.card, fg=theme.text_faint,
@@ -846,15 +871,19 @@ class SettingsPage(tk.Frame):
         move_row.pack(fill="x")
         self.export_button = PillButton(
             move_row, theme, "Экспорт…", self._export_settings,
-            kind="secondary", height=CONTROL_HEIGHT)
+            kind="secondary", height=CONTROL_HEIGHT,
+            tooltip="Сохранить настройки в файл для переноса")
         self.export_button.pack(side="left")
         self.import_button = PillButton(
             move_row, theme, "Импорт…", self._import_settings,
-            kind="secondary", height=CONTROL_HEIGHT)
+            kind="secondary", height=CONTROL_HEIGHT,
+            tooltip="Загрузить настройки из файла")
         self.import_button.pack(side="left", padx=(SPACE["sm"], 0))
         self.wizard_button = PillButton(
             move_row, theme, "Мастер настройки", self._run_wizard,
-            kind="secondary", height=CONTROL_HEIGHT)
+            kind="secondary", height=CONTROL_HEIGHT,
+            tooltip="Проверить компоненты, подобрать стратегию и сделать "
+                    "первую проверку")
         self.wizard_button.pack(side="left", padx=(SPACE["sm"], 0))
 
         secret_row = tk.Frame(move, bg=theme.card)
@@ -876,32 +905,45 @@ class SettingsPage(tk.Frame):
         self.reload()
 
     # ---- дашборд (проверки сервисов) ---------------------------------------
+    def _health_column_widths(self) -> tuple[int, int]:
+        """Ширины колонок тумблеров: по подписи шапки, чтобы центры совпали.
+
+        Шапка и строки — разные гриды. С общим ``minsize`` ширина колонки
+        равна ширине подписи, и тумблер с подписью встают на одну ось.
+        """
+        font = self.theme.caption()
+        check = max(HEALTH_SWITCH_COLUMN, font.measure("Проверять"))
+        show = max(HEALTH_SWITCH_COLUMN, font.measure("Показывать"))
+        return check, show
+
     def _build_dashboard(self, parent: tk.Misc) -> None:
         """Секция «Дашборд»: состав проверок, порядок строк и видимость."""
         theme = self.theme
         section = self._section(parent, "Дашборд")
-        self._label(
-            section,
-            "Скрытая проверка продолжает влиять на иконку, если «Проверять» "
-            "включено.", caption=True)
         head = tk.Frame(section, bg=theme.card)
         head.pack(fill="x", pady=(0, SPACE["xs"]))
         head.columnconfigure(0, weight=1)
         # Ширины колонок те же, что у строк: подписи встают ровно над
         # тумблерами, иначе «Проверять» висело бы между ними.
-        for column in (1, 2):
-            head.columnconfigure(column, minsize=HEALTH_SWITCH_COLUMN)
-        for column, text in ((1, "Проверять"), (2, "Показывать")):
+        widths = self._health_column_widths()
+        for column, text, width in ((1, "Проверять", widths[0]),
+                                    (2, "Показывать", widths[1])):
+            head.columnconfigure(column, minsize=width)
             tk.Label(head, text=text, bg=theme.card, fg=theme.text_faint,
-                     font=theme.caption(), anchor="e").grid(
-                row=0, column=column, sticky="e")
+                     font=theme.caption(), anchor="center").grid(
+                row=0, column=column, sticky="")
         self.health_list = tk.Frame(section, bg=theme.card)
         self.health_list.pack(fill="x")
+        # Одна короткая строка вместо абзаца сверху: связь колонок читается
+        # из подписей и подсказок, а не из объяснения перед списком.
+        self._label(section, "Скрытая проверка продолжает влиять на иконку",
+                    caption=True)
         add_row = tk.Frame(section, bg=theme.card)
         add_row.pack(fill="x", pady=(SPACE["sm"], 0))
         self.health_add_button = PillButton(
             add_row, theme, "Добавить проверку", self._open_health_form,
-            kind="secondary", height=CONTROL_HEIGHT)
+            kind="secondary", height=CONTROL_HEIGHT,
+            tooltip="Добавить свою проверку сайта или порта")
         self.health_add_button.pack(side="left")
         self.health_counter = tk.Label(
             add_row, text="", bg=theme.card, fg=theme.text_faint,
@@ -996,9 +1038,11 @@ class SettingsPage(tk.Frame):
         actions.pack(fill="x", pady=(SPACE["sm"], 0))
         self.health_actions_row = actions
         PillButton(actions, theme, "Сохранить", self._submit_health_form,
-                   kind="primary", height=CONTROL_HEIGHT).pack(side="left")
+                   kind="primary", height=CONTROL_HEIGHT,
+                   tooltip="Добавить проверку в список").pack(side="left")
         PillButton(actions, theme, "Отмена", self._cancel_health_form,
-                   kind="ghost", height=CONTROL_HEIGHT).pack(
+                   kind="ghost", height=CONTROL_HEIGHT,
+                   tooltip="Закрыть форму без добавления").pack(
             side="left", padx=(SPACE["sm"], 0))
 
     def _health_kind_changed(self, value) -> None:
@@ -1060,63 +1104,230 @@ class SettingsPage(tk.Frame):
         self._cancel_health_form()
 
     def _render_health_items(self) -> None:
-        """Список проверок: имя, два тумблера, порядок и удаление своей."""
+        """Список проверок: имя и два тумблера; порядок — перетаскиванием."""
         holder = getattr(self, "health_list", None)
         if holder is None:
             return
+        self._health_drag = None
+        # Линия вставки — дочерний виджет списка: умрёт вместе с ним.
+        self._health_marker = None
         for child in list(holder.winfo_children()):
             child.destroy()
         self.health_rows = {}
+        self._health_row_widgets = []
         theme = self.theme
+        widths = self._health_column_widths()
         for index, record in enumerate(self.health_items):
             item_id = str(record.get("id") or "")
-            row = tk.Frame(holder, bg=theme.card)
+            row = tk.Frame(holder, bg=theme.card, cursor="sb_v_double_arrow")
             row.pack(fill="x", pady=(0, SPACE["xs"]))
             row.columnconfigure(0, weight=1)
-            for column in (1, 2):
-                row.columnconfigure(column, minsize=HEALTH_SWITCH_COLUMN)
+            for column, width in ((1, widths[0]), (2, widths[1])):
+                row.columnconfigure(column, minsize=width)
             name = tk.Label(row, text=str(record.get("title") or item_id),
                             bg=theme.card, fg=theme.text, font=theme.body(),
-                            anchor="w")
+                            anchor="w", cursor="sb_v_double_arrow")
             name.grid(row=0, column=0, sticky="w")
             check = ToggleSwitch(
                 row, theme, bool(record.get("check", True)),
                 command=lambda value, i=index: self._set_health_flag(
-                    i, "check", value))
-            check.grid(row=0, column=1, sticky="e", padx=(SPACE["md"], 0))
+                    i, "check", value),
+                tooltip="Входит в расчёт состояния: влияет на цвет иконки и на "
+                        "счётчик сервисов")
+            check.grid(row=0, column=1, sticky="")
             show = ToggleSwitch(
                 row, theme, bool(record.get("show", True)),
                 command=lambda value, i=index: self._set_health_flag(
-                    i, "show", value))
-            show.grid(row=0, column=2, sticky="e", padx=(SPACE["md"], 0))
-            # Шеврон вместо «↑»: волосяной знак на 720 px не читается.
-            # Цвета — из ghost-палитры: text_dim, при наведении text,
-            # у недоступной крайней стрелки text_faint.
-            up = PillButton(row, theme, "",
-                            lambda i=index: self._move_health(i, -1),
-                            kind="ghost", height=ROW_CONTROL_HEIGHT,
-                            pad_x=SPACE["xs"], width=30, arrow="up")
-            up.grid(row=0, column=3, padx=(SPACE["sm"], 0))
-            up.set_enabled(index > 0)
-            down = PillButton(row, theme, "",
-                              lambda i=index: self._move_health(i, 1),
-                              kind="ghost", height=ROW_CONTROL_HEIGHT,
-                              pad_x=SPACE["xs"], width=30, arrow="down")
-            down.grid(row=0, column=4, padx=(SPACE["xs"], 0))
-            down.set_enabled(index < len(self.health_items) - 1)
-            delete = None
-            if str(record.get("kind") or "") != "builtin":
-                # Встроенную проверку удалить нельзя — только скрыть или
-                # выключить: её id живёт в истории и в сводке по суткам.
-                delete = PillButton(row, theme, "×",
-                                    lambda i=index: self._delete_health(i),
-                                    kind="ghost", height=ROW_CONTROL_HEIGHT,
-                                    pad_x=SPACE["xs"], width=30)
-                delete.grid(row=0, column=5, padx=(SPACE["xs"], 0))
+                    i, "show", value),
+                tooltip="Строка видна на панели; скрытая проверка продолжает "
+                        "влиять на иконку, если включено «Проверять»")
+            show.grid(row=0, column=2, sticky="")
+            # Тянем за саму строку и подпись; тумблеры остаются тумблерами:
+            # нажатие на них драг не начинает (у них своя привязка Button-1).
+            for handle in (row, name):
+                handle.bind("<Button-1>",
+                            lambda event, i=index: self._health_press(event, i))
+                handle.bind("<B1-Motion>", self._health_motion)
+                handle.bind("<ButtonRelease-1>", self._health_release)
+                handle.bind("<Button-3>",
+                            lambda event, i=index: self._health_menu(event, i))
+                handle.bind("<Control-Button-1>",
+                            lambda event, i=index: self._health_menu(event, i))
+            self._health_row_widgets.append(row)
             self.health_rows[item_id] = {
                 "row": row, "name": name, "check": check, "show": show,
-                "up": up, "down": down, "delete": delete,
+                # Встроенную проверку удалить нельзя — только скрыть или
+                # выключить: её id живёт в истории и в сводке по суткам.
+                "can_delete": str(record.get("kind") or "") != "builtin",
             }
+        # Строки пересоздаются после сборки страницы: колесо на них вешает
+        # прокрутка страницы, повторно оно не дублируется.
+        try:
+            self.body.bind_tree(holder)
+        except (AttributeError, tk.TclError):
+            pass
+
+    # ---- порядок проверок: перетаскивание и меню ---------------------------
+    def _health_press(self, event, index: int) -> None:
+        """Запомнить точку нажатия: движение меньше порога — это клик."""
+        if not 0 <= index < len(self.health_items):
+            return
+        try:
+            event.widget.configure(cursor="hand2")
+        except tk.TclError:
+            pass
+        self._health_drag = {
+            "index": index, "x": event.x_root, "y": event.y_root,
+            "active": False, "widget": event.widget,
+        }
+
+    def _health_motion(self, event) -> None:
+        """Пока кнопка нажата: после порога тащим и показываем линию вставки."""
+        drag = self._health_drag
+        if drag is None:
+            return
+        if not drag["active"]:
+            far = (abs(event.x_root - drag["x"]) >= HEALTH_DRAG_THRESHOLD
+                   or abs(event.y_root - drag["y"]) >= HEALTH_DRAG_THRESHOLD)
+            if not far:
+                return
+            drag["active"] = True
+        self._health_show_marker(self._health_drop_index(event.y_root))
+
+    def _health_release(self, event) -> None:
+        """Отпускание фиксирует порядок; клик без движения ничего не меняет."""
+        drag, self._health_drag = self._health_drag, None
+        self._health_hide_marker()
+        if drag is None:
+            return
+        try:
+            drag["widget"].configure(cursor="sb_v_double_arrow")
+        except tk.TclError:
+            pass
+        if not drag["active"]:
+            return
+        self._health_drop(drag["index"], self._health_drop_index(event.y_root))
+
+    def _health_drop_index(self, y_root: int) -> int:
+        """Позиция вставки: сколько строк своей серединой выше курсора.
+
+        Курсор ниже всех — получится ``len(rows)`` (в самый конец), выше
+        всех — ``0`` (в начало): за пределы списка не выпадаем.
+        """
+        holder = getattr(self, "health_list", None)
+        if holder is None:
+            return 0
+        try:
+            # Только что перерисованные строки ещё не размечены: без этого
+            # вызова winfo_y()/winfo_height() — нули, и строка встаёт не туда.
+            holder.update_idletasks()
+            y = y_root - holder.winfo_rooty()
+        except tk.TclError:
+            return 0
+        before = 0
+        for row in self._health_row_widgets:
+            try:
+                middle = row.winfo_y() + row.winfo_height() / 2
+            except tk.TclError:
+                continue
+            if y >= middle:
+                before += 1
+        return before
+
+    def _health_show_marker(self, before: int) -> None:
+        """Акцентная линия на границе строк; вёрстку не сдвигает (place)."""
+        holder = getattr(self, "health_list", None)
+        rows = self._health_row_widgets
+        if holder is None or not rows:
+            return
+        marker = self._health_marker
+        if marker is None:
+            marker = tk.Frame(holder, bg=self.theme.accent, height=2, bd=0,
+                              highlightthickness=0)
+            self._health_marker = marker
+        if before < len(rows):
+            y = rows[before].winfo_y()
+        else:
+            last = rows[-1]
+            y = last.winfo_y() + last.winfo_height()
+        try:
+            marker.place(x=0, y=max(0, y - 1), relwidth=1, height=2)
+            marker.lift()
+        except tk.TclError:
+            pass
+
+    def _health_hide_marker(self) -> None:
+        marker = self._health_marker
+        if marker is None:
+            return
+        try:
+            marker.place_forget()
+        except tk.TclError:
+            pass
+
+    def _health_drop(self, index: int, before: int) -> None:
+        """Перенести строку на позицию ``before``; край списка — начало/конец."""
+        items = self.health_items
+        if not 0 <= index < len(items):
+            return
+        record = items.pop(index)
+        # Позиция считается уже без вынутой строки: всё, что ниже, съехало.
+        target = before if before <= index else before - 1
+        target = max(0, min(len(items), target))
+        if target == index:
+            items.insert(index, record)
+            return
+        items.insert(target, record)
+        self._render_health_items()
+
+    def _health_menu(self, event, index: int) -> None:
+        """Правый клик по строке: порядок и флаги без перетаскивания."""
+        menu = self._health_menu_for(index)
+        if menu is None:
+            return
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _health_menu_for(self, index: int) -> tk.Menu | None:
+        """Собрать меню строки: «Выше», «Ниже», флаги, «Удалить»."""
+        if not 0 <= index < len(self.health_items):
+            return None
+        theme = self.theme
+        menu = self._health_menu_bar
+        if menu is None:
+            menu = tk.Menu(self, tearoff=0, bg=theme.card, fg=theme.text,
+                           activebackground=theme.accent,
+                           activeforeground=theme.accent_text,
+                           bd=0, relief="flat", font=theme.body())
+            self._health_menu_bar = menu
+        menu.delete(0, "end")
+        menu.add_command(
+            label="Выше", command=lambda: self._move_health(index, -1),
+            state="normal" if index > 0 else "disabled")
+        menu.add_command(
+            label="Ниже", command=lambda: self._move_health(index, 1),
+            state="normal" if index < len(self.health_items) - 1 else "disabled")
+        menu.add_separator()
+        menu.add_command(label="Проверять",
+                         command=lambda: self._flip_health_flag(index, "check"))
+        menu.add_command(label="Показывать",
+                         command=lambda: self._flip_health_flag(index, "show"))
+        if str(self.health_items[index].get("kind") or "") != "builtin":
+            menu.add_separator()
+            menu.add_command(label="Удалить",
+                             command=lambda: self._delete_health(index))
+        return menu
+
+    def _flip_health_flag(self, index: int, key: str) -> None:
+        """Переключить флаг из меню — так же, как это делает тумблер."""
+        if not 0 <= index < len(self.health_items):
+            return
+        current = bool(self.health_items[index].get(key, True))
+        self._set_health_flag(index, key, not current)
+        self._render_health_items()
+
 
     def _set_health_flag(self, index: int, key: str, value) -> None:
         """Тумблер «Проверять»/«Показывать» правит рабочую копию списка."""
@@ -1125,7 +1336,7 @@ class SettingsPage(tk.Frame):
         self.health_items[index][key] = bool(value)
 
     def _move_health(self, index: int, delta: int) -> None:
-        """Стрелка меняет порядок; в конфиг он попадёт по «Сохранить»."""
+        """Сдвиг из контекстного меню; в конфиг попадёт по «Сохранить»."""
         target = index + delta
         if not (0 <= index < len(self.health_items)
                 and 0 <= target < len(self.health_items)):
@@ -1639,13 +1850,13 @@ class SettingsPage(tk.Frame):
         domains = sorted(self.rules)
         self.routes_counter.configure(text=f"Правил: {len(domains)}")
         if not domains:
-            self.rules_scroll.pack_forget()
+            self.rules_list.pack_forget()
             if not self.routes_empty.winfo_manager():
                 self.routes_empty.pack(fill="x", pady=(SPACE["xs"], 0))
             return
         self.routes_empty.pack_forget()
-        if not self.rules_scroll.winfo_manager():
-            self.rules_scroll.pack(fill="x")
+        if not self.rules_list.winfo_manager():
+            self.rules_list.pack(fill="x")
         for domain in domains:
             route = self.rules[domain]
             # Клик по домену переключает маршрут — как прежняя плашка, но
@@ -1663,7 +1874,8 @@ class SettingsPage(tk.Frame):
             segment = Segmented(
                 row, theme, [("direct", "Напрямую"), ("proxy", "Через VPN")],
                 route, command=lambda value, d=domain: self._set_rule(d, value),
-                bg=theme.card, height=ROW_CONTROL_HEIGHT, width=176)
+                bg=theme.card, height=ROW_CONTROL_HEIGHT, width=176,
+                tooltips=ROUTE_SEGMENT_TIPS)
             segment.pack(side="left", padx=(SPACE["sm"], SPACE["sm"]))
             # Сервер — только для proxy: напрямую он не нужен. Место под
             # контрол занимаем всегда, иначе строки прыгают по ширине.
@@ -1687,10 +1899,9 @@ class SettingsPage(tk.Frame):
                                 pad_x=SPACE["sm"])
             remove.pack(side="right", pady=SPACE["xs"])
             Tooltip(remove, "Удалить правило")
-        self.rules_list.update_idletasks()
-        self.rules_scroll.set_height(
-            min(max(self.rules_list.winfo_reqheight(), 26), 176))
-        self.rules_scroll.bind_tree()
+        # Строки создаются после сборки страницы: колесо на них вешает
+        # прокрутка страницы — своей полосы у списка больше нет.
+        self.body.bind_tree(self.rules_list)
 
     # ---- компоненты --------------------------------------------------------
     def _refresh_status(self) -> None:

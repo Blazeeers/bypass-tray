@@ -919,7 +919,8 @@ class Panel:
         self._diagnose_title.pack(side="left", fill="x", expand=True)
         self._diagnose_button = PillButton(
             top, theme, "", None, kind="primary", min_width=140,
-            height=ROW_CONTROL_HEIGHT)
+            height=ROW_CONTROL_HEIGHT,
+            tooltip="Выполнить предложенное действие")
         self._diagnose_button.pack(side="right", padx=(SPACE["md"], 0))
         self._diagnose_facts = tk.Label(
             inner, text="", bg=theme.card, fg=theme.text_dim,
@@ -1010,7 +1011,8 @@ class Panel:
         self._app_update_title.pack(side="left", fill="x", expand=True)
         self._app_update_button = PillButton(
             top, theme, "Открыть страницу релиза", self._open_release,
-            kind="primary", min_width=200, height=ROW_CONTROL_HEIGHT)
+            kind="primary", min_width=200, height=ROW_CONTROL_HEIGHT,
+            tooltip="Открыть страницу нового релиза в браузере")
         self._app_update_button.pack(side="right", padx=(SPACE["md"], 0))
         self._app_update_facts = tk.Label(
             inner, text="", bg=theme.card, fg=theme.text_dim,
@@ -1260,7 +1262,9 @@ class Panel:
         )
         self._header_update = IconButton(
             inner, theme, self._icon("refresh", theme.header_dim, 20),
-            self._request_update, tooltip="Обновить всё", bg=theme.header, size=32,
+            self._request_update,
+            tooltip="Проверить обновления и установить недостающее",
+            bg=theme.header, size=32,
         )
         self._header_gear = IconButton(
             inner, theme, self._icon("gear", theme.header_dim, 20),
@@ -1273,7 +1277,7 @@ class Panel:
             inner, theme, self._icon("moon" if dark else "sun",
                                      theme.header_dim, 20),
             self._toggle_theme,
-            tooltip="Светлая тема" if dark else "Тёмная тема",
+            tooltip="Переключить светлую и тёмную тему",
             bg=theme.header, size=32,
         )
         self._header_back.pack(side="right", padx=(0, SPACE["sm"]))
@@ -1373,7 +1377,7 @@ class Panel:
             # Иконка остаётся нейтральной в любом случае: о находке сообщает
             # точка в углу кнопки, а не перекраска всей иконки.
             color = theme.header_dim
-            tooltip = "Обновить всё"
+            tooltip = "Проверить обновления и установить недостающее"
             badge = theme.accent if outdated else None
         # Кнопка перерисовывается каждую секунду: set_image/set_tooltip зовём
         # только при смене значения, иначе всплывающая подсказка гаснет на
@@ -1484,7 +1488,9 @@ class Panel:
         self._vpn["button"] = PillButton(
             top, theme, "Включить", lambda: self._call(self.controller.set_proxy, True),
             kind="primary", min_width=120, height=CONTROL_HEIGHT,
+            tooltip="Подключить локальный прокси Xray",
         )
+        self._vpn_tip = ""
         self._vpn["button"].pack(side="right", padx=(SPACE["md"], 0))
 
         Divider(inner, theme).pack(fill="x", pady=(SPACE["sm"], SPACE["xs"]))
@@ -1497,6 +1503,7 @@ class Panel:
         chevron = tk.Label(toggle, bg=theme.card, bd=0)
         self._set_icon(chevron, "chevron", theme.text_dim, 14)
         chevron.pack(side="right", padx=(SPACE["sm"], SPACE["xs"]))
+        Tooltip(toggle, "Список серверов, задержки и выбор лучшего", theme=theme)
         self._vpn["toggle"] = toggle
         self._vpn["toggle_label"] = label
         self._vpn["chevron"] = chevron
@@ -1515,12 +1522,14 @@ class Panel:
             buttons, theme, "Подобрать лучший",
             lambda: self._call(self.controller.pick_best_server),
             kind="secondary", height=ROW_CONTROL_HEIGHT, pad_x=SPACE["md"],
+            tooltip="Переключиться на сервер с наименьшей задержкой",
         )
         self._vpn["pick"].pack(side="left")
         self._vpn["refresh"] = PillButton(
             buttons, theme, "Обновить список",
             lambda: self._call(self.controller.load_servers, True),
             kind="secondary", height=ROW_CONTROL_HEIGHT, pad_x=SPACE["md"],
+            tooltip="Перечитать список серверов из подписки",
         )
         self._vpn["refresh"].pack(side="left", padx=(SPACE["sm"], 0))
 
@@ -1619,7 +1628,8 @@ class Panel:
             if key in SERVICE_BUTTONS:
                 button = PillButton(grid_frame, theme, "Запустить", None,
                                     kind="ghost", height=ROW_CONTROL_HEIGHT,
-                                    pad_x=SPACE["sm"], min_width=104)
+                                    pad_x=SPACE["sm"], min_width=104,
+                                    tooltip="Запустить службу вручную")
                 button.grid(row=0, column=2, rowspan=2, sticky="e")
                 button.grid_remove()
 
@@ -1757,7 +1767,9 @@ class Panel:
         # Откат живёт рядом с журналом: там видно, что именно виджет сделал сам.
         self._rollback = PillButton(header, theme, "Откатить маршруты",
                                     self._confirm_rollback, kind="ghost",
-                                    height=ROW_CONTROL_HEIGHT, pad_x=SPACE["md"])
+                                    height=ROW_CONTROL_HEIGHT, pad_x=SPACE["md"],
+                                    tooltip="Вернуть маршруты к состоянию до "
+                                            "последнего автоматического изменения")
         self._rollback.set_enabled(False)
         self._activity_empty = tk.Label(
             inner, text="", bg=theme.card, fg=theme.text_faint,
@@ -1788,22 +1800,28 @@ class Panel:
         gap = SPACE["sm"]
         specs = (
             ("check_all", "Проверить всё", "refresh",
-             self.controller.run_health, "primary"),
+             self.controller.run_health, "primary",
+             "Проверить VPN, сервисы и состояние канала сейчас"),
             ("sweep", "Тест стратегий", "list",
-             self.controller.start_sweep, "ghost"),
+             self.controller.start_sweep, "ghost",
+             "Перебрать стратегии zapret и выбрать самую быструю "
+             "(нужны права администратора)"),
             ("routes", "Проверить маршруты", "route",
-             self._confirm_routes, "ghost"),
+             self._confirm_routes, "ghost",
+             "Проверить, какие сайты идут напрямую, а какие через VPN, "
+             "и применить изменения"),
             ("subscription", "Обновить подписку", "download",
-             self.controller.refresh_subscription, "ghost"),
+             self.controller.refresh_subscription, "ghost",
+             "Скачать заново список серверов по ссылке подписки"),
         )
-        for index, (key, text, icon_name, command, kind) in enumerate(specs):
+        for index, (key, text, icon_name, command, kind, tip) in enumerate(specs):
             # Подтверждение маршрутов показывает messagebox — только в UI-потоке.
             callback = command if key == "routes" else (lambda c=command: self._call(c))
             icon_color = theme.accent_text if kind == "primary" else theme.text_dim
             tile = ActionTile(
                 grid, theme, text, callback, kind=kind,
                 icon=self._icon(icon_name, icon_color, ACTION_ICON_SIZE),
-                height=ACTION_HEIGHT,
+                height=ACTION_HEIGHT, tooltip=tip,
             )
             tile.grid(row=0, column=index, sticky="nsew",
                       padx=(0 if index == 0 else gap, 0))
@@ -1923,6 +1941,13 @@ class Panel:
         button.set_kind("primary" if not running else "secondary")
         button.set_command(lambda: self._call(self.controller.set_proxy, not running))
         button.set_enabled(not busy_here)
+        # Подсказка меняется вместе с подписью, но не каждую секунду:
+        # set() гасит показанную подсказку, поэтому зовём только при смене.
+        tip = ("Выключить локальный прокси Xray" if running
+               else "Подключить локальный прокси Xray")
+        if tip != getattr(self, "_vpn_tip", ""):
+            self._vpn_tip = tip
+            button.set_tooltip(tip)
 
         self._render_servers()
         pick = info.get("pick")

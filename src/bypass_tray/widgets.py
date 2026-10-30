@@ -206,7 +206,7 @@ class PillButton(tk.Canvas):
                  kind: str = "secondary", pad_x: int | None = None,
                  height: int | None = None, bg: str | None = None,
                  width: int | None = None, min_width: int | None = None,
-                 arrow: str | None = None):
+                 arrow: str | None = None, tooltip: str = ""):
         self.theme = theme
         self.kind = kind
         self.command = command
@@ -237,6 +237,7 @@ class PillButton(tk.Canvas):
         self.bind("<ButtonRelease-1>", self._on_click)
         self.bind("<Configure>", self._on_configure)
         self.bind("<Destroy>", self._stop_spin)
+        self._tooltip = Tooltip(self, tooltip, theme=theme)
         self._render()
 
     def _font_for(self, kind: str) -> tkfont.Font:
@@ -255,6 +256,10 @@ class PillButton(tk.Canvas):
 
     def set_command(self, command) -> None:
         self.command = command
+
+    def set_tooltip(self, text: str) -> None:
+        """Текст подсказки: у кнопки с меняющимся смыслом он тоже меняется."""
+        self._tooltip.set(text)
 
     def set_enabled(self, enabled: bool) -> None:
         if enabled == self._enabled:
@@ -682,7 +687,8 @@ class Segmented(tk.Canvas):
 
     def __init__(self, master: tk.Misc, theme: Theme, items: list[tuple[str, str]],
                  value: str | None = None, command=None, bg: str | None = None,
-                 height: int = 30, width: int = WIDTH):
+                 height: int = 30, width: int = WIDTH,
+                 tooltips: dict[str, str] | None = None):
         self.theme = theme
         self._items = [(str(key), str(label)) for key, label in items]
         if not self._items:
@@ -695,8 +701,14 @@ class Segmented(tk.Canvas):
         self._width = int(width)
         self._hover = -1
         self._font = theme.body("bold")
+        #: Подсказки по ключу сегмента: у «Напрямую» и «Через VPN» разный смысл.
+        self._tips = {str(key): str(text) for key, text in (tooltips or {}).items()}
         super().__init__(master, width=self._width, height=self._height,
                          bg=self._bg, highlightthickness=0, bd=0, cursor="hand2")
+        self._tooltip: Tooltip | None = None
+        if self._tips:
+            first = self._tips.get(self._value) or next(iter(self._tips.values()))
+            self._tooltip = Tooltip(self, first, theme=theme)
         self.bind("<Button-1>", self._click)
         self.bind("<Motion>", self._motion)
         self.bind("<Leave>", self._leave)
@@ -743,7 +755,16 @@ class Segmented(tk.Canvas):
         index = self._index_at(int(event.x))
         if index != self._hover:
             self._hover = index
+            self._tip_for(index)
             self._draw()
+
+    def _tip_for(self, index: int) -> None:
+        """Подсказка сегмента под указателем; вне сегментов — прежняя."""
+        if self._tooltip is None or not 0 <= index < len(self._items):
+            return
+        text = self._tips.get(self._items[index][0])
+        if text:
+            self._tooltip.set(text)
 
     def _leave(self, _event=None) -> None:
         if self._hover != -1:
@@ -923,25 +944,27 @@ class Dropdown(tk.Canvas):
 
 
 class ToggleSwitch(tk.Canvas):
-    """Тумблер: дорожка 40×22, кружок 18, плавный переезд за 128 мс.
+    """Тумблер: дорожка 34×18, кружок 14, плавный переезд за 128 мс.
 
+    Выключен — только контур дорожки в цвет границы: состояние читается
+    формой, а не тенью. Включён — заливка акцентом и белый кружок.
     ``set()`` меняет состояние мгновенно (панель обновляет тумблеры из
     состояния конфига и не должна догонять анимацию), а клик пользователя
     анимируется. Атрибута ``_after`` у виджета нет намеренно — тесты
     проверяют, что в покое никаких отложенных кадров не остаётся.
     """
 
-    WIDTH = 40
-    HEIGHT = 22
+    WIDTH = 34
+    HEIGHT = 18
     #: Кружок, пиксели.
-    KNOB = 18
+    KNOB = 14
     #: Отступ под кольцо фокуса, пиксели.
     PAD = 2
     #: Кадров анимации переезда (16 мс × 8 ≈ 128 мс).
     STEPS = 8
 
     def __init__(self, master: tk.Misc, theme: Theme, value: bool = False,
-                 command=None, bg: str | None = None):
+                 command=None, bg: str | None = None, tooltip: str = ""):
         self.theme = theme
         self._value = bool(value)
         self.command = command
@@ -962,7 +985,10 @@ class ToggleSwitch(tk.Canvas):
         self.bind("<FocusIn>", self._focus_in)
         self.bind("<FocusOut>", self._focus_out)
         self.bind("<space>", self._space)
+        # Enter — привычная клавиша подтверждения: ведёт себя как пробел.
+        self.bind("<Return>", self._space)
         self.bind("<Destroy>", self._stop_anim)
+        self._tooltip = Tooltip(self, tooltip, theme=theme)
         self._draw()
 
     # -- состояние ---------------------------------------------------------
@@ -1055,6 +1081,14 @@ class ToggleSwitch(tk.Canvas):
             self._anim_job = None
 
     # -- отрисовка ---------------------------------------------------------
+    def _edge(self, alpha: float) -> str:
+        """Контур выключенной дорожки.
+
+        Рамка карточки к фону — всего 1.2:1, серый контур на ней не виден;
+        поэтому край подмешивается к цвету текста, пока не наберётся ~3:1.
+        """
+        return blend(self.theme.text, self.theme.card, alpha)
+
     def _draw(self) -> None:
         self.delete("all")
         theme = self.theme
@@ -1065,27 +1099,23 @@ class ToggleSwitch(tk.Canvas):
         radius = height / 2
 
         if not self._enabled:
-            track = blend(theme.track, theme.card, 0.55)
-            knob_fill = blend(theme.card, theme.bg, 0.55)
-            knob_edge = blend(theme.track, theme.card, 0.6)
+            fill, edge = "", self._edge(0.20)
+            knob_fill, knob_edge = blend(theme.card, theme.bg, 0.55), edge
         elif self._value:
-            track = theme.accent_hover if self._hover else theme.accent
-            knob_fill = "#FFFFFF"
-            knob_edge = blend(theme.text, theme.card, 0.18)
+            fill = theme.accent_hover if self._hover else theme.accent
+            edge = ""
+            knob_fill, knob_edge = "#FFFFFF", ""
         else:
-            # Дорожка выключенного тумблера — цвет рамки кнопок: на светлой
-            # карточке она заметно темнее, белый кружок не «висит в воздухе».
-            track = theme.track
-            if self._hover:
-                track = blend(theme.text, theme.card, 0.26)
-            knob_fill = "#FFFFFF"
-            knob_edge = blend(theme.text, theme.card, 0.25)
+            fill = ""
+            edge = self._edge(0.62 if self._hover else 0.48)
+            knob_fill, knob_edge = "#FFFFFF", edge
 
+        # Выключено — только контур: состояние читается формой, а не тенью.
         rounded_rect(self, pad, pad, right, bottom, radius,
-                     fill=track, outline="")
+                     fill=fill, outline=edge)
 
         knob = self.KNOB
-        travel = width - knob - 2 * (pad - 1)
+        travel = width - knob - 4
         left = pad + 2 + self._pos * travel
         top = pad + (height - knob) / 2
         self.create_oval(left, top, left + knob, top + knob, fill=knob_fill,
