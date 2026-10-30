@@ -176,8 +176,14 @@ def system_is_dark() -> bool:
 
 
 def resolve_dark(preference: str = "auto") -> bool:
-    """Превращает настройку ``theme`` в конкретный режим."""
-    preference = (preference or "auto").lower()
+    """Превращает настройку ``theme_mode`` в конкретный режим.
+
+    ``auto`` (и всё нераспознанное) спрашивает систему тем же
+    ``system_is_dark``; ``light``/``dark`` применяются принудительно.
+    Значение из конфига может оказаться числом или ``None`` — такие тоже
+    считаются ``auto``, а не роняют старт панели.
+    """
+    preference = str(preference or "auto").strip().lower()
     if preference == "dark":
         return True
     if preference == "light":

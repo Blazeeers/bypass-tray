@@ -88,6 +88,15 @@ def _parse_port(text: str) -> tuple[int | None, str]:
     return value, ""
 
 
+def _theme_mode_from_control(value) -> str:
+    """Значение сегмента темы → ключ ``theme_mode`` для конфига.
+
+    Отдельная чистая функция: путь «форма → конфиг» проверяется без Tk,
+    а мусор из чужого кода не попадает в config.json.
+    """
+    return config.normalise_theme_mode(value)
+
+
 def _merge_legacy_routes(cfg: dict) -> None:
     """Переносит старые списки доменов в ``xray_routes``, затем чистит их.
 
@@ -473,6 +482,30 @@ class SettingsPage(tk.Frame):
                 cfg.get("autoconnect"))
         except Exception:  # noqa: BLE001
             autostart_now = bool(cfg.get("autoconnect"))
+        # Тема — первой строкой: смена видна сразу, «Сохранить» только
+        # запоминает выбор на следующий запуск.
+        theme_row = tk.Frame(behavior, bg=theme.card)
+        theme_row.pack(fill="x", pady=(0, SPACE["md"]))
+        theme_row.columnconfigure(0, weight=1)
+        theme_name = tk.Label(theme_row, text="Тема", bg=theme.card,
+                              fg=theme.text, font=theme.body(), anchor="w")
+        theme_name.grid(row=0, column=0, sticky="w")
+        theme_tip = ("Авто следует системной теме Windows. Переключение "
+                     "применяется сразу, в конфиг попадает после «Сохранить».")
+        self.tooltips.append(Tooltip(theme_name, theme_tip))
+        self.theme_segment = Segmented(
+            theme_row, theme,
+            [("auto", "Авто"), ("light", "Светлая"), ("dark", "Тёмная")],
+            config.theme_mode_of(cfg),
+            command=self._preview_theme, bg=theme.card,
+            height=CONTROL_HEIGHT, width=300)
+        self.theme_segment.grid(row=0, column=1, sticky="e",
+                                padx=(SPACE["md"], 0))
+        self.tooltips.append(Tooltip(self.theme_segment, theme_tip))
+        tk.Label(theme_row, text="Живой предпросмотр", bg=theme.card,
+                 fg=theme.text_faint, font=theme.caption(), anchor="w",
+                 justify="left", wraplength=self.WIDTH - 160).grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(SPACE["xs"], 0))
         rows = (
             ("autostart", "Подключаться при входе", autostart_now, self._set_autostart),
             ("quiet", "Без уведомлений", bool(cfg.get("quiet_icon", True)), self._set_quiet),
@@ -787,6 +820,9 @@ class SettingsPage(tk.Frame):
             if segment is not None:
                 segment.set(config.normalise_routing_mode(
                     cfg.get("routing_mode")))
+            theme_segment = getattr(self, "theme_segment", None)
+            if theme_segment is not None:
+                theme_segment.set(config.theme_mode_of(cfg))
             self.vars["zapret_dir"].set(_text_value(cfg, "zapret_dir"))
             self.vars["tgws_exe"].set(_text_value(cfg, "tgws_exe"))
             self._set_links(_links_text(cfg))
@@ -862,6 +898,91 @@ class SettingsPage(tk.Frame):
     def _set_youtube(self, _value: bool) -> None:
         """Тумблер YouTube — часть сценария: подсветка чипа догоняет форму."""
         self._refresh_preset_chips()
+
+    # ---- тема --------------------------------------------------------------
+    def _preview_theme(self, mode: str) -> None:
+        """Живой предпросмотр: панель перекрашивается, конфиг не трогается."""
+        panel = getattr(self.controller, "panel", None)
+        apply_mode = getattr(panel, "set_theme_mode", None)
+        if callable(apply_mode):
+            apply_mode(config.normalise_theme_mode(mode))
+
+    def set_theme_mode(self, mode: str) -> None:
+        """Ставит сегмент темы без колбэка: режим уже применён панелью."""
+        segment = getattr(self, "theme_segment", None)
+        if segment is not None:
+            segment.set(config.normalise_theme_mode(mode))
+
+    def snapshot(self) -> dict:
+        """Снимок формы для перестройки панели при смене темы.
+
+        Несохранённые поля (подписка, ссылки, правила) должны пережить
+        пересоздание страницы — иначе клик по «Тёмная» стирал бы ввод.
+        """
+        # Уничтоженная страница не может отдать снимок: пусть вызывающий
+        # увидит пустоту, а не TclError из недр Tk.
+        try:
+            if not self.winfo_exists():
+                return {}
+        except tk.TclError:
+            return {}
+        state: dict = {
+            "vars": {key: variable.get() for key, variable in self.vars.items()},
+            "links": self._links_value(),
+            "routing": self.routing_segment.get(),
+            "toggles": {key: bool(switch.get())
+                        for key, switch in self.toggles.items()},
+            "blocked": bool(self.blocked_toggle.get()),
+            "theme": self.theme_segment.get(),
+            "rules": dict(self.rules),
+            "rule_servers": dict(self.rule_servers),
+        }
+        if self._saved_rules is not None:
+            state["saved_rules"] = dict(self._saved_rules)
+            state["saved_rule_servers"] = dict(self._saved_rule_servers)
+        return state
+
+    def restore(self, state: dict) -> None:
+        """Возвращает в форму снимок :meth:`snapshot` после перестройки."""
+        if not isinstance(state, dict):
+            return
+        # Снимок может прийти на уже уничтоженную страницу (окно закрыли
+        # между снимком и восстановлением): Tk тогда бросает TclError.
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        for key, value in (state.get("vars") or {}).items():
+            variable = self.vars.get(key)
+            if variable is None:
+                continue
+            variable.set(value)
+        links = state.get("links")
+        if isinstance(links, str):
+            self._set_links(links)
+        routing = state.get("routing")
+        if isinstance(routing, str) and routing:
+            self.routing_segment.set(routing)
+        for key, value in (state.get("toggles") or {}).items():
+            switch = self.toggles.get(key)
+            if switch is not None:
+                switch.set(bool(value))
+        if "blocked" in state:
+            self.blocked_toggle.set(bool(state["blocked"]))
+        if isinstance(state.get("theme"), str):
+            self.set_theme_mode(state["theme"])
+        if isinstance(state.get("rules"), dict):
+            self.rules = dict(state["rules"])
+            self.rule_servers = dict(state.get("rule_servers") or {})
+            if isinstance(state.get("saved_rules"), dict):
+                self._saved_rules = dict(state["saved_rules"])
+                self._saved_rule_servers = dict(
+                    state.get("saved_rule_servers") or {})
+            self._render_rules()
+        self._refresh_preset_chips()
+        self._refresh_status()
+        self._refresh_blocked_status()
 
     # ---- сценарии ----------------------------------------------------------
     def _preset_values(self) -> dict:
@@ -1475,6 +1596,7 @@ class SettingsPage(tk.Frame):
             self.routing_segment.get())
         cfg["blocked_list_enabled"] = bool(self.blocked_toggle.get())
         cfg["youtube_via_vpn"] = bool(self.toggles["youtube"].get())
+        cfg["theme_mode"] = _theme_mode_from_control(self.theme_segment.get())
         cfg["xray_routes"] = routes.routes_payload(self.rules,
                                                    self.rule_servers)
         # Старые списки не обнуляем в никуда: их значения становятся правилами.
@@ -1515,6 +1637,11 @@ class SettingsPage(tk.Frame):
                 self.progress_label.configure(
                     text="Сохранено, но прокси занят — перезапустите вручную",
                     fg=self.theme.warn)
+        # Тема — последней: перестройка панели уничтожает эту страницу,
+        # поэтому после вызова к её виджетам уже не обращаемся.
+        apply_theme = getattr(self.controller, "apply_theme", None)
+        if callable(apply_theme):
+            apply_theme(cfg["theme_mode"])
         return True
 
 

@@ -132,8 +132,9 @@ DEFAULTS: dict = {
     "tgws_port": 1443,
     "refresh_seconds": 5,
     "update_check_hours": 24,
-    # auto — по системной теме Windows, либо принудительно light / dark.
-    "theme": "auto",
+    # Тема панели: auto — по системной теме Windows, либо принудительно
+    # light / dark. Прежний ключ ``theme`` мигрирует сюда при чтении.
+    "theme_mode": "auto",
     # --- собственный клиент Xray ---
     # Подписка: отдаёт список серверов vless://. Укажите свою — в репозитории
     # её нет намеренно, это персональный ключ доступа.
@@ -190,6 +191,29 @@ DEFAULTS: dict = {
 #: Режимы маршрутизации Xray. Всё остальное при чтении конфига сводится к
 #: ``blocked``: неизвестное значение не должно ломать запуск.
 ROUTING_MODES = ("blocked", "all")
+
+#: Режимы темы панели. ``auto`` — по системной настройке Windows; всё, что
+#: не распознано, тоже становится ``auto``.
+THEME_MODES = ("auto", "light", "dark")
+
+
+def normalise_theme_mode(value) -> str:
+    """Значение ``theme_mode`` из конфига; неизвестное — ``auto``."""
+    mode = str(value).strip().lower() if isinstance(value, str) else ""
+    return mode if mode in THEME_MODES else "auto"
+
+
+def theme_mode_of(cfg: dict) -> str:
+    """Режим темы из конфига: ``theme_mode``, затем прежний ключ ``theme``.
+
+    Старое имя нужно контроллерам и тестам, которые ещё не прошли
+    ``load_config``: без него панель молча уехала бы в ``auto``.
+    """
+    cfg = cfg or {}
+    value = cfg.get("theme_mode")
+    if value is None:
+        value = cfg.get("theme")
+    return normalise_theme_mode(value)
 
 
 def normalise_routing_mode(value) -> str:
@@ -381,6 +405,17 @@ def load_config() -> dict:
     # Старые config.json читаются как раньше: без ключа режим — "blocked",
     # неизвестное значение тоже сводится к нему (без записи файла).
     cfg["routing_mode"] = normalise_routing_mode(cfg.get("routing_mode"))
+    # Прежний ключ ``theme`` (до появления ``theme_mode``) продолжает
+    # работать: если нового ключа в файле нет, значение берётся из старого и
+    # файл переписывается с новым именем.
+    legacy_theme = False
+    if isinstance(data, dict) and "theme_mode" not in data:
+        stored_theme = data.get("theme")
+        if stored_theme is not None:
+            cfg["theme_mode"] = stored_theme
+            legacy_theme = True
+    cfg["theme_mode"] = normalise_theme_mode(cfg.get("theme_mode"))
+    cfg.pop("theme", None)
     normalised = False
     if isinstance(data, dict):
         # Мусорное значение (``"routing_mode": 123``) или отброшенные
@@ -390,11 +425,18 @@ def load_config() -> dict:
             ("routing_mode" in data
              and data.get("routing_mode") != cfg["routing_mode"])
             or ("xray_links" in data
-                and data.get("xray_links") != cfg["xray_links"]))
+                and data.get("xray_links") != cfg["xray_links"])
+            or ("theme_mode" in data
+                and data.get("theme_mode") != cfg["theme_mode"])
+            or legacy_theme)
     changed = raw is None
     migrated = False
     if "xray_routes" not in cfg:
         _migrate_routes(cfg)
+        changed = True
+        migrated = True
+    if legacy_theme:
+        # Переименование ключа — тоже миграция: файл пишется с ``theme_mode``.
         changed = True
         migrated = True
     if not cfg.get("zapret_dir"):

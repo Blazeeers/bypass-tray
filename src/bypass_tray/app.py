@@ -1228,6 +1228,16 @@ class TrayApp:
         return True
 
     # ---- поведение ---------------------------------------------------------
+    def apply_theme(self, mode: str | None = None) -> None:
+        """Применяет режим темы к открытой панели без перезапуска.
+
+        Конфиг уже записан вызывающим (страница настроек) или читается здесь;
+        сама панель перестраивается на месте.
+        """
+        mode = config.normalise_theme_mode(
+            self.cfg.get("theme_mode") if mode is None else mode)
+        self.panel.set_theme_mode(mode)
+
     def set_quiet(self, value: bool) -> None:
         """Тихий режим — только уведомления; цвет иконки от него не зависит."""
         self.cfg["quiet_icon"] = bool(value)

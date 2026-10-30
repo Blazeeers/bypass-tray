@@ -19,7 +19,7 @@ from tkinter import messagebox
 
 from PIL import ImageTk
 
-from . import diagnose, history, icons, routes
+from . import config, diagnose, history, icons, routes
 from .secrets import redact_text
 from .settings_ui import SettingsPage
 from .theme import SPACE, Theme, resolve_dark
@@ -283,6 +283,11 @@ def _work_area(root: tk.Misc) -> tuple[int, int, int, int]:
     return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
 
 
+def theme_mode_from_cfg(cfg: dict) -> str:
+    """Режим темы из конфига: ``theme_mode``, затем прежний ``theme``."""
+    return config.theme_mode_of(cfg)
+
+
 class Panel:
     def __init__(self, controller):
         self.controller = controller
@@ -292,6 +297,9 @@ class Panel:
         self._queue: queue.Queue[object] = queue.Queue()
         self._lock = threading.Lock()
         self._theme = Theme(False)
+        #: Выбранный режим темы ("auto" | "light" | "dark") — не цветовые
+        #: значения: при ``auto`` тема может поменяться без смены режима.
+        self._theme_mode = "auto"
         self._images: list = []
         self._icon_cache: dict[tuple, ImageTk.PhotoImage] = {}
         self._body: ScrollBody | None = None
@@ -388,6 +396,79 @@ class Panel:
         self._settings_visible = True
         self._switch_pages(show_settings=True)
 
+    def set_theme_mode(self, mode: str) -> None:
+        """Меняет тему панели на лету: ``auto`` | ``light`` | ``dark``.
+
+        Tk не умеет перекрашивать готовое дерево, поэтому виджеты
+        пересоздаются заново. Позиция и размер окна сохраняются, открытые
+        настройки и введённое в них — тоже. Из чужого потока команда уходит
+        в очередь: Tk трогает только поток панели.
+        """
+        mode = config.normalise_theme_mode(mode)
+        self._theme_mode = mode
+        if self._root is None:
+            return
+        in_ui = self._thread is None or threading.current_thread() is self._thread
+        if not in_ui:
+            self._queue.put(("theme", mode))
+            return
+        self._apply_theme_mode(mode)
+
+    def _apply_theme_mode(self, mode: str) -> None:
+        """Перестраивает панель под режим темы (вызывается в UI-потоке)."""
+        root = self._root
+        if root is None:
+            return
+        dark = resolve_dark(mode)
+        if dark == getattr(self._theme, "dark", None):
+            # Режим мог смениться (auto → light при светлой системе), но
+            # цвета те же: перестройка ничего бы не дала.
+            return
+        was_settings = self._settings_visible
+        settings_state = None
+        if was_settings and self._settings_page is not None:
+            # Страница могла быть уже уничтожена (закрытие во время тика):
+            # snapshot по мёртвым виджетам даёт TclError, а не снимок.
+            try:
+                if self._settings_page.winfo_exists():
+                    settings_state = self._settings_page.snapshot()
+            except tk.TclError:
+                settings_state = None
+        servers_open = self._servers_open
+        x, y = self._origin_x, self._origin_y
+        try:
+            if root.winfo_ismapped():
+                x, y = int(root.winfo_x()), int(root.winfo_y())
+        except tk.TclError:
+            return
+        # Старое дерево убирается целиком: иначе виджеты со старыми цветами
+        # остались бы висеть поверх новых.
+        for child in list(root.winfo_children()):
+            child.destroy()
+        self._release()
+        self._root = root
+        self._placed = True
+        theme = Theme(dark)
+        self._build(root, theme)
+        page = self._settings_page
+        if page is not None:
+            page.set_theme_mode(mode)
+        if servers_open:
+            self._servers_open = False
+            self._toggle_servers()
+        if was_settings and page is not None:
+            self._settings_visible = True
+            self._switch_pages(show_settings=True)
+            if settings_state:
+                page.restore(settings_state)
+        try:
+            # Только позиция: размер уже выставил _fit в _build.
+            root.geometry(f"+{x}+{y}")
+            root.update_idletasks()
+        except tk.TclError:
+            return
+        _apply_titlebar(root, theme)
+
     # ---- жизненный цикл ----------------------------------------------------
     def _run(self) -> None:
         """Поднимает окно в отдельном потоке.
@@ -396,7 +477,9 @@ class Panel:
         (``withdraw``), а ``destroy`` выполняется только при выходе из
         приложения.
         """
-        theme = Theme(resolve_dark(self.controller.cfg.get("theme", "auto")))
+        mode = theme_mode_from_cfg(self.controller.cfg or {})
+        self._theme_mode = mode
+        theme = Theme(resolve_dark(mode))
         self._theme = theme
         root = tk.Tk()
         # Окно не должно мелькнуть в (0,0) до _fit: строим скрытым, показываем
@@ -552,6 +635,9 @@ class Panel:
         kind, payload = event
         if kind == "ok":
             self._ui_error = ""
+        elif kind == "theme":
+            # Смена темы из другого потока: перестройка только здесь.
+            self._apply_theme_mode(str(payload))
         elif kind == "routes_plan":
             # Сухой прогон вернулся из фонового потока: диалог — здесь.
             self._ask_routes(payload)
