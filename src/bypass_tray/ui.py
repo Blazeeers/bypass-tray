@@ -322,6 +322,15 @@ class Panel:
         self._activity_period: tk.Label | None = None
         #: Текст ошибки в подвале: держится до следующего удачного действия.
         self._ui_error = ""
+        #: Короткое сообщение в подвале: (текст, до какого момента) — чтобы
+        #: нажатие, которое ничего не запускает, не выглядело молчанием.
+        self._ui_note: tuple[str, float] | None = None
+        #: Момент нажатия кнопки обновления: отклик виден сразу, а не с тика.
+        self._update_requested = 0.0
+        #: Карточка «Обновление программы»: показывается только при релизе.
+        self._app_update_card: Card | None = None
+        self._app_update_visible = False
+        self._app_update_key: tuple | None = None
         #: Действия контроллера, уже запущенные из панели (защита от двойного клика).
         self._inflight: set = set()
 
@@ -464,6 +473,11 @@ class Panel:
         self._activity_card = None
         self._stability_visible = True
         self._ui_error = ""
+        self._ui_note = None
+        self._update_requested = 0.0
+        self._app_update_card = None
+        self._app_update_visible = False
+        self._app_update_key = None
         self._inflight = set()
         self._vpn = {}
         self._services = {}
@@ -568,6 +582,24 @@ class Panel:
         except tk.TclError:
             pass
 
+    def _flash_note(self, text: str, seconds: float = 4.0) -> None:
+        """Короткое сообщение в подвале: видно сразу, само гаснет.
+
+        Нужно для нажатий, которые ничего не запускают (действие уже идёт):
+        молчащий клик пользователь читает как «кнопка не работает».
+        """
+        self._ui_note = (str(text), time.monotonic() + max(0.5, float(seconds)))
+        self._show_ui_note()
+
+    def _show_ui_note(self) -> None:
+        note = self._ui_note
+        if self._footer is None or not note:
+            return
+        try:
+            self._footer.configure(text=note[0])
+        except tk.TclError:
+            pass
+
     def _request_health(self) -> None:
         run_health = getattr(self.controller, "run_health", None)
         if callable(run_health):
@@ -650,6 +682,7 @@ class Panel:
         # Диагноз — самая верхняя карточка: она отвечает на «что не так»,
         # поэтому должна попадаться первой. Пустая не занимает высоту.
         self._build_diagnose()
+        self._build_app_update()
         self._vpn_card = self._card_box()
         self._build_vpn(self._vpn_card.inner)
         self._services_card = self._card_box()
@@ -779,6 +812,88 @@ class Panel:
         if not button.winfo_ismapped():
             button.pack(side="right", padx=(SPACE["md"], 0))
 
+    # ---- карточка «Обновление программы» -----------------------------------
+    def _build_app_update(self) -> None:
+        """Свежий релиз программы: строка версии и ссылка на страницу.
+
+        Карточка собирается всегда, но показывается только когда релиз
+        новее установленного: пустая отнимала бы высоту у тесной панели.
+        Сам exe не подменяем — открываем страницу релиза.
+        """
+        theme = self._theme
+        card = self._card_box()
+        inner = card.inner
+        top = tk.Frame(inner, bg=theme.card)
+        top.pack(fill="x")
+        self._app_update_title = tk.Label(
+            top, text="Обновление программы", bg=theme.card, fg=theme.text,
+            font=theme.title(), anchor="w")
+        self._app_update_title.pack(side="left", fill="x", expand=True)
+        self._app_update_button = PillButton(
+            top, theme, "Открыть страницу релиза", self._open_release,
+            kind="primary", min_width=200, height=ROW_CONTROL_HEIGHT)
+        self._app_update_button.pack(side="right", padx=(SPACE["md"], 0))
+        self._app_update_facts = tk.Label(
+            inner, text="", bg=theme.card, fg=theme.text_dim,
+            font=theme.caption(), anchor="w", justify="left",
+            wraplength=CARD_TEXT_WIDTH)
+        self._app_update_facts.pack(fill="x", pady=(SPACE["xs"], 0))
+        self._app_update_card = card
+        # ``_card_box`` уже упаковал карточку: первый рендер её спрячет,
+        # если свежего релиза нет.
+        self._app_update_visible = True
+
+    def _open_release(self, *_args) -> None:
+        """Открывает страницу релиза: через контроллер, если он умеет."""
+        opener = getattr(self.controller, "open_release", None)
+        if callable(opener):
+            try:
+                ok = opener()
+            except Exception as exc:  # noqa: BLE001
+                self._report_ui_error(exc, "страницы релиза")
+                return
+            if ok is False:
+                self._flash_note("не удалось открыть страницу релиза")
+            return
+        block = (getattr(self.controller, "updates_report", {}) or {}).get("app") or {}
+        url = str(block.get("url") or "")
+        if not url.startswith("https://"):
+            self._flash_note("ссылка на релиз неизвестна")
+            return
+        try:
+            import webbrowser
+
+            webbrowser.open(url)
+        except Exception as exc:  # noqa: BLE001
+            self._report_ui_error(exc, "страницы релиза")
+
+    def _render_app_update(self) -> None:
+        card = self._app_update_card
+        if card is None:
+            return
+        block = (getattr(self.controller, "updates_report", {}) or {}).get("app") or {}
+        latest = str(block.get("latest") or "")
+        if not block.get("outdated") or not latest:
+            if self._app_update_visible:
+                card.pack_forget()
+                self._app_update_visible = False
+            self._app_update_key = None
+            return
+        installed = str(block.get("installed") or "")
+        facts = f"Доступна версия {latest}"
+        if installed:
+            facts += f" · установлена {installed}"
+        key = (latest, installed)
+        if not self._app_update_visible:
+            # Показ на прежнее место — над карточкой VPN.
+            card.pack(fill="x", padx=SPACE["lg"], pady=(0, SPACE["md"]),
+                      before=self._vpn_card)
+            self._app_update_visible = True
+        if key == self._app_update_key:
+            return
+        self._app_update_key = key
+        self._app_update_facts.configure(text=facts)
+
     # ---- шапка -------------------------------------------------------------
     def _build_header(self, root: tk.Tk, theme: Theme) -> None:
         header = tk.Frame(root, bg=theme.header)
@@ -850,15 +965,26 @@ class Panel:
             self._render_header_update()
 
     def _request_update(self) -> None:
-        if bool(getattr(self.controller, "updates_running", False)):
+        """Кнопка обновления: запускает работу или честно говорит, что занято."""
+        controller = self.controller
+        busy = getattr(controller, "busy", {}) or {}
+        if bool(getattr(controller, "updates_running", False)) or bool(busy.get("updates")):
+            # Клик по кнопке, пока идёт чужая проверка/установка, не должен
+            # выглядеть как «ничего не произошло».
+            self._flash_note(str(busy.get("updates") or "обновление уже идёт"))
+            self._render_header_update()
             return
-        if bool((getattr(self.controller, "busy", {}) or {}).get("updates")):
-            return
-        action = getattr(self.controller, "update_everything", None)
+        action = getattr(controller, "update_everything", None)
         if not callable(action):
-            action = getattr(self.controller, "check_all", None)
-        if callable(action):
-            self._call(action)
+            action = getattr(controller, "check_all", None)
+        if not callable(action):
+            self._flash_note("обновление недоступно")
+            return
+        self._call(action)
+        # Отклик сразу: тултип «обновляю…» и строка в подвале, не дожидаясь тика.
+        self._update_requested = time.monotonic()
+        self._flash_note("обновляю…")
+        self._render_header_update()
 
     def _render_header_update(self) -> None:
         theme = self._theme
@@ -868,10 +994,16 @@ class Panel:
         report = getattr(self.controller, "updates_report", {}) or {}
         running = bool(getattr(self.controller, "updates_running", False)) or bool(
             (getattr(self.controller, "busy", {}) or {}).get("updates"))
+        # Нажатие отвечает мгновенно, даже если контроллер ещё не поднял флаг.
+        if not running and self._update_requested:
+            if time.monotonic() - self._update_requested < 3.0:
+                running = True
+            else:
+                self._update_requested = 0.0
         outdated = list(report.get("outdated") or [])
         if running:
             color = theme.accent
-            tooltip = "Проверяю…"
+            tooltip = "обновляю…"
             badge = None
         else:
             # Иконка остаётся нейтральной в любом случае: о находке сообщает
@@ -1274,6 +1406,7 @@ class Panel:
         # Сводка за сутки читается один раз: её просят и диагноз, и стабильность.
         summary = history.summary()
         self._render_diagnose(summary)
+        self._render_app_update()
         self._render_vpn(proxy, busy)
         self._render_services(items, status, busy)
         self._render_stability(summary)
@@ -1581,6 +1714,12 @@ class Panel:
             # Ошибку показываем вместо обычной строки, пока действие не пройдёт.
             self._show_ui_error()
             return
+        note = self._ui_note
+        if note is not None:
+            if note[1] > time.monotonic():
+                self._footer.configure(text=note[0])
+                return
+            self._ui_note = None
         stamp = getattr(self.controller, "updated_at", 0) or 0
         clock = time.strftime("%H:%M:%S", time.localtime(stamp or time.time()))
         cfg = getattr(self.controller, "cfg", {}) or {}

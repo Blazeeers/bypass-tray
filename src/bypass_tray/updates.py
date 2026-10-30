@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import concurrent.futures
+import ctypes
 import json
 import re
 import subprocess
+import sys
 import time
 import urllib.request
 from pathlib import Path
@@ -18,6 +20,10 @@ REPOS = {
     "xray": "XTLS/Xray-core",
 }
 
+#: Репозиторий самой программы: релизы ``v*`` собирает GitHub Actions.
+APP_REPO = "Blazeeers/bypass-tray"
+APP_RELEASES_URL = f"https://github.com/{APP_REPO}/releases/latest"
+
 #: Человеческие названия для уведомлений и журнала.
 LABELS = {
     "zapret": "zapret",
@@ -28,12 +34,30 @@ LABELS = {
 
 #: Строка ``xray -version``: «Xray 25.6.8 (Xray, Penetration Test Build)».
 _VERSION_RE = re.compile(r"Xray\s+([\w.\-]+)")
+#: Начало версии в теге: «v1.10.4», «1.11.2.0», «0.6.9».
+_VERSION_START_RE = re.compile(r"^[vV]?(\d+(?:\.\d+)*)")
 #: Запасной разбор pyproject.toml, если tomllib недоступен (Python < 3.11).
 _PYPROJECT_VERSION_RE = re.compile(r'^\s*version\s*=\s*"([^"]+)"', re.MULTILINE)
 
 
 def label(name: str) -> str:
     return LABELS.get(str(name), str(name))
+
+
+def _version_key(text: str) -> tuple[int, ...] | None:
+    """Числовая версия строкой-кортежем; ``None`` — если это не версия.
+
+    Сравнивать «0.6.10» и «0.6.9» строками нельзя: как тексты они дают
+    обратный порядок. Хвостовые нули отбрасываются, потому что версия из
+    ресурсов exe — «1.11.2.0», а тег релиза — «v1.11.2».
+    """
+    match = _VERSION_START_RE.match(str(text or "").strip())
+    if not match:
+        return None
+    parts = [int(part) for part in match.group(1).split(".")]
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
 
 
 def _latest_tag(repo: str) -> tuple[str, str]:
@@ -61,11 +85,15 @@ def _latest_tags() -> tuple[dict, str]:
 
     Второе значение — текст ошибки, если **ни один** репозиторий не ответил.
     Часовой сбой одного репозитория не делает офлайном всю проверку.
+    Ключ ``app`` — последний релиз самой программы, чтобы панель и трей
+    могли сказать «Доступна версия X».
     """
+    repos = dict(REPOS)
+    repos["app"] = APP_REPO
     tags: dict[str, str] = {}
     failures: list[str] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(REPOS)) as pool:
-        futures = {pool.submit(_latest_tag, repo): name for name, repo in REPOS.items()}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(repos)) as pool:
+        futures = {pool.submit(_latest_tag, repo): name for name, repo in repos.items()}
         for future in concurrent.futures.as_completed(futures):
             name = futures[future]
             try:
@@ -80,16 +108,39 @@ def _latest_tags() -> tuple[dict, str]:
 
 
 def _is_outdated(installed: str, latest: str) -> bool:
-    """Отличается ли установленная версия от последнего тега.
+    """Установленная версия старше последнего тега.
 
-    ``v`` в начале и регистр не важны: ``xray -version`` печатает «25.6.8»,
-    а тег релиза — «v25.6.8».
+    ``v`` в начале, регистр и хвостовые нули не важны: ``xray -version``
+    печатает «25.6.8», тег релиза — «v25.6.8», а версия из ресурсов exe —
+    «1.11.2.0». Неразборчивые теги (например, «zapret-new») сравниваются
+    строками: иначе проверка молча считала бы их равными.
     """
-    have = str(installed or "").strip().lower().lstrip("v")
-    want = str(latest or "").strip().lower().lstrip("v")
-    if not have or not want:
+    have_raw = str(installed or "").strip()
+    want_raw = str(latest or "").strip()
+    if not have_raw or not want_raw:
         return False
-    return have != want
+    have = _version_key(have_raw)
+    want = _version_key(want_raw)
+    if have is not None and want is not None:
+        return have < want
+    return have_raw.lower().lstrip("v") != want_raw.lower().lstrip("v")
+
+
+def _needs_update(installed: str, latest: str, present: bool) -> bool:
+    """Стоит ли ставить компонент: отсутствует или версия не подтверждена.
+
+    Пустая версия при живых файлах — не «актуально», а «неизвестно»:
+    zapret, поставленный службой, и tg-ws-proxy, скопированный вручную,
+    в ``state`` своей версии не оставили. Один раз обновляем — установка
+    запишет версию, и дальше сверка пойдёт по ней.
+    """
+    if not str(latest or "").strip():
+        return False  # сверять не с чем — не трогаем без сети
+    if not present:
+        return True
+    if not str(installed or "").strip():
+        return True
+    return _is_outdated(installed, latest)
 
 
 # ---- установленные версии -------------------------------------------------
@@ -114,6 +165,43 @@ def _xray_version() -> str:
     text = actions._decode(completed.stdout) + actions._decode(completed.stderr)
     match = _VERSION_RE.search(text)
     return match.group(1) if match else ""
+
+
+def _exe_version(path) -> str:
+    """Версия из ресурсов exe (``FileVersion``) — без сторонних библиотек.
+
+    tg-ws-proxy не помнит свою версию, если его файл скопировали вручную:
+    читаем её из самого бинарника. Ресурс даёт «1.11.2.0», тег релиза —
+    «v1.11.2»; ``_version_key`` считает их равными.
+    """
+    if not sys.platform.startswith("win"):
+        return ""
+    target = str(path or "").strip()
+    if not target or not Path(target).is_file():
+        return ""
+    try:
+        from ctypes import wintypes
+
+        size = ctypes.windll.version.GetFileVersionInfoSizeW(target, None)
+        if not size:
+            return ""
+        buffer = ctypes.create_string_buffer(size)
+        if not ctypes.windll.version.GetFileVersionInfoW(target, 0, size, buffer):
+            return ""
+        pointer = ctypes.c_void_p()
+        length = wintypes.UINT()
+        if not ctypes.windll.version.VerQueryValueW(
+                buffer, "\\", ctypes.byref(pointer), ctypes.byref(length)):
+            return ""
+        # VS_FIXEDFILEINFO: подпись, версия структуры, старшая и младшая
+        # половины номера файла.
+        fixed = ctypes.cast(pointer, ctypes.POINTER(ctypes.c_uint32 * 4)).contents
+        high, low = int(fixed[2]), int(fixed[3])
+    except (OSError, AttributeError, ValueError, ctypes.ArgumentError):
+        return ""
+    if not high and not low:
+        return ""
+    return f"{high >> 16}.{high & 0xFFFF}.{low >> 16}.{low & 0xFFFF}"
 
 
 def widget_version() -> str:
@@ -144,15 +232,45 @@ def widget_version() -> str:
 
 
 def installed_versions(cfg: dict, state: dict | None = None) -> dict:
-    """Что установлено сейчас: zapret/tgws — из state, xray — живым запуском."""
+    """Что установлено сейчас: zapret/tgws — из state, xray — живым запуском.
+
+    Если в state версии нет, tg-ws-proxy читается из ресурсов своего exe:
+    файл, скопированный вручную, иначе навсегда оставался «неизвестным».
+    """
     state = state if state is not None else config.load_state()
     known = state.get("installed") or {}
+    tgws = str(known.get("tgws") or "")
+    raw_tgws = str(cfg.get("tgws_exe") or "").strip()
+    if not tgws and raw_tgws:
+        # Пустой путь в конфиге значит «не установлено» (так же думает
+        # present_components) — на диск по умолчанию не подменяем.
+        tgws = _exe_version(raw_tgws)
     return {
         "zapret": str(known.get("zapret") or ""),
-        "tgwsproxy": str(known.get("tgws") or ""),
+        "tgwsproxy": tgws,
         "xray": _xray_version(),
         "widget": widget_version(),
     }
+
+
+def _app_block(tag: str) -> dict:
+    """Свежий релиз программы: ``installed/latest/outdated/url``.
+
+    Пустой ``latest`` — не «актуально», а «не проверено»: GitHub мог не
+    ответить или у репозитория ещё нет релизов. Это не ошибка проверки,
+    но и не повод писать «обновлений нет».
+    """
+    installed = widget_version()
+    block = {
+        "installed": installed,
+        "latest": str(tag or ""),
+        "outdated": bool(tag) and _is_outdated(installed, tag),
+        "url": APP_RELEASES_URL,
+    }
+    block["checked"] = bool(tag)
+    if not tag:
+        block["note"] = "не проверено"
+    return block
 
 
 # ---- проверка -------------------------------------------------------------
@@ -186,6 +304,8 @@ def present_components(cfg: dict) -> dict:
         "tgwsproxy": bool(local.get("tgws")),
         "xray": core,
         "refilter": refilter,
+        # Служба zapret: её файлы не наши — версию не ведём и не «обновляем».
+        "service": service,
     }
 
 
@@ -195,7 +315,8 @@ def check_all(cfg: dict, state: dict) -> dict:
     ``missing`` — компоненты, которых нет ни в state, ни на диске (для
     zapret учитывается и служба Windows). ``network_error`` появляется,
     только когда GitHub не ответил ни по одному репозиторию: тогда пустой
-    ``outdated`` не означает «всё актуально».
+    ``outdated`` не означает «всё актуально». ``app`` — отдельный блок про
+    версию самой программы.
     """
     latest, network_error = _latest_tags()
     installed = installed_versions(cfg, state)
@@ -207,18 +328,40 @@ def check_all(cfg: dict, state: dict) -> dict:
     for name in REPOS:
         tag = latest.get(name, "")
         have = installed.get(name, "")
-        is_outdated = _is_outdated(have, tag)
+        here = bool(present.get(name))
+        if name == "zapret" and present.get("service"):
+            # Версию службы мы не знаем и менять её файлы нельзя: не врём
+            # ни «устарело», ни «актуально».
+            is_outdated = False
+        elif here:
+            is_outdated = _needs_update(have, tag, True)
+        else:
+            is_outdated = False
         if tag:
             seen[name] = tag
-        found[name] = {"latest": tag, "installed": have, "outdated": bool(is_outdated)}
+        info = {"latest": tag, "installed": have, "outdated": bool(is_outdated)}
+        if name == "zapret" and present.get("service"):
+            info["service"] = True
+        found[name] = info
         if is_outdated:
             outdated.append(name)
-        if not have and not present.get(name):
+        if not have and not here:
             missing.append(name)
     if not present.get("refilter"):
         missing.append("refilter")
+    # Версии, прочитанные с диска (tgws из ресурсов exe), фиксируем сразу:
+    # иначе «неизвестная» версия снова приведёт к лишней переустановке.
+    known = state.get("installed")
+    known = dict(known) if isinstance(known, dict) else {}
+    for name, key in (("zapret", "zapret"), ("tgwsproxy", "tgws"), ("xray", "xray")):
+        value = str(installed.get(name) or "")
+        if value and value != known.get(key):
+            known[key] = value
+    if known:
+        state["installed"] = known
     result = {"checked": time.time(), "components": found,
-              "outdated": outdated, "missing": missing}
+              "outdated": outdated, "missing": missing,
+              "app": _app_block(str(latest.get("app") or ""))}
     if network_error:
         result["network_error"] = network_error
     state["updates"] = result
@@ -280,7 +423,8 @@ def update_all(cfg: dict, state: dict, progress=None) -> dict:
         result["warnings"].append("zapret установлен службой, обновите вручную")
     else:
         was_there = bool(present["zapret"])
-        can_update = _is_outdated(known.get("zapret", ""), latest.get("zapret", ""))
+        can_update = _needs_update(known.get("zapret", ""), latest.get("zapret", ""),
+                                   was_there)
         if not was_there or can_update:
             say("zapret", ("обновляю: zapret" if was_there else "устанавливаю: zapret"), 0)
             existing_dir = str(cfg.get("zapret_dir") or "")
@@ -320,7 +464,9 @@ def update_all(cfg: dict, state: dict, progress=None) -> dict:
 
     # ---- tg-ws-proxy ------------------------------------------------------
     was_there = bool(present["tgwsproxy"])
-    can_update = _is_outdated(known.get("tgws", ""), latest.get("tgwsproxy", ""))
+    have_tgws = str(known.get("tgws") or "") or _exe_version(
+        str(cfg.get("tgws_exe") or "").strip())
+    can_update = _needs_update(have_tgws, latest.get("tgwsproxy", ""), was_there)
     if not was_there or can_update:
         say("tgws", ("обновляю: tg-ws-proxy" if was_there else "устанавливаю: tg-ws-proxy"), 0)
         tgws_was_running = False
@@ -347,6 +493,8 @@ def update_all(cfg: dict, state: dict, progress=None) -> dict:
         }
         if tgws.get("ok"):
             version = str(tgws.get("version") or "")
+            if not version:
+                version = _exe_version(cfg.get("tgws_exe") or tgws.get("exe") or "")
             if version:
                 versions["tgws"] = version
             (result["updated"] if was_there else result["installed"]).append("tgwsproxy")
@@ -369,7 +517,7 @@ def update_all(cfg: dict, state: dict, progress=None) -> dict:
     # ---- ядро Xray --------------------------------------------------------
     was_there = bool(present["xray"])
     have_xray = installed_versions(cfg, state).get("xray", "")
-    can_update = _is_outdated(have_xray, latest.get("xray", ""))
+    can_update = _needs_update(have_xray, latest.get("xray", ""), was_there)
     if not was_there or can_update:
         say("xray", ("обновляю: ядро Xray" if was_there else "устанавливаю: ядро Xray"), 0)
         was_running = False
@@ -436,6 +584,12 @@ def update_all(cfg: dict, state: dict, progress=None) -> dict:
 
     if versions:
         known.update(versions)
+    # Версию, прочитанную с диска, тоже фиксируем: компонент, поставленный
+    # вручную, иначе навсегда останется «неизвестным» и будет переставляться.
+    if not known.get("tgws"):
+        found_tgws = _exe_version(str(cfg.get("tgws_exe") or "").strip())
+        if found_tgws:
+            known["tgws"] = found_tgws
     state["installed"] = known
     if not config.save_config(cfg):
         result["warnings"].append("config.json не записан")

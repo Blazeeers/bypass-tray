@@ -855,6 +855,30 @@ class TrayApp:
     def _component_names(names) -> str:
         return ", ".join(updates.label(str(name)) for name in names)
 
+    @staticmethod
+    def _version_note(report: dict) -> str:
+        """«Доступна версия X» — если у самой программы есть свежий релиз."""
+        block = (report or {}).get("app") or {}
+        latest = str(block.get("latest") or "")
+        if not block.get("outdated") or not latest:
+            return ""
+        installed = str(block.get("installed") or "")
+        return (f"Доступна версия {latest}"
+                + (f" (установлена {installed})" if installed else ""))
+
+    def open_release(self) -> bool:
+        """Открывает страницу релиза в браузере. Exe сам не подменяем."""
+        import webbrowser
+
+        block = (self.updates_report or {}).get("app") or {}
+        url = str(block.get("url") or updates.APP_RELEASES_URL)
+        if not url.startswith("https://"):
+            return False
+        try:
+            return bool(webbrowser.open(url))
+        except Exception:  # noqa: BLE001
+            return False
+
     def _update_message(self, result: dict, network_error: str = "") -> str:
         """Человеческий итог установки: что поставил, что обновил, что не вышло."""
         installed = list(result.get("installed") or [])
@@ -879,34 +903,50 @@ class TrayApp:
         return message
 
     def check_all(self, notify: bool = False) -> bool:
-        """Проверяет обновления через GitHub (в фоне)."""
+        """Проверяет обновления через GitHub (в фоне).
+
+        С ``notify`` проверка не обрывается сообщением: если нашлись
+        устаревшие/отсутствующие компоненты, сразу запускается установка
+        (``update_everything``) — так же, как кнопка обновления в панели.
+        """
         if self.updates_running:
             return False
         self.updates_running = True
         self.busy["updates"] = "проверяю обновления…"
         self._signature = None
+        follow_up = False
 
         def worker() -> None:
+            nonlocal follow_up
             try:
                 report = updates.check_all(self.cfg, self.state)
                 self.updates_report = report
                 outdated = list(report.get("outdated") or [])
                 missing = list(report.get("missing") or [])
                 network_error = str(report.get("network_error") or "")
-                if network_error and not (outdated or missing):
+                version_note = self._version_note(report)
+                parts: list[str] = []
+                if outdated or missing:
+                    parts.append("Обновления: "
+                                 + self._component_names(outdated or missing))
+                if version_note:
+                    parts.append(version_note)
+                if parts:
+                    self.state["updates_note"] = ". ".join(parts)
+                elif network_error:
                     self.state["updates_note"] = "нет связи с GitHub"
-                elif outdated or missing:
-                    names = outdated or missing
-                    self.state["updates_note"] = "Обновления: " + ", ".join(names)
                 else:
                     self.state.pop("updates_note", None)
                 config.save_state(self.state)
                 if notify:
-                    if network_error and not (outdated or missing):
+                    if parts:
+                        text = ". ".join(parts)
+                        if outdated or missing:
+                            text += ". Запускаю обновление…"
+                            follow_up = True
+                        self.notify(text)
+                    elif network_error:
                         self.notify("нет связи с GitHub — обновления не проверены")
-                    elif outdated or missing:
-                        self.notify("Обновления: "
-                                    + ", ".join(outdated or missing))
                     else:
                         self.notify("Обновлений нет")
             except Exception:  # noqa: BLE001
@@ -916,6 +956,9 @@ class TrayApp:
                 self.busy.pop("updates", None)
                 self._signature = None
                 self.update_icon()
+                if follow_up:
+                    # Флаги уже сняты — update_everything начнёт новую работу.
+                    self.update_everything()
 
         threading.Thread(target=worker, daemon=True, name="updates").start()
         return True
@@ -939,6 +982,7 @@ class TrayApp:
                 outdated = list(report.get("outdated") or [])
                 missing = list(report.get("missing") or [])
                 network_error = str(report.get("network_error") or "")
+                version_note = self._version_note(report)
                 if outdated or missing:
                     self.busy["updates"] = "устанавливаю компоненты…"
                     result = updates.update_all(self.cfg, self.state, progress=progress)
@@ -946,10 +990,15 @@ class TrayApp:
                         result, network_error or str(result.get("network_error") or ""))
                     try:
                         self.updates_report = updates.check_all(self.cfg, self.state)
+                        version_note = self._version_note(self.updates_report)
                     except Exception:  # noqa: BLE001
                         pass
+                    if version_note:
+                        message += ". " + version_note
                 elif network_error:
                     message = "нет связи с GitHub — обновления не проверены"
+                elif version_note:
+                    message = version_note + " — откройте страницу релиза"
                 else:
                     message = "Обновления не найдены"
                 activity.log(message)
@@ -1494,6 +1543,9 @@ class TrayApp:
             self.proxy.get("running"),
             self.proxy.get("server"),
             self.state.get("updates_note"),
+            (self.updates_report or {}).get("app") or {},
+            tuple(self.updates_report.get("outdated") or ()),
+            tuple(self.updates_report.get("missing") or ()),
             bool(self.busy),
             self._prev_verdict,
             bool(self.cfg.get("quiet_icon")),
@@ -1547,6 +1599,10 @@ class TrayApp:
         state = self.status or {}
         zapret = state.get("zapret") or {}
         zapret_text = "запущен" if zapret.get("running") else "выключен"
+        # Свежий релиз программы: отдельный пункт меню, без подмены exe.
+        app_block = (self.updates_report or {}).get("app") or {}
+        version = (str(app_block.get("latest") or "")
+                   if app_block.get("outdated") else "")
         strategy = zapret.get("strategy") or zapret.get("digest") or ""
         if strategy:
             zapret_text = f"{zapret_text} · {strategy}"
@@ -1624,10 +1680,16 @@ class TrayApp:
             pystray.MenuItem("tg-ws-proxy: запустить", lambda icon, item: self.start_tgws()),
             pystray.MenuItem("tg-ws-proxy: остановить", lambda icon, item: self.stop_tgws()),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Проверить обновления", lambda icon, item: self.check_all(notify=True)),
+            pystray.MenuItem("Проверить обновления",
+                             lambda icon, item: self.check_all(notify=True)),
             *([pystray.MenuItem("Обновить всё",
                                 lambda icon, item: self.update_everything())]
-              if (self.updates_report.get("outdated") or []) else []),
+              if (self.updates_report.get("outdated")
+                  or self.updates_report.get("missing")) else []),
+            *([pystray.MenuItem(
+                    f"Открыть страницу релиза {version}",
+                    lambda icon, item: self.open_release())]
+              if version else []),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
                 "Тихая иконка",
