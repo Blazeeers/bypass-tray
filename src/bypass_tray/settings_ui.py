@@ -1089,16 +1089,19 @@ class SettingsPage(tk.Frame):
                 command=lambda value, i=index: self._set_health_flag(
                     i, "show", value))
             show.grid(row=0, column=2, sticky="e", padx=(SPACE["md"], 0))
-            up = PillButton(row, theme, "↑",
+            # Шеврон вместо «↑»: волосяной знак на 720 px не читается.
+            # Цвета — из ghost-палитры: text_dim, при наведении text,
+            # у недоступной крайней стрелки text_faint.
+            up = PillButton(row, theme, "",
                             lambda i=index: self._move_health(i, -1),
                             kind="ghost", height=ROW_CONTROL_HEIGHT,
-                            pad_x=SPACE["xs"], width=30)
+                            pad_x=SPACE["xs"], width=30, arrow="up")
             up.grid(row=0, column=3, padx=(SPACE["sm"], 0))
             up.set_enabled(index > 0)
-            down = PillButton(row, theme, "↓",
+            down = PillButton(row, theme, "",
                               lambda i=index: self._move_health(i, 1),
                               kind="ghost", height=ROW_CONTROL_HEIGHT,
-                              pad_x=SPACE["xs"], width=30)
+                              pad_x=SPACE["xs"], width=30, arrow="down")
             down.grid(row=0, column=4, padx=(SPACE["xs"], 0))
             down.set_enabled(index < len(self.health_items) - 1)
             delete = None

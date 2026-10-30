@@ -205,7 +205,8 @@ class PillButton(tk.Canvas):
     def __init__(self, master: tk.Misc, theme: Theme, text: str, command,
                  kind: str = "secondary", pad_x: int | None = None,
                  height: int | None = None, bg: str | None = None,
-                 width: int | None = None, min_width: int | None = None):
+                 width: int | None = None, min_width: int | None = None,
+                 arrow: str | None = None):
         self.theme = theme
         self.kind = kind
         self.command = command
@@ -220,6 +221,10 @@ class PillButton(tk.Canvas):
         self._pad_x = theme.space_of("lg") if pad_x is None else pad_x
         self._min_width = min_width or 0
         self._height = CONTROL_HEIGHT if height is None else int(height)
+        # Шеврон вместо текста: у Segoe UI ↑ — волосяная линия, на малом
+        # кегле кнопка порядка читается как точка. Цвет берётся тот же,
+        # что у текста (`_palette`), поэтому состояния совпадают.
+        self._arrow = arrow if arrow in ("up", "down") else None
         self._font = self._font_for(kind)
         self._last_width = 0
         computed = width or (self._font.measure(text) + self._pad_x * 2)
@@ -378,8 +383,31 @@ class PillButton(tk.Canvas):
             self._draw_spinner(width, height, fg, fill)
             return
         offset = 1 if self._pressed else 0
+        if self._arrow is not None:
+            self._draw_arrow(width, height, fg, offset)
+            return
         self.create_text(width / 2, height / 2 + offset, text=self._text,
                          font=self._font, fill=fg)
+
+    #: Полуширина и высота шеврона кнопки-стрелки, пиксели.
+    ARROW_HALF = 5
+    ARROW_RISE = 5
+    #: Толщина линий шеврона: волосяная линия глифа не видна на 720 px.
+    ARROW_WIDTH = 2
+
+    def _draw_arrow(self, width: float, height: float, fg: str,
+                    offset: int = 0) -> None:
+        """Шеврон ↑/↓ линиями: цвет тот же, что у текста, форма читаема."""
+        center_x = width / 2
+        center_y = height / 2 + offset
+        half, rise = self.ARROW_HALF, self.ARROW_RISE
+        up = self._arrow == "up"
+        apex_y = center_y - rise if up else center_y + rise
+        wing_y = center_y + rise if up else center_y - rise
+        self.create_line(center_x - half, wing_y, center_x, apex_y,
+                         center_x + half, wing_y, fill=fg,
+                         width=self.ARROW_WIDTH, capstyle="round",
+                         joinstyle="round")
 
     def _draw_spinner(self, width: float, height: float, fg: str, fill: str) -> None:
         middle = height / 2
