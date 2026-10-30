@@ -143,27 +143,90 @@ def is_valid_domain(value: str) -> tuple[bool, str]:
     return True, ""
 
 
+def normalise_routes(source) -> dict[str, dict]:
+    """Правила ``xray_routes`` в едином виде: ``{домен: {"route", "server"}}``.
+
+    Читаются обе схемы: строка ``"direct"|"proxy"`` (старый файл) и объект
+    ``{"route": ..., "server": ...}``. Принимает и сам словарь правил, и
+    конфиг целиком (``{"xray_routes": ...}``) — им пользуются все читатели:
+    ``user_routes``, ``xray.build_config`` и ``xray._proxy_bypass_list``.
+
+    Домены нормализованы и не повторяются; при конфликте побеждает direct.
+    У direct сервер отбрасывается: напрямую он не нужен. Пустая строка и
+    не-строка в ``server`` читаются как ``None``. Запись с неизвестным
+    ``route`` (и объект без него) пропускается — так вёл себя прежний
+    ``user_routes``, и на этом держатся и тесты, и окно настроек.
+    """
+    if isinstance(source, dict) and isinstance(source.get("xray_routes"), dict):
+        mapping = source["xray_routes"]
+    elif isinstance(source, dict):
+        mapping = source
+    else:
+        return {}
+    result: dict[str, dict] = {}
+    for raw, value in mapping.items():
+        name = normalize_user_domain(raw)
+        if not name:
+            continue
+        server = None
+        if isinstance(value, dict):
+            route = str(value.get("route") or "").strip().lower()
+            server = value.get("server")
+        else:
+            route = str(value).strip().lower()
+        if route not in ("direct", "proxy"):
+            # Мусор в значении не становится правилом: молчаливый пропуск —
+            # прежнее поведение, его проверяет smoke-тест.
+            continue
+        if route == "direct" or not isinstance(server, str):
+            server = None
+        if isinstance(server, str):
+            server = server.strip() or None
+        previous = result.get(name)
+        if previous is not None:
+            # Тот же домен после нормализации: direct сильнее, иначе первое
+            # правило остаётся — как было со списками direct/proxy.
+            if previous["route"] == "direct" or route != "direct":
+                continue
+        result[name] = {"route": route, "server": server}
+    return result
+
+
+def routes_payload(routes_map: dict, servers: dict | None = None) -> dict:
+    """``xray_routes`` из формы настроек: строка без сервера, объект с ним.
+
+    Обратная сторона ``normalise_routes``. Без сервера правило пишется
+    строкой — файл остаётся понятным прежним версиям, — а правило proxy со
+    своим сервером становится объектом ``{"route", "server"}``. Неизвестный
+    маршрут и пустой домен отбрасываются, как и при чтении.
+    """
+    payload: dict = {}
+    for raw, route in (routes_map or {}).items():
+        name = normalize_user_domain(raw)
+        route = str(route or "").strip()
+        if not name or route not in ("direct", "proxy"):
+            continue
+        server = None
+        if route == "proxy" and isinstance(servers, dict):
+            value = servers.get(name, servers.get(raw))
+            if isinstance(value, str) and value.strip():
+                server = value.strip()
+        if server:
+            payload[name] = {"route": "proxy", "server": server}
+        else:
+            payload[name] = route
+    return payload
+
+
 def user_routes(cfg: dict) -> tuple[list[str], list[str]]:
     """Пользовательские правила из ``xray_routes``: (direct, proxy).
 
     Домены нормализованы и не повторяются; при конфликте побеждает direct.
+    Схема v2 разбирается той же ``normalise_routes``, что и в конфиге Xray.
     """
-    mapping = (cfg or {}).get("xray_routes")
-    if not isinstance(mapping, dict):
-        return [], []
-    direct: list[str] = []
-    proxy: list[str] = []
-    for raw, route in mapping.items():
-        name = normalize_user_domain(raw)
-        if not name:
-            continue
-        if str(route) == "direct":
-            if name not in direct:
-                direct.append(name)
-        elif str(route) == "proxy":
-            if name not in proxy:
-                proxy.append(name)
-    proxy = [name for name in proxy if name not in set(direct)]
+    rules = normalise_routes(cfg or {})
+    direct = [name for name, info in rules.items() if info["route"] == "direct"]
+    proxy = [name for name, info in rules.items() if info["route"] == "proxy"]
     return direct, proxy
 
 

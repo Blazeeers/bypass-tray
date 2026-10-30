@@ -17,8 +17,8 @@ from tkinter import filedialog
 from . import activity, blocked, components, config, routes, xray
 from .theme import SPACE, Theme
 from .widgets import (
-    Card, Divider, HoverRow, PillButton, ScrollBody, Section, Segmented,
-    TextField, ToggleSwitch, Tooltip, blend, rounded_rect,
+    Card, Divider, Dropdown, HoverRow, PillButton, ScrollBody, Section,
+    Segmented, TextField, ToggleSwitch, Tooltip, blend, rounded_rect,
 )
 
 PORT_MIN = 1024
@@ -149,6 +149,10 @@ class SettingsPage(tk.Frame):
         #: Правила, которые на момент последней синхронизации лежали в конфиге:
         #: по ним видно, есть ли несохранённые правки маршрутов.
         self._saved_rules: dict[str, str] | None = None
+        #: Сервер правила («домен → свой сервер»). Лежит отдельно от ``rules``:
+        #: тот остаётся ``{домен: маршрут}``, как его ждут окно и тесты.
+        self.rule_servers: dict[str, str | None] = {}
+        self._saved_rule_servers: dict[str, str | None] = {}
         self._blocked_busy = False
         self._blocked_result = None
         self._blocked_text = ""
@@ -628,8 +632,9 @@ class SettingsPage(tk.Frame):
     def _routes_dirty(self) -> bool:
         """Отличаются ли правила на экране от тех, что лежат в конфиге."""
         if self._saved_rules is None:
-            return bool(self.rules)
-        return self.rules != self._saved_rules
+            return bool(self.rules) or bool(self.rule_servers)
+        return (self.rules != self._saved_rules
+                or self.rule_servers != (self._saved_rule_servers or {}))
 
     def _persist_routes(self) -> bool:
         """Тихо записать маршруты из формы, не трогая остальные поля.
@@ -638,11 +643,13 @@ class SettingsPage(tk.Frame):
         отсюда не перезапускаем — применение остаётся за «Сохранить».
         """
         cfg = dict(self.controller.cfg or {})
-        cfg["xray_routes"] = dict(self.rules)
+        cfg["xray_routes"] = routes.routes_payload(self.rules,
+                                                   self.rule_servers)
         if not config.save_config(cfg):
             return False
         self.controller.cfg = cfg
         self._saved_rules = dict(self.rules)
+        self._saved_rule_servers = dict(self.rule_servers)
         return True
 
     def revert(self) -> bool:
@@ -702,14 +709,17 @@ class SettingsPage(tk.Frame):
         mapping = cfg.get("xray_routes")
         if not isinstance(mapping, dict):
             mapping = {}
-        loaded: dict[str, str] = {}
-        for raw, route in mapping.items():
-            name = routes.normalize_user_domain(raw)
-            if name and str(route) in ("direct", "proxy"):
-                loaded[name] = str(route)
-        if self._saved_rules is None or self.rules == self._saved_rules:
+        # Читаем обе схемы: строку и объект с сервером. Раньше здесь был
+        # фильтр по ``str(route) in ("direct", "proxy")``, и правило v2
+        # отбрасывалось — открытие настроек молча стирало сервер.
+        loaded_map = routes.normalise_routes(mapping)
+        loaded = {name: info["route"] for name, info in loaded_map.items()}
+        loaded_servers = {name: info["server"] for name, info in loaded_map.items()}
+        if self._saved_rules is None or not self._routes_dirty():
             self.rules = loaded
             self._saved_rules = dict(loaded)
+            self.rule_servers = dict(loaded_servers)
+            self._saved_rule_servers = dict(loaded_servers)
         # иначе на экране есть несохранённые правки — их не выкидываем
         self._blocked_busy = False
         self._blocked_result = None
@@ -864,6 +874,8 @@ class SettingsPage(tk.Frame):
             self._route_feedback("Такое правило уже есть", self.theme.warn)
             return
         self.rules[domain] = route
+        # Новое правило — всегда «Текущий»: сервер выбирают отдельно.
+        self.rule_servers.pop(domain, None)
         self._route_feedback("Правило обновлено" if current else "Добавлено",
                              self.theme.ok)
         self.route_var.set("")
@@ -874,6 +886,9 @@ class SettingsPage(tk.Frame):
         if route not in ("direct", "proxy") or self.rules.get(domain) == route:
             return
         self.rules[domain] = route
+        if route == "direct":
+            # Напрямую сервер не нужен: правило остаётся без него и в файле.
+            self.rule_servers.pop(domain, None)
         self._route_feedback("Изменения применятся после «Сохранить»",
                              self.theme.text_faint)
         self._render_rules()
@@ -884,7 +899,40 @@ class SettingsPage(tk.Frame):
             return
         self._set_rule(domain, "proxy" if current == "direct" else "direct")
 
+    def _server_options(self, current: str | None = None) -> list[tuple[str, str]]:
+        """Варианты выбора сервера: «Текущий» и сохранённый список.
+
+        Источник тот же, что у панели (``xray.cached_servers``): без сети и
+        без повторного опроса подписки. Пустой список — только «Текущий».
+        `current` добавляется, если его нет в кеше: сервер мог уйти из
+        подписки, но правило помнит его имя — показывать «Текущий» было бы
+        враньём.
+        """
+        names: list[str] = []
+        for row in xray.cached_servers() or []:
+            name = str((row or {}).get("name") or "").strip()
+            if name and name not in names:
+                names.append(name)
+        wanted = str(current or "").strip()
+        if wanted and wanted not in names:
+            names.append(wanted)
+        return [("", "Текущий")] + [(name, name) for name in names]
+
+    def _set_rule_server(self, domain: str, value: str) -> None:
+        """Сервер proxy-правила; пустое значение — «Текущий».
+
+        Список не перерисовываем: плашка уже показывает выбор, а ``_render_rules``
+        уничтожил бы контрол прямо внутри его же обработчика.
+        """
+        server = value.strip() or None
+        if self.rule_servers.get(domain) == server:
+            return
+        self.rule_servers[domain] = server
+        self._route_feedback("Изменения применятся после «Сохранить»",
+                             self.theme.text_faint)
+
     def _delete_rule(self, domain: str) -> None:
+        self.rule_servers.pop(domain, None)
         if self.rules.pop(domain, None) is None:
             return
         self._route_feedback("Удалено", self.theme.text_faint)
@@ -925,6 +973,22 @@ class SettingsPage(tk.Frame):
                 route, command=lambda value, d=domain: self._set_rule(d, value),
                 bg=theme.card, height=ROW_CONTROL_HEIGHT, width=176)
             segment.pack(side="left", padx=(SPACE["sm"], SPACE["sm"]))
+            # Сервер — только для proxy: напрямую он не нужен. Место под
+            # контрол занимаем всегда, иначе строки прыгают по ширине.
+            if route == "proxy":
+                picker = Dropdown(
+                    row, theme,
+                    self._server_options(self.rule_servers.get(domain)),
+                    self.rule_servers.get(domain),
+                    command=lambda value, d=domain: self._set_rule_server(d, value),
+                    bg=theme.card, height=ROW_CONTROL_HEIGHT, width=132)
+                picker.pack(side="left", padx=(0, SPACE["sm"]))
+                Tooltip(picker, "Сервер для этого сайта")
+            else:
+                spacer = tk.Frame(row, bg=theme.card, width=132,
+                                  height=ROW_CONTROL_HEIGHT)
+                spacer.pack(side="left", padx=(0, SPACE["sm"]))
+                spacer.pack_propagate(False)
             remove = PillButton(row, theme, "Удалить",
                                 lambda d=domain: self._delete_rule(d),
                                 kind="ghost", height=ROW_CONTROL_HEIGHT,
@@ -1067,7 +1131,8 @@ class SettingsPage(tk.Frame):
             self.routing_segment.get())
         cfg["blocked_list_enabled"] = bool(self.blocked_toggle.get())
         cfg["youtube_via_vpn"] = bool(self.toggles["youtube"].get())
-        cfg["xray_routes"] = dict(self.rules)
+        cfg["xray_routes"] = routes.routes_payload(self.rules,
+                                                   self.rule_servers)
         # Старые списки не обнуляем в никуда: их значения становятся правилами.
         _merge_legacy_routes(cfg)
         cfg["zapret_dir"] = self.vars["zapret_dir"].get().strip()
@@ -1078,6 +1143,7 @@ class SettingsPage(tk.Frame):
             return False
         self.controller.cfg = cfg
         self._saved_rules = dict(self.rules)
+        self._saved_rule_servers = dict(self.rule_servers)
         # Перечитываем тумблеры/поля из сохранённого cfg: старые галочки
         # не должны оставаться после смены настроек.
         self.reload()

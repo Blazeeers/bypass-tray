@@ -221,34 +221,58 @@ def all() -> dict:
     return networks if isinstance(networks, dict) else {}
 
 
-def strategy_for(key: str) -> str:
-    """Какая стратегия zapret работала в этой сети (пусто — неизвестно).
+def _record(key: str) -> dict:
+    """Запись сети: прямо по ключу, иначе по сохранённому в ней шлюзу.
 
-    Кроме прямого совпадения ключа ищем запись по сохранённому шлюзу: старые
-    версии писали ключом MAC, а он сразу после загрузки пуст — тогда шлюз
-    лежал внутри записи, и стратегия всё равно находится.
+    Старые версии писали ключом MAC, а он сразу после загрузки пуст — тогда
+    шлюз лежал внутри записи, и найденное по нему подходит для чтения.
     """
     networks = all()
     info = networks.get(key)
-    if not isinstance(info, dict):
-        info = {}
-    if not info:
-        for saved in networks.values():
-            if isinstance(saved, dict) and str(saved.get("gateway") or "") == key:
-                info = saved
-                break
-    return str(info.get("bat") or "")
+    if isinstance(info, dict) and info:
+        return info
+    for saved in networks.values():
+        if isinstance(saved, dict) and str(saved.get("gateway") or "") == key:
+            return saved
+    return {}
 
 
-def remember(key: str, bat: str, info: dict | None = None) -> None:
-    """Запоминает стратегию для сети. ``info`` — словарь из ``current()``."""
+def strategy_for(key: str) -> str:
+    """Какая стратегия zapret работала в этой сети (пусто — неизвестно)."""
+    return str(_record(key).get("bat") or "")
+
+
+def server_for(key: str) -> str:
+    """Какой сервер запомнен за этой сетью (пусто — не выбран).
+
+    Старые записи поля не имеют и читаются как «сервер не выбран».
+    """
+    return str(_record(key).get("server") or "")
+
+
+def remember(key: str, bat: str, info: dict | None = None,
+             server: str | None = None) -> None:
+    """Запоминает стратегию и сервер для сети. ``info`` — из ``current()``.
+
+    ``server=None`` — не трогать уже сохранённый сервер: подбор стратегии
+    зовёт ``remember`` без него и не должен стирать выбор человека. Пустая
+    строка сервер очищает.
+    """
     if not key:
         return
     networks = all()
     source = info or {}
     gateway = str(source.get("gateway") or "")
+    previous = networks.get(key)
+    if not isinstance(previous, dict):
+        previous = {}
+    if server is None:
+        saved_server = str(previous.get("server") or "")
+    else:
+        saved_server = str(server or "").strip()
     networks[key] = {
         "bat": str(bat or ""),
+        "server": saved_server,
         "at": time.time(),
         "ssid": str(source.get("ssid") or ""),
         "gateway": gateway,

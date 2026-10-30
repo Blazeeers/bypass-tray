@@ -320,6 +320,7 @@ class TrayApp:
                 self.server_selected = raw_name
                 activity.log(f"выбрал сервер: {raw_name}", kind="ok")
                 self.refresh_activity()
+                self._remember_network_server(raw_name)
                 self.notify(f"Сервер: {raw_name}")
             else:
                 self.proxy = {**self.proxy, "busy": False,
@@ -1296,6 +1297,45 @@ class TrayApp:
             activity.log(f"сеть {net.get('name') or key}: стратегия {saved}")
             self.refresh_activity()
             self._signature = None
+        self._apply_network_server(key, net)
+
+    def _remember_network_server(self, name: str) -> None:
+        """Запоминает сервер за текущей сетью — его применит смена сети."""
+        if not name:
+            return
+        try:
+            net = networks.current()
+            if not net.get("key"):
+                return
+            networks.remember(str(net["key"]), str(self.cfg.get("zapret_bat") or ""),
+                              net, server=name)
+        except OSError:
+            activity.log("не запомнил сервер для сети", kind="warn")
+
+    def _apply_network_server(self, key: str, net: dict) -> None:
+        """Переключает на сервер, запомненный за этой сетью.
+
+        Сервер берётся из списка, который уже есть у панели, — сеть не
+        опрашивается. Переключение перезапускает Xray, поэтому идёт через
+        ``select_server`` (он работает в своём потоке). Сервер, которого нет
+        в списке, не трогаем: иначе смена сети уводила бы туннель на пустое
+        имя. Об этом одно предупреждение в час.
+        """
+        name = networks.server_for(key)
+        if not name or name == str(self.proxy.get("server") or ""):
+            return
+        if self.proxy.get("busy") or self.busy.get("proxy"):
+            return
+        rows = self.servers or xray.cached_servers()
+        if not any(str(row.get("name") or "") == name for row in rows):
+            self._notify_throttled(
+                "net-server",
+                f"сеть {net.get('name') or key}: сервер «{name}» не найден",
+                hours=1.0)
+            return
+        activity.log(f"сеть {net.get('name') or key}: сервер {name}", kind="auto")
+        self.refresh_activity()
+        self.select_server(name)
 
     def check_stream_fallback(self) -> None:
         """Уводит YouTube/Discord в прокси, если zapret не работает.

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import ctypes
+import hashlib
 import json
 import os
 import re
@@ -26,7 +27,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-from . import actions, config
+from . import actions, activity, config
 
 #: Ссылку на подписку каждый указывает свою в config.json — в репозитории её
 #: нет намеренно: это персональный ключ доступа.
@@ -676,12 +677,148 @@ def _config_route_lists(cfg: dict, extra_domains: list[str] | None) -> tuple[lis
     return [d for d in extra if d], [d for d in legacy_direct if d]
 
 
+class BuiltConfig(dict):
+    """Конфиг Xray вместе с итогами сборки.
+
+    Обычный ``dict`` (``json.dumps`` и индексация работают как раньше), у
+    которого есть ``warnings``. ``build_config`` остаётся чистой функцией: в
+    журнал она не пишет, предупреждения возвращает вызывающему.
+    """
+
+    def __init__(self, *args, warnings: list[str] | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.warnings: list[str] = list(warnings or [])
+
+
+def _server_identity(server: dict) -> str:
+    """Чем один сервер отличается от другого: ссылка, иначе адрес с портом."""
+    server = server or {}
+    link = str(server.get("link") or "").strip()
+    if link:
+        return link
+    return f"{server.get('host') or ''}:{server.get('port') or 0}"
+
+
+def _server_tag(server: dict) -> str:
+    """Устойчивый тег outbound: имя слагами плюс хеш опознания сервера.
+
+    Хеш берётся от ссылки (или адреса), а не от порядка правил: тег не
+    меняется, когда правила добавляют, удаляют или переставляют.
+    """
+    server = server or {}
+
+    def slugify(value: str) -> str:
+        return re.sub(r"[^0-9a-zA-Z._-]+", "-", str(value or "")).strip("-.").lower()[:24]
+
+    slug = slugify(server.get("name") or "")
+    if not any(ch.isalpha() for ch in slug):
+        # Кириллическое имя схлопывается в цифры/дефисы: берём хост, он ASCII.
+        slug = slugify(server.get("host") or "") or slug
+    digest = hashlib.sha1(_server_identity(server).encode("utf-8")).hexdigest()[:6]
+    return f"proxy-{slug or 'server'}-{digest}"
+
+
+def _find_server(name: str, servers: list[dict]) -> dict | None:
+    """Сервер из списка по имени: точное совпадение, затем без регистра."""
+    wanted = str(name or "").strip()
+    if not wanted:
+        return None
+    rows = [row for row in (servers or []) if isinstance(row, dict)]
+    for row in rows:
+        if str(row.get("name") or "").strip() == wanted:
+            return row
+    lowered = wanted.casefold()
+    for row in rows:
+        if str(row.get("name") or "").strip().casefold() == lowered:
+            return row
+    return None
+
+
+def _server_outbound(row: dict) -> dict | None:
+    """Outbound сервера из строки списка: готовый или разобранный из ссылки."""
+    outbound = (row or {}).get("outbound")
+    if isinstance(outbound, dict) and outbound:
+        return dict(outbound)
+    link = str((row or {}).get("link") or "").strip()
+    if not link:
+        return None
+    try:
+        parsed = parse_link(link)
+    except (ValueError, KeyError, TypeError):
+        # Битая ссылка в кеше серверов — не повод не поднять прокси.
+        return None
+    outbound = parsed.get("outbound")
+    return dict(outbound) if isinstance(outbound, dict) else None
+
+
+def _proxy_targets(rules: dict[str, dict], current: dict,
+                   servers: list[dict] | None
+                   ) -> tuple[dict[str, str], dict[str, dict], list[str]]:
+    """Куда вести proxy-правила с указанным сервером.
+
+    Возвращает ``(тег по домену, лишние outbounds по тегу, предупреждения)``.
+    Правила без сервера и правила с текущим сервером сюда не попадают: их
+    ведёт обычный тег ``proxy`` — ровно как до появления схемы v2. Один
+    сервер на несколько правил даёт один outbound: ключ — опознание сервера.
+    """
+    wanted = [(domain, str(info.get("server") or "").strip())
+              for domain, info in (rules or {}).items()
+              if info.get("route") == "proxy" and info.get("server")]
+    if not wanted:
+        return {}, {}, []
+    rows = servers if servers is not None else cached_servers()
+    current_identity = _server_identity(current)
+    tags: dict[str, str] = {}
+    outbounds: dict[str, dict] = {}
+    warnings: list[str] = []
+    resolved: dict[str, dict | None] = {}
+    for domain, name in wanted:
+        if name not in resolved:
+            resolved[name] = _find_server(name, rows)
+        row = resolved[name]
+        outbound = _server_outbound(row) if row is not None else None
+        if row is None or outbound is None:
+            warnings.append(
+                f"правило {domain}: сервер «{name}» не найден — веду через текущий")
+            continue
+        if _server_identity(row) == current_identity:
+            continue
+        tag = _server_tag(row)
+        tags[domain] = tag
+        if tag not in outbounds:
+            outbound["tag"] = tag
+            outbounds[tag] = outbound
+    return tags, outbounds, warnings
+
+
+#: Что уже предупреждали и когда: одна запись в час, чтобы сборка конфига при
+#: каждом запуске не засоряла журнал.
+_WARNED: dict[str, float] = {}
+_WARN_INTERVAL = 3600.0
+
+
+def _warn_once(key: str, text: str) -> None:
+    """Пишет предупреждение в журнал не чаще раза в час."""
+    now = time.time()
+    last = _WARNED.get(key)
+    if last is not None and now - last < _WARN_INTERVAL:
+        return
+    _WARNED[key] = now
+    try:
+        activity.log(text, kind="warn")
+    except OSError:
+        # Журнал — не причина не поднимать прокси.
+        pass
+
+
 def build_config(server: dict, port: int, extra_domains: list[str] | None = None,
                  stream_via_proxy: bool = False,
                  direct_domains: list[str] | None = None,
                  user_routes: dict | None = None,
                  blocked_rule: str | None = None,
-                 routing_mode: str = "blocked") -> dict:
+                 routing_mode: str = "blocked",
+                 servers: list[dict] | None = None,
+                 current_server: dict | None = None) -> dict:
     """Конфиг Xray: локальный прокси + маршрутизация.
 
     Маршрут по умолчанию задаёт **первый outbound** — catch-all правила в
@@ -702,23 +839,29 @@ def build_config(server: dict, port: int, extra_domains: list[str] | None = None
 
     Preset перебивает РФ-direct (среди заблокированных есть российские
     домены), но пользовательские правила и YouTube/Discord остаются выше.
+
+    Правила ``user_routes`` читаются обеих схем: v1 (строка) и v2 (объект с
+    ``server``). Правило proxy со своим сервером получает отдельный outbound
+    с устойчивым тегом, и правило указывает на него. Правила без сервера, с
+    текущим сервером и с неизвестным сервером идут через ``proxy`` — как
+    раньше. ``servers`` — список серверов (по умолчанию ``cached_servers()``),
+    ``current_server`` — поднятый сейчас (по умолчанию ``server``).
+    Неизвестный сервер попадает в ``BuiltConfig.warnings``, а не в журнал:
+    писать их — дело вызывающего.
     """
     from . import routes
 
     mode = config.normalise_routing_mode(routing_mode)
 
-    user_direct: list[str] = []
-    user_proxy: list[str] = []
-    for raw, route in (user_routes or {}).items():
-        name = routes.normalize_user_domain(raw)
-        if not name:
-            continue
-        if str(route) == "direct" and name not in user_direct:
-            user_direct.append(name)
-        elif str(route) == "proxy" and name not in user_proxy:
-            user_proxy.append(name)
-    # Один и тот же домен не может быть в двух правилах: direct важнее.
-    user_proxy = [name for name in user_proxy if name not in set(user_direct)]
+    rules_map = routes.normalise_routes(user_routes or {})
+    user_direct = [name for name, info in rules_map.items()
+                   if info["route"] == "direct"]
+    user_proxy = [name for name, info in rules_map.items()
+                  if info["route"] == "proxy"]
+    # «Через кого» для proxy-правил со своим сервером: тег по домену плюс
+    # отдельные outbounds. Пусто — всё через текущий сервер, как раньше.
+    proxy_tags, extra_outbounds, warnings = _proxy_targets(
+        rules_map, current_server or server, servers)
 
     proxy_domains = list(PROXY_DOMAINS)
     if stream_via_proxy:
@@ -758,10 +901,15 @@ def build_config(server: dict, port: int, extra_domains: list[str] | None = None
             "domain": [_domain_rule(d) for d in user_direct],
         })
     if user_proxy:
-        rules.append({
-            "type": "field", "outboundTag": "proxy",
-            "domain": [_domain_rule(d) for d in user_proxy],
-        })
+        groups: dict[str, list[str]] = {}
+        for name in user_proxy:
+            groups.setdefault(proxy_tags.get(name, "proxy"), []).append(name)
+        # "proxy" первым: он и стоял здесь до схемы v2, приоритет не меняется.
+        for tag in sorted(groups, key=lambda item: (item != "proxy", item)):
+            rules.append({
+                "type": "field", "outboundTag": tag,
+                "domain": [_domain_rule(d) for d in groups[tag]],
+            })
     if audit_direct:
         rules.append({
             "type": "field", "outboundTag": "direct",
@@ -792,7 +940,7 @@ def build_config(server: dict, port: int, extra_domains: list[str] | None = None
         "type": "field", "outboundTag": "proxy",
         "domain": [_domain_rule(d) for d in proxy_keys],
     })
-    return {
+    built = {
         "log": {"loglevel": "warning", "access": "none"},
         "inbounds": [{
             "tag": "in",
@@ -805,20 +953,30 @@ def build_config(server: dict, port: int, extra_domains: list[str] | None = None
         # ВАЖНО: первый outbound — маршрут по умолчанию. В "blocked" это
         # `direct`, в "all" — сервер: явные правила выше в списке всё равно
         # отправляют РФ/private и пользовательские direct напрямую.
-        "outbounds": _ordered_outbounds(server, mode),
+        "outbounds": _ordered_outbounds(
+            server, mode,
+            [extra_outbounds[tag] for tag in sorted(extra_outbounds)]),
         "routing": {
             "domainStrategy": "IPIfNonMatch",
             "rules": rules,
         },
     }
+    return BuiltConfig(built, warnings=warnings)
 
 
-def _ordered_outbounds(server: dict, mode: str) -> list[dict]:
-    """Outbounds с маршрутом по умолчанию первым (catch-all правила нет)."""
+def _ordered_outbounds(server: dict, mode: str,
+                       extra: list[dict] | None = None) -> list[dict]:
+    """Outbounds с маршрутом по умолчанию первым (catch-all правила нет).
+
+    ``extra`` — серверы из правил «домен → свой сервер»: они идут после
+    текущего и до ``block``, поэтому первый outbound остаётся маршрутом по
+    умолчанию, а порядок direct/прочего не меняется.
+    """
     direct = {"tag": "direct", "protocol": "freedom"}
     proxy = server["outbound"]
     order = [proxy, direct] if mode == "all" else [direct, proxy]
-    return order + [{"tag": "block", "protocol": "blackhole"}]
+    return order + list(extra or []) + [
+        {"tag": "block", "protocol": "blackhole"}]
 
 
 def _normalise_domains(values: list[str] | None) -> list[str]:
@@ -1224,10 +1382,12 @@ def _start(cfg: dict | None = None, extra_domains: list[str] | None = None,
     blocked_rule, blocked_ok = _blocked_preset(cfg)
     mode = config.normalise_routing_mode(cfg.get("routing_mode"))
     config_path = config.config_dir() / "xray-config.json"
-    payload = json.dumps(build_config(server, port, extra, stream,
-                                      direct_all, user_map, blocked_rule,
-                                      mode),
-                         ensure_ascii=False, indent=2)
+    built = build_config(server, port, extra, stream, direct_all, user_map,
+                         blocked_rule, mode, servers=cached_servers(),
+                         current_server=server)
+    for warning in built.warnings:
+        _warn_once(warning, warning)
+    payload = json.dumps(built, ensure_ascii=False, indent=2)
     config.atomic_write(config_path, payload)
     try:
         written = config_path.read_text(encoding="utf-8")
@@ -1409,12 +1569,19 @@ def scan_servers(timeout: float = 5.0) -> list[dict]:
 
 
 def cached_servers() -> list[dict]:
-    """Сохранённый список серверов (без обращения к сети)."""
+    """Сохранённый список серверов (без обращения к сети).
+
+    Валидный JSON не того вида (``[]``, строка) раньше ронял ``.get``: файл
+    правят руками, а список теперь нужен и сборке конфига.
+    """
     try:
         data = json.loads(servers_path().read_text(encoding="utf-8"))
-        return data.get("servers") or []
     except (OSError, ValueError):
         return []
+    rows = data.get("servers") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
 
 
 def verify(target: str = "www.instagram.com", timeout: float = 10.0) -> dict:

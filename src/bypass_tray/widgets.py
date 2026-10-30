@@ -699,6 +699,153 @@ class Segmented(tk.Canvas):
                              font=self._font, fill=color)
 
 
+class Dropdown(tk.Canvas):
+    """Компактный выбор из списка: плашка с текущим значением и выпадающий список.
+
+    Нужен там, где вариантов много (серверы подписки) и ``Segmented`` уже не
+    помещается. Плашка рисуется тем же треком, что и ``Segmented``; список —
+    отдельным окном без рамки в цветах карточки, потому что ``tk.Menu`` на
+    Windows игнорирует цвета темы и выбивается из окна.
+    """
+
+    WIDTH = 132
+
+    def __init__(self, master: tk.Misc, theme: Theme, items: list[tuple[str, str]],
+                 value: str | None = None, command=None, bg: str | None = None,
+                 height: int = 30, width: int = WIDTH, placeholder: str = "—"):
+        self.theme = theme
+        self._items = [(str(key), str(label)) for key, label in items]
+        keys = [key for key, _label in self._items]
+        self._value = str(value) if value is not None and str(value) in keys \
+            else (keys[0] if keys else "")
+        self.command = command
+        self._bg = bg or theme.card
+        self._height = int(height)
+        self._width = int(width)
+        self._placeholder = placeholder
+        self._hover = False
+        self._popup: tk.Toplevel | None = None
+        self._font = theme.body()
+        super().__init__(master, width=self._width, height=self._height,
+                         bg=self._bg, highlightthickness=0, bd=0, cursor="hand2")
+        self.bind("<Button-1>", self._toggle)
+        self.bind("<Enter>", lambda _event: self._set_hover(True))
+        self.bind("<Leave>", lambda _event: self._set_hover(False))
+        self.bind("<Destroy>", self._on_destroy)
+        self._draw()
+
+    # ---- значение ------------------------------------------------------
+    def get(self) -> str:
+        return self._value
+
+    def set(self, value: str, notify: bool = False) -> None:
+        value = str(value)
+        if value not in [key for key, _label in self._items] or value == self._value:
+            return
+        self._value = value
+        self._draw()
+        if notify and self.command is not None:
+            self.command(value)
+
+    def _label(self) -> str:
+        for key, label in self._items:
+            if key == self._value:
+                return label
+        return self._placeholder
+
+    # ---- отрисовка -----------------------------------------------------
+    def _set_hover(self, value: bool) -> None:
+        if self._hover != value:
+            self._hover = value
+            self._draw()
+
+    def _draw(self) -> None:
+        self.delete("all")
+        theme = self.theme
+        width, height = self._width, self._height
+        rounded_rect(self, 1, 1, width - 1, height - 1, (height - 2) / 2,
+                     fill=theme.btn_hover if self._hover else theme.btn,
+                     outline=theme.btn_border)
+        label = self._label()
+        # Плашка узкая: длинное имя сервера обрезаем, полное — в подсказке.
+        if len(label) > 18:
+            label = label[:17].rstrip() + "…"
+        self.create_text(10, height / 2, text=label, anchor="w",
+                         font=self._font, fill=theme.text)
+        _chevron(self, width - 13, height / 2, 8, theme.text_dim, down=True)
+
+    # ---- выпадающий список ---------------------------------------------
+    def _toggle(self, _event=None) -> None:
+        if self._popup is not None:
+            self._close()
+            return
+        self._open()
+
+    def _open(self) -> None:
+        if not self._items:
+            return
+        theme = self.theme
+        try:
+            popup = tk.Toplevel(self)
+        except tk.TclError:
+            return
+        popup.overrideredirect(True)
+        popup.configure(bg=theme.btn_border)
+        columns = 1 if len(self._items) <= 14 else 2
+        rows = (len(self._items) + columns - 1) // columns
+        body = tk.Frame(popup, bg=theme.btn)
+        body.pack(padx=1, pady=1)
+        for index, (key, label) in enumerate(self._items):
+            selected = key == self._value
+            row = tk.Label(
+                body, text=label, bg=theme.btn,
+                fg=theme.accent if selected else theme.text,
+                font=theme.body("bold") if selected else theme.body(),
+                anchor="w", justify="left", padx=10, pady=4,
+                width=16 if columns > 1 else 0)
+            row.grid(row=index % max(rows, 1), column=index // max(rows, 1),
+                     sticky="ew")
+            row.bind("<Enter>", lambda _event, widget=row:
+                     widget.configure(bg=theme.btn_hover))
+            row.bind("<Leave>", lambda _event, widget=row:
+                     widget.configure(bg=theme.btn))
+            row.bind("<Button-1>", lambda _event, name=key: self._choose(name))
+        popup.update_idletasks()
+        popup_w = popup.winfo_reqwidth()
+        popup_h = popup.winfo_reqheight()
+        x = self.winfo_rootx()
+        y = self.winfo_rooty() + self.winfo_height() + 2
+        # Окно не должно уходить за край экрана: при нехватке места снизу
+        # список раскрывается вверх.
+        if y + popup_h > self.winfo_screenheight():
+            y = max(0, self.winfo_rooty() - popup_h - 2)
+        x = min(x, max(0, self.winfo_screenwidth() - popup_w - 4))
+        popup.geometry(f"+{int(x)}+{int(y)}")
+        popup.bind("<Escape>", lambda _event: self._close())
+        popup.bind("<FocusOut>", lambda _event: self._close())
+        self._popup = popup
+        try:
+            popup.focus_force()
+        except tk.TclError:
+            pass
+
+    def _choose(self, value: str) -> None:
+        self.set(value, notify=True)
+        self._close()
+
+    def _close(self) -> None:
+        popup, self._popup = self._popup, None
+        if popup is not None:
+            try:
+                popup.destroy()
+            except tk.TclError:
+                pass
+
+    def _on_destroy(self, event) -> None:
+        if event.widget is self:
+            self._close()
+
+
 class ToggleSwitch(tk.Canvas):
     """Тумблер: дорожка 40×22, кружок 18, плавный переезд за 128 мс.
 
