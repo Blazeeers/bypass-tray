@@ -822,7 +822,7 @@ class SettingsPage(tk.Frame):
                     cfg.get("routing_mode")))
             theme_segment = getattr(self, "theme_segment", None)
             if theme_segment is not None:
-                theme_segment.set(config.theme_mode_of(cfg))
+                theme_segment.set(self._theme_mode_now())
             self.vars["zapret_dir"].set(_text_value(cfg, "zapret_dir"))
             self.vars["tgws_exe"].set(_text_value(cfg, "tgws_exe"))
             self._set_links(_links_text(cfg))
@@ -900,6 +900,19 @@ class SettingsPage(tk.Frame):
         self._refresh_preset_chips()
 
     # ---- тема --------------------------------------------------------------
+    def _theme_mode_now(self) -> str:
+        """Режим темы, в котором панель находится сейчас.
+
+        Читаем панель, а не конфиг: живой предпросмотр перекрашивает окно
+        сразу, а в конфиг попадает только после «Сохранить». Иначе сегмент
+        показывал бы сохранённое значение при уже другой теме на экране.
+        """
+        panel = getattr(self.controller, "panel", None)
+        mode_of = getattr(panel, "theme_mode", None)
+        if callable(mode_of):
+            return config.normalise_theme_mode(mode_of())
+        return config.theme_mode_of(self.controller.cfg or {})
+
     def _preview_theme(self, mode: str) -> None:
         """Живой предпросмотр: панель перекрашивается, конфиг не трогается."""
         panel = getattr(self.controller, "panel", None)

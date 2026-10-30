@@ -60,18 +60,20 @@ def blend(foreground: str, background: str, alpha: float) -> str:
 
 
 def soft_shadow(canvas: tk.Canvas, x1: float, y1: float, x2: float, y2: float,
-                radius: float, theme: Theme, base: str, steps: int = 3,
-                spread: float = 3.0, tags: str = "shadow") -> None:
+                radius: float, theme: Theme, base: str, steps: int = 4,
+                spread: float = 4.0, tags: str = "shadow") -> None:
     """Мягкая тень: несколько полупрозрачных слоёв (у Tk нет alpha).
 
     Каждый следующий слой ближе к фигуре и темнее, поэтому край выглядит
     размытым. Рисуется до самой фигуры — она перекроет внутренние слои.
+    Прозрачность слоёв не выше 10 % (макет): резче тень читалась бы как
+    вторая рамка, а не как тень.
     """
     for step in range(steps, 0, -1):
         grow = spread * step / steps
-        # 0.10 у внешнего слоя … 0.30 у внутреннего: на 1-2 пикселях разница
-        # с фоном иначе не читается и тень выглядит отсутствующей.
-        alpha = 0.10 + 0.10 * (steps - step)
+        # 2.5 % у внешнего слоя … 10 % у внутреннего: на широком размытии
+        # разница с фоном иначе не читается и тень выглядит отсутствующей.
+        alpha = 0.025 + 0.075 * (steps - step) / max(1, steps - 1)
         color = blend(theme.shadow, base, alpha)
         rounded_rect(canvas, x1 - grow, y1 - grow + 1, x2 + grow, y2 + grow + 1,
                      radius + grow, fill=color, outline="", tags=tags)
@@ -389,6 +391,46 @@ class PillButton(tk.Canvas):
             cx = width / 2 + (index - 1) * step
             self.create_oval(cx - radius, middle - radius, cx + radius,
                              middle + radius, fill=color, outline="")
+
+
+class ActionTile(PillButton):
+    """Ячейка панели действий: иконка сверху, подпись снизу.
+
+    Наследник ``PillButton`` намеренно: снаружи это та же кнопка —
+    ``set_text``, ``set_command``, ``set_enabled``, ``_on_click`` и признак
+    ``_text`` (по нему панель и проверки находят «Проверить всё»). Отличается
+    только отрисовка: скруглённый прямоугольник во всю ячейку и иконка над
+    подписью, а не «таблетка» с текстом в центре.
+    """
+
+    #: Центр иконки от верха ячейки, пиксели.
+    ICON_Y = 19
+    #: Отступ подписи от низа ячейки, пиксели.
+    TEXT_BOTTOM = 16
+
+    def __init__(self, master: tk.Misc, theme: Theme, text: str, command,
+                 icon, kind: str = "ghost", **kwargs):
+        self.icon = icon
+        super().__init__(master, theme, text, command, kind=kind,
+                         pad_x=SPACE["sm"], **kwargs)
+
+    def _render(self) -> None:
+        self.delete("all")
+        fill, border, fg = self._palette()
+        width = self._last_width if self._last_width > 1 else self.winfo_reqwidth()
+        width = max(int(width), 1)
+        height = self._height
+        self.configure(bg=self._bg)
+        rounded_rect(self, 1, 1, width - 1, height - 1, RADIUS["md"],
+                     fill=fill, outline=border)
+        if self._loading:
+            self._draw_spinner(width, height, fg, fill)
+            return
+        offset = 1 if self._pressed else 0
+        if self.icon is not None:
+            self.create_image(width / 2, self.ICON_Y + offset, image=self.icon)
+        self.create_text(width / 2, height - self.TEXT_BOTTOM + offset,
+                         text=self._text, font=self._font, fill=fg)
 
 
 class Divider(tk.Frame):

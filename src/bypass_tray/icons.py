@@ -155,20 +155,46 @@ def make_icon(state: str, color: str, size: int = 64) -> Image.Image:
 # ---- иконки панели --------------------------------------------------------
 
 
+def _gear_contour(center: float, radius: float, teeth: int = 8,
+                  root: float = 0.74) -> list[tuple[float, float]]:
+    """Замкнутый зубчатый контур шестерёнки.
+
+    Восемь зубцов: площадка на внешнем радиусе, скосы и дуга впадины на
+    ``root`` от внешнего радиуса. Раньше шестерёнка рисовалась кругом с
+    восемью лучами — при 20 px это читалось как солнце.
+    """
+    points: list[tuple[float, float]] = []
+    sector = 2 * math.pi / teeth
+    for index in range(teeth):
+        start = sector * index
+        # Впадина → левый скос → площадка зуба → правый скос.
+        for offset, scale in ((0.0, root), (0.16, 1.0), (0.40, 1.0),
+                              (0.56, root)):
+            angle = start + sector * offset
+            points.append((center + radius * scale * math.cos(angle),
+                           center + radius * scale * math.sin(angle)))
+        # Дуга впадины до начала следующего зуба.
+        for step in range(1, 3):
+            angle = start + sector * (0.56 + 0.44 * step / 2)
+            points.append((center + radius * root * math.cos(angle),
+                           center + radius * root * math.sin(angle)))
+    return points
+
+
 def _panel_gear(draw: ImageDraw.ImageDraw, big: int, color: str, width: int) -> None:
-    box = (big * 0.22, big * 0.22, big * 0.78, big * 0.78)
-    draw.ellipse(box, outline=color, width=width)
-    teeth = max(2, int(width * 0.9))
-    for index in range(8):
-        angle = math.pi * index / 4
-        x1 = big * (0.5 + 0.29 * math.cos(angle))
-        y1 = big * (0.5 + 0.29 * math.sin(angle))
-        x2 = big * (0.5 + 0.44 * math.cos(angle))
-        y2 = big * (0.5 + 0.44 * math.sin(angle))
-        draw.line((x1, y1, x2, y2), fill=color, width=teeth)
-    dot = 0.05 * big
-    draw.ellipse((big * 0.5 - dot, big * 0.5 - dot,
-                  big * 0.5 + dot, big * 0.5 + dot), fill=color)
+    """Шестерёнка: зубчатый контур и круглое отверстие по центру.
+
+    Штрих здесь свой, а не общий ``width``: макет просит 2 px при 20 px, то
+    есть ровно десятую часть размера. Общая толщина (8.5 %) на этом контуре
+    с восемью зубцами сливала бы впадины.
+    """
+    stroke = max(2, round(big * 0.10))
+    center = big / 2
+    contour = _gear_contour(center, big * 0.46)
+    draw.line(contour + [contour[0]], fill=color, width=stroke, joint="curve")
+    hole = big * 0.17
+    draw.ellipse((center - hole, center - hole, center + hole, center + hole),
+                 outline=color, width=stroke)
 
 
 def _panel_refresh(draw: ImageDraw.ImageDraw, big: int, color: str, width: int) -> None:
@@ -181,7 +207,7 @@ def panel_icon(name: str, color: str, size: int = 20) -> Image.Image:
     """Иконка панели на прозрачном фоне: ``name`` из списка ниже.
 
     shield, zap, youtube, discord, spark, telegram, update, check, warning,
-    gear, chevron, clock, refresh.
+    gear, chevron, clock, refresh, moon, sun, list, route, download.
     """
     big = size * _SCALE
     image = Image.new("RGBA", (big, big), (0, 0, 0, 0))
@@ -255,6 +281,43 @@ def panel_icon(name: str, color: str, size: int = 20) -> Image.Image:
                   fill=color, width=width)
     elif name == "refresh":
         _panel_refresh(draw, big, color, width)
+    elif name == "moon":
+        # Полумесяц: круг минус смещённый круг (альфа-маска Tk не умеет).
+        mask = Image.new("L", (big, big), 0)
+        mask_draw = ImageDraw.Draw(mask)
+        mask_draw.ellipse((big * 0.10, big * 0.08, big * 0.90, big * 0.88), fill=255)
+        mask_draw.ellipse((big * 0.36, big * 0.00, big * 1.16, big * 0.74), fill=0)
+        image.paste(Image.new("RGBA", (big, big), color), (0, 0), mask)
+    elif name == "sun":
+        radius = 0.17
+        draw.ellipse((big * (0.5 - radius), big * (0.5 - radius),
+                      big * (0.5 + radius), big * (0.5 + radius)),
+                     outline=color, width=width)
+        for dx, dy in ((0, -1), (0, 1), (-1, 0), (1, 0),
+                       (0.7, -0.7), (0.7, 0.7), (-0.7, -0.7), (-0.7, 0.7)):
+            draw.line((big * (0.5 + dx * 0.29), big * (0.5 + dy * 0.29),
+                       big * (0.5 + dx * 0.44), big * (0.5 + dy * 0.44)),
+                      fill=color, width=width)
+    elif name == "list":
+        for row in (0.26, 0.5, 0.74):
+            draw.ellipse((big * 0.10, big * (row - 0.05),
+                          big * 0.20, big * (row + 0.05)), fill=color)
+            draw.line((big * 0.30, big * row, big * 0.90, big * row),
+                      fill=color, width=width)
+    elif name == "route":
+        draw.line(_points(big, [(0.18, 0.84), (0.5, 0.20), (0.82, 0.84)]),
+                  fill=color, width=width, joint="curve")
+        for cx, cy in ((0.18, 0.84), (0.82, 0.84)):
+            r = 0.08
+            draw.ellipse((big * (cx - r), big * (cy - r),
+                          big * (cx + r), big * (cy + r)), fill=color)
+    elif name == "download":
+        draw.line((big * 0.5, big * 0.10, big * 0.5, big * 0.62),
+                  fill=color, width=width)
+        draw.line(_points(big, [(0.28, 0.44), (0.5, 0.66), (0.72, 0.44)]),
+                  fill=color, width=width, joint="curve")
+        draw.line((big * 0.16, big * 0.88, big * 0.84, big * 0.88),
+                  fill=color, width=width)
     else:
         draw.ellipse((big * 0.2, big * 0.2, big * 0.8, big * 0.8),
                      outline=color, width=width)

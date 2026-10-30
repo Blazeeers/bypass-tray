@@ -45,7 +45,9 @@ from bypass_tray import (  # noqa: E402
 )
 from bypass_tray.app import TrayApp  # noqa: E402
 from bypass_tray.settings_ui import SettingsWindow  # noqa: E402
-from bypass_tray.widgets import AnimatedSection, HoverRow, ToggleSwitch  # noqa: E402
+from bypass_tray.widgets import (  # noqa: E402
+    ActionTile, AnimatedSection, HoverRow, ToggleSwitch,
+)
 from bypass_tray.ui import Panel  # noqa: E402
 
 #: Сетевые проверки включаются только явно.
@@ -375,8 +377,11 @@ def main() -> int:
             time.sleep(0.03)
         labels = widget_texts(root)
         check("заголовок «Обходы»", "Обходы" in labels)
+        # Регистр сменён по макету «B»: подпись идёт обычным предложением
+        # («VPN включён · Финляндия · 51 мс»), а не капсом. Проверка смысла
+        # та же: подзаголовок начинается с состояния VPN.
         check("подзаголовок состояния",
-              any(text.startswith("VPN ВКЛЮЧЁН") for text in labels))
+              any(text.startswith("VPN включён") for text in labels))
         for title in ("zapret · обход DPI", "YouTube", "Discord",
                       "DeepSeek API", "tg-ws-proxy"):
             check(f"строка «{title}»", title in labels)
@@ -399,6 +404,43 @@ def main() -> int:
         check("подвал панели", any(text.startswith("обновлено") for text in labels))
         check("панель отрисована", panel._last_height > 500,
               f"высота {panel._last_height}px")
+
+        # --- вёрстка «B — Дашборд»: плитки, сервисы, журнал, действия ----
+        # Плитки берут числа из тех же данных, что и карточки.
+        vpn_tile = panel._tiles["vpn"]["value"].cget("text")
+        check("плитка VPN: задержка из proxy.latency", vpn_tile == "51 мс",
+              str(vpn_tile))
+        services_tile = panel._tiles["services"]["value"].cget("text")
+        check("плитка «Сервисы»: 5 из 5", services_tile == "5 из 5",
+              str(services_tile))
+        uptime_tile = panel._tiles["uptime"]
+        # Истории за сутки в тестовом каталоге нет: плитка обязана показать
+        # короткое тире кеглем подписи и честную подпись, а не выдуманный
+        # процент. Крупное тире кеглем значения читалось как полоса.
+        check("плитка «Сутки» без истории: тире и «нет данных»",
+              uptime_tile["value"].cget("text") == "–"
+              and uptime_tile["hint"].cget("text") == "нет данных",
+              f"{uptime_tile['value'].cget('text')} / "
+              f"{uptime_tile['hint'].cget('text')}")
+        tiles = list(panel._buttons.values())
+        check("панель действий: 4 ячейки с подписями",
+              len(tiles) == 4
+              and all(isinstance(tile, ActionTile) for tile in tiles)
+              and [tile._text for tile in tiles] == [
+                  "Проверить всё", "Тест стратегий", "Проверить маршруты",
+                  "Обновить подписку"],
+              ", ".join(tile._text for tile in tiles))
+        journal_right = (panel._activity_count.cget("text")
+                         if panel._activity_count is not None else "нет")
+        check("журнал: «последние 3»", journal_right == "последние 3",
+              str(journal_right))
+        # Две колонки: разделитель на месте, а правая ячейка правее левой.
+        left_x = panel._services["zapret"]["cell"].winfo_x()
+        right_x = panel._services["deepseek"]["cell"].winfo_x()
+        check("сервисы: две колонки с разделителем",
+              bool(panel._services_divider.winfo_ismapped()) and right_x > left_x,
+              f"x={left_x}/{right_x}, разделитель "
+              f"{panel._services_divider.winfo_ismapped()}")
 
         origin = (panel._origin_x, panel._origin_y)
         main_height = panel._last_height

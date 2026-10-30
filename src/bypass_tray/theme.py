@@ -3,9 +3,12 @@
 Схема выбирается автоматически по системной теме Windows (светлая/тёмная),
 но её можно зафиксировать в конфиге полем ``theme``: ``auto`` | ``light`` | ``dark``.
 
-Палитра подобрана под контраст WCAG AA: любой текст на своём фоне даёт
-не меньше ``MIN_CONTRAST`` (4.5:1) в обеих схемах. Проверять —
-``contrast_ratio(theme.text_faint, theme.card)``.
+Палитра — макет «B — Дашборд»: тёмная как основная, teal-акцент, приглушённые
+поверхности. Смысловой текст (``text``, ``text_dim``) держит контраст WCAG AA
+не ниже ``MIN_CONTRAST`` (4.5:1) на своём фоне в обеих схемах; проверять —
+``contrast_ratio(theme.text_dim, theme.card)``. Исключение — ``text_faint``:
+это декоративные подписи (11-12 px, дублируют соседний текст), для них
+норма AA не выполняется, поэтому смысловое в них класть нельзя.
 """
 
 from __future__ import annotations
@@ -26,99 +29,103 @@ RADIUS: dict[str, int] = {"sm": 8, "md": 12, "lg": 16}
 
 #: Шкала кеглей в пунктах Tk (1 pt = 1.333 px при 96 DPI):
 #: caption 8pt≈11px, body 9pt≈12px, title 10pt≈13px,
-#: heading 11pt≈15px, display 16pt≈20px.
+#: heading 11pt≈15px, display 16pt≈20px, hero 18pt≈24px,
+#: value 20pt≈27px (крупные числа плиток).
 TYPE: dict[str, int] = {
     "caption": 8,
     "body": 9,
     "title": 10,
     "heading": 11,
     "display": 16,
+    "hero": 18,
+    "value": 20,
 }
 
-#: Светлая схема — фон чуть глубже карточек, чтобы белые карточки читались.
+#: Светлая схема: страница чуть темнее карточек, акцент — тот же teal, но
+#: темнее: на белом ``#2DD4BF`` даёт 2.0:1 и текст на нём не читается.
 LIGHT: dict[str, str] = {
-    "bg": "#E9EDF4",
+    "bg": "#F5F6F8",
     "card": "#FFFFFF",
-    "card_border": "#DCE3ED",
-    "card_hover": "#F4F7FC",
-    "hairline": "#E4EAF2",
-    "header": "#16202C",
-    "header_text": "#FFFFFF",
-    "header_dim": "#A6B6C9",
-    "text": "#101821",
-    "text_dim": "#4F5E73",
-    "text_faint": "#5A6879",
-    "accent": "#2F6FED",
+    "card_border": "#E4E7EC",
+    "card_hover": "#F9FAFB",
+    "hairline": "#EAECF0",
+    "header": "#F5F6F8",
+    "header_text": "#101828",
+    "header_dim": "#667085",
+    "text": "#101828",
+    "text_dim": "#667085",
+    "text_faint": "#98A2B3",
+    "accent": "#0F766E",
     "accent_text": "#FFFFFF",
-    "accent_hover": "#255BC7",
-    "accent_pressed": "#1E4FAE",
-    # Подложка-тон; текст на ней берётся accent_hover: чистый accent на
-    # светло-синем даёт только 4.1:1.
-    "accent_soft": "#EEF4FF",
-    "accent_ink": "#255BC7",
-    "ok": "#0F7A52",
-    "ok_soft": "#E3F5EC",
-    "warn": "#96560A",
-    "warn_soft": "#FBF0DC",
-    "bad": "#B7202A",
-    "bad_soft": "#FBE7E8",
-    "btn": "#F0F3F9",
-    "btn_hover": "#E3E9F3",
-    "btn_border": "#D5DDE9",
-    "btn_text": "#1B2735",
-    "track": "#DFE6EF",
-    "dim": "#5C6A80",
-    "shadow": "#C9D3E1",
-    "shadow_soft": "#DBE2EC",
-    "focus": "#2F6FED",
-    "focus_soft": "#D7E5FD",
-    "overlay": "#0B1220",
-    "skeleton": "#E4EAF2",
+    "accent_hover": "#115E59",
+    "accent_pressed": "#134E4A",
+    # Подложка-тон; текст на ней — accent_ink (тот же accent: 5.5:1 на белом).
+    "accent_soft": "#E7F6F4",
+    "accent_ink": "#0F766E",
+    "ok": "#0F766E",
+    "ok_soft": "#E7F6F4",
+    "warn": "#B54708",
+    "warn_soft": "#FEF3E2",
+    "bad": "#B42318",
+    "bad_soft": "#FEE4E2",
+    "btn": "#F9FAFB",
+    "btn_hover": "#F2F4F7",
+    "btn_border": "#E4E7EC",
+    "btn_text": "#101828",
+    "track": "#E4E7EC",
+    "dim": "#667085",
+    "shadow": "#98A2B3",
+    "shadow_soft": "#D0D5DD",
+    "focus": "#0F766E",
+    "focus_soft": "#D5F0EC",
+    "overlay": "#101828",
+    "skeleton": "#EEF0F3",
 }
 
-#: Тёмная схема.
+#: Тёмная схема — основная.
 DARK: dict[str, str] = {
     "bg": "#0B0F15",
-    "card": "#151B24",
-    "card_border": "#28313E",
-    "card_hover": "#1C2431",
-    "hairline": "#202834",
-    "header": "#070A0E",
-    "header_text": "#EAF0F8",
-    "header_dim": "#8798AC",
-    "text": "#EAF0F8",
-    "text_dim": "#A7B4C6",
-    "text_faint": "#8B99AC",
-    # Белый на #4C8DFF даёт всего 3.2:1, поэтому в тёмной схеме текст
-    # акцентной кнопки тёмный — так он читается (5.9:1) и остаётся в моде.
-    "accent": "#4C8DFF",
-    "accent_text": "#08101E",
-    "accent_hover": "#3C79E6",
-    # Текст акцента в тёмной схеме тёмный, поэтому «нажатие» подсвечивает
-    # заливку (6.9:1); затемнение дало бы 3.6:1.
-    "accent_pressed": "#5E9BFF",
-    "accent_soft": "#16253E",
-    # На тёмно-синей подложке читается сам accent (4.8:1).
-    "accent_ink": "#4C8DFF",
-    "ok": "#4ED0A0",
-    "ok_soft": "#122A21",
-    "warn": "#F2B43C",
-    "warn_soft": "#2C2312",
-    "bad": "#FF8288",
-    "bad_soft": "#331619",
-    "btn": "#1F2733",
-    "btn_hover": "#29323F",
-    "btn_border": "#33404F",
-    "btn_text": "#DCE4EE",
-    "track": "#262F3C",
-    "dim": "#78879A",
-    "shadow": "#05080C",
-    "shadow_soft": "#070B10",
-    "focus": "#7FB0FF",
-    "focus_soft": "#1E3357",
+    "card": "#121A24",
+    "card_border": "#1D2836",
+    "card_hover": "#18222E",
+    "hairline": "#1D2836",
+    # Шапка сливается со страницей, как на макете: отдельной полосы нет.
+    "header": "#0B0F15",
+    "header_text": "#E8EEF5",
+    "header_dim": "#8A98A8",
+    "text": "#E8EEF5",
+    "text_dim": "#8A98A8",
+    # Декоративные подписи: 3.3:1 на карточке — ниже AA, но дублируют текст.
+    "text_faint": "#5E6C7C",
+    # На заливке #2DD4BF белый даёт 2.0:1, поэтому текст кнопки тёмный (9.9:1).
+    "accent": "#2DD4BF",
+    "accent_text": "#04221E",
+    "accent_hover": "#25BFAE",
+    # Текст акцента тёмный, поэтому «нажатие» подсвечивает заливку.
+    "accent_pressed": "#3FE0CE",
+    "accent_soft": "#0F2A28",
+    "accent_ink": "#2DD4BF",
+    "ok": "#2DD4BF",
+    "ok_soft": "#0F2A28",
+    "warn": "#F59E0B",
+    "warn_soft": "#2E2110",
+    "bad": "#F87171",
+    "bad_soft": "#33191B",
+    "btn": "#16202B",
+    "btn_hover": "#1C2836",
+    "btn_border": "#1D2836",
+    "btn_text": "#E8EEF5",
+    "track": "#1D2836",
+    "dim": "#8A98A8",
+    # Тень в тёмной теме светлее фона: тёмное пятно на нём не видно вовсе.
+    "shadow": "#243040",
+    "shadow_soft": "#1A2431",
+    "focus": "#2DD4BF",
+    "focus_soft": "#0F2A28",
     "overlay": "#000000",
-    "skeleton": "#1E2734",
+    "skeleton": "#1A2431",
 }
+
 
 #: Цвета состояний для иконки трея (одинаковы в обеих схемах).
 #: Значения менять нельзя: по ним сверяются иконки, тесты и отчёты health.
@@ -236,6 +243,19 @@ class Theme:
     def display(self, weight: str = "bold") -> tkfont.Font:
         """Крупный заголовок, 20 px."""
         return self.font(TYPE["display"], weight)
+
+    def hero(self, weight: str = "bold") -> tkfont.Font:
+        """Название панели в шапке, 24 px."""
+        return self.font(TYPE["hero"], weight)
+
+    def value(self, weight: str = "bold") -> tkfont.Font:
+        """Крупное число плитки (51 мс, 83%) — semibold, 27 px.
+
+        Tk знает только normal/bold; bold у Segoe UI — ближайшее к semibold,
+        цифры при этом остаются табличными (tabular figures шрифта).
+        """
+        return self.font(TYPE["value"], weight)
+
 
     # -- прочее ------------------------------------------------------------
     def space_of(self, name: str, default: int = SPACE["md"]) -> int:

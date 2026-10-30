@@ -22,10 +22,10 @@ from PIL import ImageTk
 from . import config, diagnose, history, icons, routes
 from .secrets import redact_text
 from .settings_ui import SettingsPage
-from .theme import SPACE, Theme, resolve_dark
+from .theme import SPACE, TYPE, Theme, resolve_dark
 from .widgets import (
-    AnimatedSection, Card, Chip, Divider, HoverRow, IconButton, PillButton,
-    ScrollBody, StatusDot, Tooltip,
+    ActionTile, AnimatedSection, Card, Chip, Divider, HoverRow, IconButton,
+    PillButton, ScrollBody, StatusDot, Tooltip,
 )
 
 WINDOW_W = 720
@@ -62,8 +62,36 @@ SERVICES = (
     ("tgwsproxy", "tg-ws-proxy", "telegram"),
 )
 
+#: Плитки сводки над карточками: ключ → подпись. Порядок — как на макете.
+TILES = (("vpn", "VPN"), ("services", "Сервисы"), ("uptime", "Сутки"))
+
+#: Ширина страницы минус боковые отступы: 720 − 2·24 = 672 (макет «B»).
+PAGE_W = WINDOW_W - 2 * SPACE["xl"]
+
+#: Минимальная ширина плитки: подпись, крупное число и подсказка справа
+#: не должны сжиматься в «…». По ней считается число колонок.
+TILE_MIN_W = 150
+
+#: Минимальная ширина колонки сервиса: имя 15 px, деталь 12 px, точка и
+#: слово состояния справа. Уже — текст начинает наезжать на состояние.
+SERVICE_COL_MIN_W = 220
+
+#: Сколько записей журнала видно на главной (и что написано справа).
+ACTIVITY_ROWS = 3
+ACTIVITY_TITLE_RIGHT = f"последние {ACTIVITY_ROWS}"
+
+#: Прочерк «нет данных» в плитке: короткое тире кеглем подписи. Крупное
+#: тире кеглем значения читалось как полоса-заглушка.
+TILE_NO_DATA = "–"
+
+#: Высота ячейки панели действий и размер её иконки: иконка сверху,
+#: подпись снизу, между ними воздух.
+ACTION_HEIGHT = SPACE["xl"] * 2 + SPACE["sm"]
+ACTION_ICON_SIZE = 18
+
 #: Поля карточки: ширина текста = окно минус отступы карточки.
-CARD_TEXT_WIDTH = WINDOW_W - 4 * SPACE["lg"] - SPACE["sm"]
+CARD_TEXT_WIDTH = (WINDOW_W - 2 * SPACE["xl"] - 2 * SPACE["lg"]
+                   - SPACE["sm"])
 
 #: Режим маршрутизации человеческим языком — та же подпись, что в настройках.
 ROUTING_MODE_TEXT = {
@@ -300,6 +328,8 @@ class Panel:
         #: Выбранный режим темы ("auto" | "light" | "dark") — не цветовые
         #: значения: при ``auto`` тема может поменяться без смены режима.
         self._theme_mode = "auto"
+        #: Режим задан явно (переключением/конфигом): _build его не трогает.
+        self._theme_mode_touched = False
         self._images: list = []
         self._icon_cache: dict[tuple, ImageTk.PhotoImage] = {}
         self._body: ScrollBody | None = None
@@ -320,14 +350,15 @@ class Panel:
         self._settings_visible = False
         self._page_visible = "main"
         self._title: tk.Label | None = None
-        #: Короткий статус рядом с заголовком: цветная точка + фраза.
-        self._status_chip: Chip | None = None
+        #: Короткий статус рядом с заголовком: фраза в цвете состояния.
+        self._state_label: tk.Label | None = None
         self._header_update: IconButton | None = None
         self._header_gear: IconButton | None = None
         self._header_back: IconButton | None = None
         self._header_update_icon: tuple | None = None
         self._header_update_text: str | None = None
-        self._activity_period: tk.Label | None = None
+        #: Подпись «последние 3» справа от заголовка журнала.
+        self._activity_count: tk.Label | None = None
         #: Текст ошибки в подвале: держится до следующего удачного действия.
         self._ui_error = ""
         #: Короткое сообщение в подвале: (текст, до какого момента) — чтобы
@@ -344,19 +375,27 @@ class Panel:
 
         self._vpn: dict = {}
         self._services: dict[str, dict] = {}
+        #: Плитки сводки над карточками: ключ → {card, value, hint}.
+        self._tiles: dict[str, dict] = {}
+        self._tiles_frame: tk.Frame | None = None
+        self._tile_columns_count = 0
+        self._uptime_tip: Tooltip | None = None
         #: Карточка «Что не так»: показывается только при не-ok уровне.
         self._diagnose_card: Card | None = None
         self._diagnose_visible = False
         self._diagnose_key: tuple | None = None
         self._vpn_card: Card | None = None
-        #: Карточки главной, которые прячутся и возвращаются: стабильность
-        #: (нет данных) и журнал (точка возврата для pack(before=...)).
+        #: Карточки главной, которые прячутся и возвращаются: журнал —
+        #: точка возврата для pack(before=...) у карточек сверху.
         self._services_card: Card | None = None
-        self._stability_card: Card | None = None
+        self._actions_card: Card | None = None
         self._activity_card: Card | None = None
-        self._stability_visible = True
-        self._services_summary: tk.Label | None = None
-        self._activity_since: tk.Label | None = None
+        #: Сетка сервисов и её разделитель: пересчитываются по ширине.
+        self._services_grid: tk.Frame | None = None
+        self._services_divider: tk.Frame | None = None
+        self._service_columns_count = 0
+        #: «проверено ЧЧ:ММ» справа от заголовка «Сервисы».
+        self._services_checked: tk.Label | None = None
         self._activity_rows: list[dict] = []
         self._activity_empty: tk.Label | None = None
         self._buttons: dict[str, PillButton] = {}
@@ -396,6 +435,14 @@ class Panel:
         self._settings_visible = True
         self._switch_pages(show_settings=True)
 
+    def theme_mode(self) -> str:
+        """Режим, в котором панель сейчас: ``auto`` | ``light`` | ``dark``.
+
+        Источник — панель, а не конфиг: пока в настройках идёт предпросмотр,
+        они расходятся, и правда о том, что видит пользователь, здесь.
+        """
+        return config.normalise_theme_mode(self._theme_mode)
+
     def set_theme_mode(self, mode: str) -> None:
         """Меняет тему панели на лету: ``auto`` | ``light`` | ``dark``.
 
@@ -406,6 +453,8 @@ class Panel:
         """
         mode = config.normalise_theme_mode(mode)
         self._theme_mode = mode
+        # Режим задан явно — _build больше не перечитывает его из конфига.
+        self._theme_mode_touched = True
         if self._root is None:
             return
         in_ui = self._thread is None or threading.current_thread() is self._thread
@@ -479,6 +528,7 @@ class Panel:
         """
         mode = theme_mode_from_cfg(self.controller.cfg or {})
         self._theme_mode = mode
+        self._theme_mode_touched = True
         theme = Theme(resolve_dark(mode))
         self._theme = theme
         root = tk.Tk()
@@ -542,19 +592,21 @@ class Panel:
         self._footer = None
         self._subtitle = None
         self._title = None
-        self._status_chip = None
+        self._state_label = None
         self._header_update = None
         self._header_gear = None
         self._header_back = None
+        self._header_theme = None
         self._header_update_icon = None
         self._header_update_text = None
-        self._activity_period = None
-        self._activity_since = None
-        self._services_summary = None
+        self._activity_count = None
+        self._services_checked = None
+        self._services_grid = None
+        self._services_divider = None
+        self._service_columns_count = 0
         self._services_card = None
-        self._stability_card = None
+        self._actions_card = None
         self._activity_card = None
-        self._stability_visible = True
         self._ui_error = ""
         self._ui_note = None
         self._update_requested = 0.0
@@ -564,6 +616,10 @@ class Panel:
         self._inflight = set()
         self._vpn = {}
         self._services = {}
+        self._tiles = {}
+        self._tiles_frame = None
+        self._tile_columns_count = 0
+        self._uptime_tip = None
         self._activity_rows = []
         self._activity_empty = None
         self._buttons = {}
@@ -733,6 +789,12 @@ class Panel:
 
     def _build(self, root: tk.Tk, theme: Theme) -> None:
         self._theme = theme
+        if not self._theme_mode_touched:
+            # Панель построена в обход _run (стенд, тесты): режим берём из
+            # конфига, иначе сегмент «Тема» в настройках разойдётся с видом.
+            self._theme_mode = theme_mode_from_cfg(
+                getattr(self.controller, "cfg", {}) or {})
+            self._theme_mode_touched = True
         root.title("Обходы")
         root.configure(bg=theme.bg)
         root.resizable(False, False)
@@ -769,13 +831,11 @@ class Panel:
         # поэтому должна попадаться первой. Пустая не занимает высоту.
         self._build_diagnose()
         self._build_app_update()
-        self._vpn_card = self._card_box()
+        self._build_tiles()
+        self._vpn_card = self._card_box(pad=SPACE["md"])
         self._build_vpn(self._vpn_card.inner)
-        self._services_card = self._card_box()
-        self._build_services(self._services_card.inner)
-        self._stability_card = self._card_box()
-        self._build_stability(self._stability_card.inner)
-        self._activity_card = self._card_box()
+        self._build_services()
+        self._activity_card = self._card_box(pad=SPACE["md"])
         self._build_activity(self._activity_card.inner)
         self._build_actions()
 
@@ -783,7 +843,7 @@ class Panel:
             self._main_page, text="", bg=theme.bg, fg=theme.text_faint,
             font=theme.caption(), anchor="w", justify="left",
         )
-        self._footer.pack(fill="x", padx=SPACE["lg"], pady=(0, SPACE["md"]))
+        self._footer.pack(fill="x", padx=SPACE["xl"], pady=(0, SPACE["md"]))
         # Колесо вешаем один раз на готовое дерево главной; строки серверов
         # пересоздаются в _render_servers и привязываются там.
         self._body.bind_tree()
@@ -803,9 +863,9 @@ class Panel:
     def _card(self) -> tk.Frame:
         return self._card_box().inner
 
-    def _card_box(self) -> Card:
-        card = Card(self._body.inner, self._theme)
-        card.pack(fill="x", padx=SPACE["lg"], pady=(0, SPACE["md"]))
+    def _card_box(self, pad: int | None = None) -> Card:
+        card = Card(self._body.inner, self._theme, pad=pad)
+        card.pack(fill="x", padx=SPACE["xl"], pady=(0, SPACE["md"]))
         return card
 
     # ---- карточка «Что не так» ---------------------------------------------
@@ -874,9 +934,9 @@ class Panel:
             self._diagnose_key = None
             return
         if not self._diagnose_visible:
-            # Показ на прежнее место — над карточкой VPN, а не последней.
-            card.pack(fill="x", padx=SPACE["lg"], pady=(0, SPACE["md"]),
-                      before=self._vpn_card)
+            # Показ на прежнее место — над плитками, а не последней.
+            card.pack(fill="x", padx=SPACE["xl"], pady=(0, SPACE["md"]),
+                      before=self._tiles_frame)
             self._diagnose_visible = True
         color = theme.bad if level == "down" else theme.warn
         facts = " · ".join(str(fact) for fact in (data.get("facts") or []))
@@ -971,28 +1031,158 @@ class Panel:
             facts += f" · установлена {installed}"
         key = (latest, installed)
         if not self._app_update_visible:
-            # Показ на прежнее место — над карточкой VPN.
-            card.pack(fill="x", padx=SPACE["lg"], pady=(0, SPACE["md"]),
-                      before=self._vpn_card)
+            # Показ на прежнее место — над плитками.
+            card.pack(fill="x", padx=SPACE["xl"], pady=(0, SPACE["md"]),
+                      before=self._tiles_frame)
             self._app_update_visible = True
         if key == self._app_update_key:
             return
         self._app_update_key = key
         self._app_update_facts.configure(text=facts)
 
+    # ---- плитки сводки -----------------------------------------------------
+    def _tile_columns_for(self, width: int) -> int:
+        """Сколько плиток влезает в ряд — расчётом по ширине.
+
+        Три плитки требуют ``3·TILE_MIN_W`` плюс два зазора: при 720 px это
+        474 из 672 — влезают с запасом. Дальше число уменьшается шагами,
+        чтобы плитки не сжимались ниже читаемого минимума.
+        """
+        gap = SPACE["md"]
+        columns = len(TILES)
+        while columns > 1 and (columns * TILE_MIN_W + (columns - 1) * gap) > width:
+            columns -= 1
+        return max(1, columns)
+
+    def _build_tiles(self) -> None:
+        """Три плитки сводки: VPN, сервисы, сутки — один ряд под шапкой."""
+        theme = self._theme
+        holder = tk.Frame(self._body.inner, bg=theme.bg)
+        holder.pack(fill="x", padx=SPACE["xl"], pady=(0, SPACE["md"]))
+        self._tiles_frame = holder
+        for key, title in TILES:
+            card = Card(holder, theme, pad=SPACE["md"])
+            caption = tk.Label(card.inner, text=title, bg=theme.card,
+                               fg=theme.text_dim, font=theme.caption(),
+                               anchor="w")
+            caption.pack(fill="x")
+            row = tk.Frame(card.inner, bg=theme.card)
+            row.pack(fill="x", pady=(SPACE["xs"], 0))
+            value = tk.Label(row, text="—", bg=theme.card, fg=theme.text,
+                             font=theme.value(), anchor="w")
+            value.pack(side="left")
+            # Подсказка прижата к низу строки: её строка ниже крупного числа,
+            # и по центру она выглядела бы висящей в воздухе.
+            hint = tk.Label(row, text="", bg=theme.card, fg=theme.text_faint,
+                            font=theme.caption(), anchor="e")
+            hint.pack(side="right", anchor="s", pady=(0, SPACE["xs"] + 2))
+            self._tiles[key] = {"card": card, "value": value, "hint": hint}
+        # Подробности суток в плитку не влезают — они в подсказке.
+        self._uptime_tip = Tooltip(self._tiles["uptime"]["value"], "", theme=theme)
+        holder.bind("<Configure>", self._sync_tile_columns)
+        self._sync_tile_columns()
+
+    def _sync_tile_columns(self, event=None) -> None:
+        """Раскладывает плитки по фактической ширине ряда."""
+        holder = self._tiles_frame
+        if holder is None or not self._tiles:
+            return
+        width = int(getattr(event, "width", 0) or 0)
+        if width <= 1:
+            width = PAGE_W
+        columns = self._tile_columns_for(width)
+        if columns == self._tile_columns_count:
+            return
+        self._tile_columns_count = columns
+        gap = SPACE["md"]
+        for index, (key, _title) in enumerate(TILES):
+            row, column = divmod(index, columns)
+            self._tiles[key]["card"].grid(
+                row=row, column=column, sticky="nsew",
+                padx=(0 if column == 0 else gap, 0),
+                pady=(0 if row == 0 else gap, 0))
+        for column in range(len(TILES)):
+            holder.columnconfigure(
+                column, weight=1 if column < columns else 0,
+                uniform="tile" if column < columns else "")
+
+    def _render_tiles(self, proxy: dict, items: dict, status: dict,
+                      summary: dict) -> None:
+        """Числа плиток — из тех же данных, что и карточки: заглушек нет."""
+        if not self._tiles:
+            return
+        theme = self._theme
+        running = bool(proxy.get("running"))
+        latency = proxy.get("latency")
+        latency_ok = isinstance(latency, int) and latency >= 0
+        name = clean_server_name(proxy.get("server") or "") or "сервер не выбран"
+        vpn = self._tiles["vpn"]
+        vpn["value"].configure(
+            text=f"{latency} мс" if running and latency_ok else "—",
+            fg=theme.text if running else theme.text_faint)
+        vpn["hint"].configure(text=name if running else "не подключён")
+
+        report = getattr(self.controller, "health_report", {}) or {}
+        checked = bool(report.get("checked")) or bool(items)
+        total = len(SERVICES)
+        ok_count = 0
+        for key, _title, _icon_name in SERVICES:
+            item = items.get(key)
+            if item:
+                state = str(item.get("state") or "off")
+            else:
+                state = self._service_fallback(key, status)[0]
+            if state == "ok":
+                ok_count += 1
+        services = self._tiles["services"]
+        if checked:
+            trouble = total - ok_count
+            services["value"].configure(
+                text=f"{ok_count} из {total}",
+                fg=theme.text if not trouble else theme.warn)
+            services["hint"].configure(
+                text="все отвечают" if not trouble else _services_brief(trouble))
+        else:
+            services["value"].configure(text="—", fg=theme.text_faint)
+            services["hint"].configure(text="не проверено")
+
+        stats = _stability_numbers(summary)
+        enough = stats["reports"] >= MIN_STABILITY_REPORTS
+        pct = stats["uptime_pct"]
+        uptime = self._tiles["uptime"]
+        if enough and pct is not None:
+            uptime["value"].configure(text=f"{pct}%", font=theme.value(),
+                                      fg=theme.text)
+        else:
+            # Нет данных — тонкое короткое тире кеглем подписи: крупный
+            # прочерк читался как полоса-заглушка, а не как «пусто».
+            uptime["value"].configure(text=TILE_NO_DATA, font=theme.caption(),
+                                      fg=theme.text_faint)
+        if not stats["reports"]:
+            hint = "нет данных"
+        elif not enough:
+            hint = "мало данных"
+        elif stats["incidents"]:
+            incidents = stats["incidents"]
+            hint = f"в сети · {incidents} {_incident_word(incidents)}"
+        else:
+            hint = "в сети · без сбоев"
+        uptime["hint"].configure(text=hint)
+        if self._uptime_tip is not None:
+            self._uptime_tip.set(self._stability_text(summary))
+
     # ---- шапка -------------------------------------------------------------
     def _build_header(self, root: tk.Tk, theme: Theme) -> None:
+        """Название, штрих-разделитель, статус и подпись сервера; справа — иконки.
+
+        Отдельной полосы нет: шапка того же цвета, что страница (макет «B»),
+        поэтому страница читается сверху вниз без шва под заголовком.
+        """
         header = tk.Frame(root, bg=theme.header)
         header.pack(fill="x")
         self._header = header
         inner = tk.Frame(header, bg=theme.header)
-        inner.pack(fill="x", padx=SPACE["lg"], pady=SPACE["md"])
-
-        badge_image = ImageTk.PhotoImage(icons.make_app_icon(44))
-        self._images.append(badge_image)
-
-        badge = tk.Label(inner, image=badge_image, bg=theme.header, bd=0)
-        badge.pack(side="left", padx=(0, SPACE["md"]))
+        inner.pack(fill="x", padx=SPACE["xl"], pady=(SPACE["md"], SPACE["sm"]))
 
         titles = tk.Frame(inner, bg=theme.header)
         titles.pack(side="left", fill="y")
@@ -1000,17 +1190,21 @@ class Panel:
         title_row.pack(anchor="w", fill="x")
         self._title = tk.Label(
             title_row, text="Обходы", bg=theme.header, fg=theme.header_text,
-            font=theme.display(), anchor="w")
+            font=theme.hero(), anchor="w")
         self._title.pack(side="left")
-        # Статус — плашка рядом с названием, а не отдельная строка: короткая
-        # фраза читается сразу, подробности остаются в подзаголовке.
-        self._status_chip = Chip(
-            title_row, theme, "Проверяю…", theme.dim, bg=theme.header)
-        self._status_chip.pack(side="left", padx=(SPACE["sm"], 0),
-                               pady=(SPACE["xs"] - 1, 0))
+        # Штрих 24×4 отделяет название от статуса — так на макете.
+        dash = tk.Frame(title_row, bg=theme.accent, width=24, height=4)
+        dash.pack(side="left", padx=(SPACE["md"], SPACE["md"]))
+        # У Frame без детей размер держится сам, propagate тут не при чём;
+        # пакет выравнивает его по центру строки, как и нужно.
+        # Статус — цветной текст, а не плашка: на макете пилюли нет.
+        self._state_label = tk.Label(
+            title_row, text="Проверяю…", bg=theme.header, fg=theme.dim,
+            font=theme.font(TYPE["title"]), anchor="w")
+        self._state_label.pack(side="left", pady=(SPACE["xs"], 0))
         self._subtitle = tk.Label(
             titles, text="", bg=theme.header, fg=theme.header_dim,
-            font=theme.body(), anchor="w",
+            font=theme.font(TYPE["title"]), anchor="w",
         )
         self._subtitle.pack(anchor="w", pady=(SPACE["xs"], 0))
 
@@ -1026,11 +1220,45 @@ class Panel:
             inner, theme, self._icon("gear", theme.header_dim, 20),
             self._open_settings, tooltip="Настройки", bg=theme.header, size=32,
         )
+        # Луна в тёмной теме, солнце в светлой: иконка — фактическая тема,
+        # а не настройка, поэтому при ``auto`` она тоже честная.
+        dark = bool(getattr(theme, "dark", False))
+        self._header_theme = IconButton(
+            inner, theme, self._icon("moon" if dark else "sun",
+                                     theme.header_dim, 20),
+            self._toggle_theme,
+            tooltip="Светлая тема" if dark else "Тёмная тема",
+            bg=theme.header, size=32,
+        )
         self._header_back.pack(side="right", padx=(0, SPACE["sm"]))
         self._header_update.pack(side="right", padx=(0, SPACE["sm"]))
         self._header_gear.pack(side="right", padx=(0, SPACE["sm"]))
+        self._header_theme.pack(side="right", padx=(0, SPACE["sm"]))
         self._header_back.pack_forget()
         self._set_header_mode("main")
+
+    def _toggle_theme(self) -> None:
+        """Переключатель темы: явный режим и запись в конфиг.
+
+        Иконка показывает фактическую тему (при ``auto`` — ту, что вышла по
+        системе), а клик фиксирует обратный режим явно. Возврат к ``auto``
+        после клика свёл бы выбор на нет — поэтому он и не делается.
+        """
+        mode = "light" if getattr(self._theme, "dark", False) else "dark"
+        cfg = getattr(self.controller, "cfg", None)
+        saved = True
+        if isinstance(cfg, dict):
+            cfg["theme_mode"] = mode
+            saved = config.save_config(cfg)
+        apply_theme = getattr(self.controller, "apply_theme", None)
+        if callable(apply_theme):
+            apply_theme(mode)
+        else:
+            # Контроллер без темы (тесты, заглушки): панель меняется сама.
+            self.set_theme_mode(mode)
+        if not saved:
+            self._flash_note("тема не сохранена: config.json недоступен")
+
     def _set_header_mode(self, mode: str) -> None:
         theme = self._theme
         settings = mode == "settings"
@@ -1038,7 +1266,10 @@ class Panel:
             self._title.configure(text="Настройки" if settings else "Обходы")
         if self._subtitle is not None and settings:
             self._subtitle.configure(text="Подписка, маршруты и компоненты")
-        for button, visible in ((self._header_gear, not settings),
+        # Порядок упаковки = порядок справа налево: переключатель темы
+        # уходит в самый правый угол, как на макете.
+        for button, visible in ((self._header_theme, not settings),
+                                (self._header_gear, not settings),
                                 (self._header_update, not settings),
                                 (self._header_back, settings)):
             if button is None:
@@ -1049,6 +1280,7 @@ class Panel:
                 button.pack_forget()
         if not settings:
             self._render_header_update()
+
 
     def _request_update(self) -> None:
         """Кнопка обновления: запускает работу или честно говорит, что занято."""
@@ -1163,6 +1395,11 @@ class Panel:
         self._settings_visible = False
         self._switch_pages(show_settings=False)
         self._render()
+        # Предпросмотр не сохраняется: без «Сохранить» панель обязана
+        # вернуться к теме из конфига, иначе выбранное висит до перезапуска.
+        mode = theme_mode_from_cfg(getattr(self.controller, "cfg", {}) or {})
+        if mode != self.theme_mode():
+            self.set_theme_mode(mode)
 
     # -- карточка VPN --------------------------------------------------------
     def _build_vpn(self, inner: tk.Frame) -> None:
@@ -1179,17 +1416,22 @@ class Panel:
         titles.pack(side="left", fill="x", expand=True)
         title_row = tk.Frame(titles, bg=theme.card)
         title_row.pack(fill="x")
-        tk.Label(title_row, text="VPN", bg=theme.card, fg=theme.text,
-                 font=theme.title()).pack(side="left")
+        tk.Label(title_row, text="VPN", bg=theme.card, fg=theme.text_dim,
+                 font=theme.caption()).pack(side="left")
         self._vpn["chip"] = Chip(title_row, theme, "выключен", theme.dim)
-        self._vpn["chip"].pack(side="left", padx=(SPACE["sm"], 0),
-                               pady=(SPACE["xs"] // 2, 0))
+        self._vpn["chip"].pack(side="left", padx=(SPACE["sm"], 0))
+        # Сервер — заголовок карточки: остальное техническое, мельче и ниже.
+        self._vpn["server"] = tk.Label(
+            titles, text="сервер не выбран", bg=theme.card, fg=theme.text,
+            font=theme.heading("bold"), anchor="w",
+        )
+        self._vpn["server"].pack(fill="x", pady=(SPACE["xs"] // 2, 0))
         self._vpn["line"] = tk.Label(
             titles, text="выключен", bg=theme.card, fg=theme.text_dim,
             font=theme.body(), anchor="w",
         )
-        self._vpn["line"].pack(fill="x", pady=(SPACE["xs"], 0))
-        # Режим маршрутизации — отдельной строкой под сервером.
+        self._vpn["line"].pack(fill="x")
+        # Режим маршрутизации — отдельной строкой под прокси и аптаймом.
         self._vpn["mode"] = tk.Label(
             titles, text="", bg=theme.card, fg=theme.text_faint,
             font=theme.caption(), anchor="w")
@@ -1201,13 +1443,13 @@ class Panel:
         )
         self._vpn["button"].pack(side="right", padx=(SPACE["md"], 0))
 
-        Divider(inner, theme).pack(fill="x", pady=(SPACE["md"], SPACE["sm"]))
+        Divider(inner, theme).pack(fill="x", pady=(SPACE["sm"], SPACE["xs"]))
 
         toggle = HoverRow(inner, theme, command=self._toggle_servers)
         toggle.pack(fill="x")
         label = tk.Label(toggle, text="Регионы и серверы", bg=theme.card,
                          fg=theme.text, font=theme.title(), anchor="w")
-        label.pack(side="left", fill="x", expand=True, pady=SPACE["sm"])
+        label.pack(side="left", fill="x", expand=True, pady=SPACE["xs"] + 2)
         chevron = tk.Label(toggle, bg=theme.card, bd=0)
         self._set_icon(chevron, "chevron", theme.text_dim, 14)
         chevron.pack(side="right", padx=(SPACE["sm"], SPACE["xs"]))
@@ -1240,7 +1482,7 @@ class Panel:
 
         # Покрытие: тонкий разделитель на всю ширину и одна строка с иконкой.
         # Без разделителя блок читался как продолжение аккордеона выше.
-        Divider(inner, theme).pack(fill="x", pady=(SPACE["sm"], SPACE["sm"]))
+        Divider(inner, theme).pack(fill="x", pady=(SPACE["xs"], SPACE["xs"]))
         coverage_row = tk.Frame(inner, bg=theme.card)
         coverage_row.pack(fill="x")
         info = tk.Label(coverage_row, text="ⓘ", bg=theme.card,
@@ -1255,127 +1497,115 @@ class Panel:
             self._vpn["coverage"], COVERAGE_HINT, theme=theme)
 
     # -- карточка сервисов ---------------------------------------------------
-    def _build_services(self, inner: tk.Frame) -> None:
+    def _service_columns_for(self, width: int) -> int:
+        """Одна или две колонки — по ширине, а не на глаз.
+
+        Между колонками зазор ``md`` (12) вместе с разделителем. При ширине
+        карточки 632 колонка выходит (632 − 12) / 2 = 310 px — это больше
+        минимума 220, поэтому колонок две; уже 452 px (2·220 + 12) — одна.
+        """
+        available = width - SPACE["md"]
+        return 2 if available / 2 >= SERVICE_COL_MIN_W else 1
+
+    def _build_services(self) -> None:
+        """Заголовок с временем проверки и список сервисов в две колонки.
+
+        Заголовок стоит над карточкой, как на макете: внутри он отнимал бы
+        строку у тесного списка. Ряды — ячейки одной сетки, поэтому пересчёт
+        колонок не пересоздаёт виджеты и не теряет обработчики.
+        """
         theme = self._theme
-        # Заголовок со сводкой: без него список читался безымянным. Рост —
-        # ровно одна строка title (~17 px), дальше ряд кнопок не сдвигается.
-        head = tk.Frame(inner, bg=theme.card)
-        head.pack(fill="x")
-        tk.Label(head, text="Сервисы", bg=theme.card, fg=theme.text,
+        head = tk.Frame(self._body.inner, bg=theme.bg)
+        head.pack(fill="x", padx=SPACE["xl"], pady=(0, SPACE["xs"]))
+        tk.Label(head, text="Сервисы", bg=theme.bg, fg=theme.text,
                  font=theme.title(), anchor="w").pack(side="left")
-        self._services_summary = tk.Label(
-            head, text="", bg=theme.card, fg=theme.text_faint,
+        self._services_checked = tk.Label(
+            head, text="", bg=theme.bg, fg=theme.text_faint,
             font=theme.caption(), anchor="e")
-        self._services_summary.pack(side="right")
-        for index, (key, title, _icon_name) in enumerate(SERVICES):
-            row = HoverRow(inner, theme)
-            row.pack(fill="x")
-            grid = tk.Frame(row, bg=theme.card)
-            # Первая строка ближе к заголовку: сам заголовок уже даёт зазор,
-            # и карточка не растёт лишними пикселями.
-            grid.pack(fill="x", pady=((SPACE["xs"] // 2, SPACE["sm"])
-                                      if index == 0 else SPACE["sm"]))
-            grid.columnconfigure(1, weight=1)
+        self._services_checked.pack(side="right")
 
-            # Состояние сервиса читается по точке; иконки брендов набора
-            # состояний дублировали бы смысл и добавляли визуальный шум.
-            dot = StatusDot(grid, theme, size=SPACE["md"], bg=theme.card)
-            dot.grid(row=0, column=0, rowspan=2, sticky="w",
-                     padx=(0, SPACE["md"]))
+        card = self._card_box(pad=SPACE["md"])
+        self._services_card = card
+        grid = tk.Frame(card.inner, bg=theme.card)
+        grid.pack(fill="x")
+        self._services_grid = grid
+        grid.columnconfigure(0, weight=1, uniform="service")
+        grid.columnconfigure(2, weight=1, uniform="service")
+        # Граница карточки, а не hairline: в светлой теме hairline на белом
+        # не читался вовсе, а ярче делать нельзя — линия должна быть тонкой.
+        self._services_divider = tk.Frame(grid, bg=theme.card_border, width=1)
+        for key, title, _icon_name in SERVICES:
+            cell = HoverRow(grid, theme)
+            grid_frame = tk.Frame(cell, bg=theme.card)
+            grid_frame.pack(fill="x")
+            grid_frame.columnconfigure(0, weight=1)
 
-            name = tk.Label(grid, text=title, bg=theme.card, fg=theme.text,
-                            font=theme.body("bold"), anchor="w")
-            name.grid(row=0, column=1, sticky="w")
+            # Состояние читается по точке; иконки брендов дублировали бы смысл.
+            name = tk.Label(grid_frame, text=title, bg=theme.card, fg=theme.text,
+                            font=theme.heading("bold"), anchor="w")
+            name.grid(row=0, column=0, sticky="w")
+            detail = tk.Label(grid_frame, text="", bg=theme.card,
+                              fg=theme.text_dim, font=theme.body(), anchor="w")
+            detail.grid(row=1, column=0, sticky="w")
 
-            detail = tk.Label(grid, text="", bg=theme.card, fg=theme.text_faint,
-                              font=theme.caption(), anchor="w")
-            detail.grid(row=1, column=1, sticky="w")
-
-            state = tk.Label(grid, text="—", bg=theme.card, fg=theme.dim,
-                             font=theme.caption("bold"), anchor="e")
-            state.grid(row=0, column=2, rowspan=2, sticky="e",
-                       padx=(SPACE["md"], 0))
+            dot = StatusDot(grid_frame, theme, size=SPACE["sm"] + 2,
+                            bg=theme.card)
+            dot.grid(row=0, column=1, rowspan=2, sticky="e",
+                     padx=(SPACE["sm"], SPACE["xs"]))
+            state = tk.Label(grid_frame, text="—", bg=theme.card, fg=theme.dim,
+                             font=theme.caption("bold"), anchor="e", width=8)
+            state.grid(row=0, column=2, rowspan=2, sticky="e")
 
             button = None
             if key in ("zapret", "tgwsproxy"):
-                button = PillButton(grid, theme, "Запустить", None,
+                button = PillButton(grid_frame, theme, "Запустить", None,
                                     kind="ghost", height=ROW_CONTROL_HEIGHT,
-                                    pad_x=SPACE["md"], min_width=104)
-                button.grid(row=0, column=2, rowspan=2, sticky="e",
-                            padx=(SPACE["md"], 0))
+                                    pad_x=SPACE["sm"], min_width=104)
+                button.grid(row=0, column=2, rowspan=2, sticky="e")
                 button.grid_remove()
 
             self._services[key] = {
-                "row": row, "grid": grid, "dot": dot, "name": name,
+                "cell": cell, "grid": grid_frame, "dot": dot, "name": name,
                 "detail": detail, "state": state, "button": button,
             }
             for widget in (dot, name, detail, state):
-                row.track(widget)
-            if index < len(SERVICES) - 1:
-                Divider(inner, theme).pack(fill="x")
+                cell.track(widget)
+        grid.bind("<Configure>", self._sync_service_columns)
+        self._sync_service_columns()
 
-    # -- карточка стабильности -----------------------------------------------
-    def _build_stability(self, inner: tk.Frame) -> None:
-        theme = self._theme
-        header = tk.Frame(inner, bg=theme.card)
-        header.pack(fill="x", pady=(0, SPACE["sm"]))
-        tk.Label(header, text="Стабильность за сутки", bg=theme.card,
-                 fg=theme.text, font=theme.title(), anchor="w"
-                 ).pack(side="left")
-        # Одна строка: панель упирается в высоту экрана, абзац тут лишний.
-        self._stability_line = tk.Label(
-            inner, text="", bg=theme.card, fg=theme.text_dim,
-            font=theme.body(), anchor="w", justify="left",
-            wraplength=CARD_TEXT_WIDTH)
-        self._stability_line.pack(fill="x")
-
-    def _render_stability(self, summary: dict | None = None) -> None:
-        """Карточка — только при достаточном числе отчётов, иначе подпись.
-
-        Пустая карточка на 90 px отвечала «пока нет данных» и занимала место;
-        пока отчётов меньше ``MIN_STABILITY_REPORTS``, те же числа идут одной
-        мелкой строкой в шапку журнала.
-        """
-        data = history.summary() if summary is None else summary
-        stats = _stability_numbers(data)
-        enough = stats["reports"] >= MIN_STABILITY_REPORTS
-        card = getattr(self, "_stability_card", None)
-        if card is not None:
-            if enough and not self._stability_visible:
-                card.pack(fill="x", padx=SPACE["lg"], pady=(0, SPACE["md"]),
-                          before=self._activity_card)
-                self._stability_visible = True
-            elif not enough and self._stability_visible:
-                card.pack_forget()
-                self._stability_visible = False
-        line = getattr(self, "_stability_line", None)
-        if line is not None:
-            line.configure(text=self._stability_text(stats))
-        # Подпись в шапке журнала повторяет карточку — держим её только пока
-        # карточки нет, иначе одни и те же числа читаются дважды.
-        self._toggle_activity_since(not (enough and card is not None), stats)
-
-    def _toggle_activity_since(self, visible: bool, stats: dict) -> None:
-        """Подпись «за сутки: …» в шапке журнала — есть, только если нет карточки."""
-        label = self._activity_since
-        if label is None:
+    def _sync_service_columns(self, event=None) -> None:
+        """Раскладывает сервисы по фактической ширине карточки."""
+        grid = self._services_grid
+        if grid is None or not self._services:
             return
-        if not visible:
-            if label.winfo_manager():
-                label.pack_forget()
+        width = int(getattr(event, "width", 0) or 0)
+        if width <= 1:
+            width = PAGE_W - 2 * SPACE["lg"]
+        columns = self._service_columns_for(width)
+        if columns == self._service_columns_count:
             return
-        label.configure(text=self._stability_brief(stats))
-        if not label.winfo_manager():
-            label.pack(side="right", padx=(SPACE["md"], 0))
-            # Кнопка отката могла занять правый край — подпись должна быть правее.
-            rollback = self._rollback
-            if rollback is not None and rollback.winfo_manager():
-                rollback.pack_configure(before=label)
+        self._service_columns_count = columns
+        per_column = (len(SERVICES) + 1) // 2 if columns == 2 else len(SERVICES)
+        half = SPACE["md"] // 2
+        for index, (key, _title, _icon_name) in enumerate(SERVICES):
+            column = 0 if index < per_column else 2
+            row = index if column == 0 else index - per_column
+            padx = (0, half) if column == 0 else (half, 0)
+            self._services[key]["cell"].grid(
+                row=row, column=column, sticky="nsew",
+                pady=(0 if row == 0 else SPACE["md"], 0),
+                padx=padx if columns == 2 else (0, 0))
+        if columns == 2:
+            self._services_divider.grid(row=0, column=1, rowspan=per_column,
+                                        sticky="ns")
+        else:
+            self._services_divider.grid_remove()
 
     def _stability_text(self, summary: dict | None = None) -> str:
-        """Строка карточки: доля «в сети», сбои, смены сервера, лечение.
+        """Строка суток: доля «в сети», сбои, смены сервера, лечение.
 
         Части с нулём не показываются: нет сбоев — нет куска, и так далее.
+        На главной это подсказка плитки «Сутки»: в саму плитку строка не влезает.
         """
         data = history.summary() if summary is None else summary
         stats = _stability_numbers(data)
@@ -1410,24 +1640,20 @@ class Panel:
 
     # -- карточка журнала ----------------------------------------------------
     def _build_activity(self, inner: tk.Frame) -> None:
+        """Журнал: заголовок, «последние 3» справа, три строки и откат."""
         theme = self._theme
         header = tk.Frame(inner, bg=theme.card)
-        header.pack(fill="x", pady=(0, SPACE["sm"]))
-        tk.Label(header, text="Что виджет сделал сам", bg=theme.card,
+        header.pack(fill="x", pady=(0, SPACE["xs"]))
+        tk.Label(header, text="Журнал", bg=theme.card,
                  fg=theme.text, font=theme.title(), anchor="w"
                  ).pack(side="left")
-        self._activity_period = tk.Label(
-            header, text="", bg=theme.card, fg=theme.text_faint,
-            font=theme.caption(), anchor="w")
-        self._activity_period.pack(side="left", padx=(SPACE["sm"], 0))
-        # Сводка за сутки, пока карточка стабильности не нужна. Пакуется
-        # раньше кнопки отката, поэтому при нехватке места уступает ей.
-        self._activity_since = tk.Label(
-            header, text="", bg=theme.card, fg=theme.text_faint,
+        # Счётчик записей — справа, как на макете. Откат пакуется после него
+        # и встаёт левее: он появляется только при наличии снимка.
+        self._activity_count = tk.Label(
+            header, text=ACTIVITY_TITLE_RIGHT, bg=theme.card, fg=theme.text_faint,
             font=theme.caption(), anchor="e")
-        self._activity_since.pack(side="right", padx=(SPACE["md"], 0))
+        self._activity_count.pack(side="right")
         # Откат живёт рядом с журналом: там видно, что именно виджет сделал сам.
-        # Пакуется только когда снимок есть — иначе это шум в шапке.
         self._rollback = PillButton(header, theme, "Откатить маршруты",
                                     self._confirm_rollback, kind="ghost",
                                     height=ROW_CONTROL_HEIGHT, pad_x=SPACE["md"])
@@ -1437,7 +1663,7 @@ class Panel:
             font=theme.body(), anchor="w",
         )
         self._activity_empty.pack(fill="x")
-        for _index in range(5):
+        for _index in range(ACTIVITY_ROWS):
             row = tk.Frame(inner, bg=theme.card)
             stamp = tk.Label(row, text="", bg=theme.card, fg=theme.text_faint,
                              font=theme.caption(), width=6, anchor="w")
@@ -1446,33 +1672,42 @@ class Panel:
                             font=theme.body(), anchor="w", justify="left")
             text.pack(side="left", fill="x", expand=True)
             self._activity_rows.append({"frame": row, "stamp": stamp, "text": text})
-
-    # -- кнопки действий -----------------------------------------------------
+    # -- панель действий -----------------------------------------------------
     def _build_actions(self) -> None:
+        """Одна карточка с четырьмя равными ячейками: иконка сверху, подпись снизу."""
         theme = self._theme
-        frame = tk.Frame(self._body.inner, bg=theme.bg)
-        frame.pack(fill="x", padx=SPACE["lg"], pady=(0, SPACE["md"]))
+        card = self._card_box(pad=SPACE["sm"])
+        card.pack_configure(pady=(0, SPACE["sm"]))
+        self._actions_card = card
+        grid = tk.Frame(card.inner, bg=theme.card)
+        grid.pack(fill="x")
 
-        # Один ряд равных кнопок одной высоты: primary выделяется цветом,
-        # а не шириной, поэтому ряд не «прыгает» при смене состояния.
+        # Обработчики прежние: primary выделяется цветом, а не шириной,
+        # поэтому ячейки не «прыгают» при смене состояния.
         gap = SPACE["sm"]
-        width = (WINDOW_W - 2 * SPACE["lg"] - 3 * gap) // 4
         specs = (
-            ("check_all", "Проверить всё", self.controller.run_health, "primary"),
-            ("sweep", "Тест стратегий", self.controller.start_sweep, "secondary"),
-            ("routes", "Проверить маршруты", self._confirm_routes, "secondary"),
-            ("subscription", "Обновить подписку",
-             self.controller.refresh_subscription, "secondary"),
+            ("check_all", "Проверить всё", "refresh",
+             self.controller.run_health, "primary"),
+            ("sweep", "Тест стратегий", "list",
+             self.controller.start_sweep, "ghost"),
+            ("routes", "Проверить маршруты", "route",
+             self._confirm_routes, "ghost"),
+            ("subscription", "Обновить подписку", "download",
+             self.controller.refresh_subscription, "ghost"),
         )
-        for index, (key, text, command, kind) in enumerate(specs):
+        for index, (key, text, icon_name, command, kind) in enumerate(specs):
             # Подтверждение маршрутов показывает messagebox — только в UI-потоке.
             callback = command if key == "routes" else (lambda c=command: self._call(c))
-            button = PillButton(frame, theme, text, callback, kind=kind,
-                                width=width, height=CONTROL_HEIGHT)
-            button.grid(row=0, column=index, sticky="ew",
-                        padx=(0 if index == 0 else gap, 0))
-            frame.columnconfigure(index, weight=1, uniform="actions")
-            self._buttons[key] = button
+            icon_color = theme.accent_text if kind == "primary" else theme.text_dim
+            tile = ActionTile(
+                grid, theme, text, callback, kind=kind,
+                icon=self._icon(icon_name, icon_color, ACTION_ICON_SIZE),
+                height=ACTION_HEIGHT,
+            )
+            tile.grid(row=0, column=index, sticky="nsew",
+                      padx=(0 if index == 0 else gap, 0))
+            grid.columnconfigure(index, weight=1, uniform="actions")
+            self._buttons[key] = tile
 
     # ---- обновление данных -------------------------------------------------
     def _render(self) -> None:
@@ -1489,13 +1724,13 @@ class Panel:
 
         if self._page_visible != "settings":
             self._render_subtitle(running, level, busy, health_running)
-        # Сводка за сутки читается один раз: её просят и диагноз, и стабильность.
+        # Сводка за сутки читается один раз: её просят диагноз и плитки.
         summary = history.summary()
         self._render_diagnose(summary)
         self._render_app_update()
+        self._render_tiles(proxy, items, status, summary)
         self._render_vpn(proxy, busy)
         self._render_services(items, status, busy)
-        self._render_stability(summary)
         self._render_activity()
         self._render_header_update()
         self._render_footer(status, busy)
@@ -1504,31 +1739,31 @@ class Panel:
 
     def _render_subtitle(self, running: bool, level: str, busy: dict,
                          health_running: bool) -> None:
-        """Короткий статус — в чип, сервер и задержка — в подзаголовок."""
+        """Короткий статус — рядом с названием, сервер и задержка — под ним."""
         theme = self._theme
         proxy = getattr(self.controller, "proxy", {}) or {}
         name = clean_server_name(proxy.get("server") or "") or "сервер не выбран"
         latency = proxy.get("latency")
         latency_text = (f"{latency} мс"
                         if isinstance(latency, int) and latency >= 0 else "")
-        server = f"VPN ВКЛЮЧЁН · {name}"
+        server = f"VPN включён · {name}"
         if latency_text:
             server += f" · {latency_text}"
         if busy or health_running:
-            chip_text, color, detail = "Проверяю…", theme.accent, "проверяю связь…"
+            state, color, detail = "Проверяю…", theme.accent, "проверяю связь…"
         elif not running:
-            chip_text, color = "VPN выключен", theme.dim
-            detail = proxy.get("message") or "не подключён"
+            state, color = "VPN выключен", theme.dim
+            detail = "VPN выключен · " + str(proxy.get("message") or "не подключён")
         elif level == "down":
-            chip_text, color, detail = "Есть сбой", theme.bad, server
+            state, color, detail = "Есть сбой", theme.bad, server
         elif level == "degraded":
-            chip_text, color, detail = "Требует внимания", theme.warn, server
+            state, color, detail = "Требует внимания", theme.warn, server
         elif level == "ok":
-            chip_text, color, detail = "Всё работает", theme.ok, server
+            state, color, detail = "Всё работает", theme.ok, server
         else:
-            chip_text, color, detail = "Нет данных", theme.dim, server
-        if self._status_chip is not None:
-            self._status_chip.set(chip_text, color)
+            state, color, detail = "Нет данных", theme.dim, server
+        if self._state_label is not None:
+            self._state_label.configure(text=state, fg=color)
         if self._subtitle is not None:
             self._subtitle.configure(text=detail)
 
@@ -1539,7 +1774,6 @@ class Panel:
             return
         running = bool(proxy.get("running"))
         busy_here = bool(busy.get("proxy") or proxy.get("busy"))
-        port = proxy.get("port") or self.controller.cfg.get("xray_port", 10818)
         level = report_level(getattr(self.controller, "health_report", {}) or {})
 
         color = theme.dim
@@ -1555,9 +1789,10 @@ class Panel:
         info["chip"].set(word, color)
 
         name = clean_server_name(proxy.get("server") or "") or "сервер не выбран"
+        info["server"].configure(text=name)
         if running:
             uptime = format_uptime(proxy.get("since"))
-            line = f"{name} · локальный прокси · {uptime}"
+            line = f"локальный прокси · {uptime}"
             if busy_here and proxy.get("message"):
                 line = str(proxy.get("message"))
         else:
@@ -1693,7 +1928,6 @@ class Panel:
     def _render_services(self, items: dict, status: dict, busy: dict) -> None:
         theme = self._theme
         zapret_status = status.get("zapret") or {}
-        trouble = 0
         for key, _title, _icon_name in SERVICES:
             row = self._services.get(key)
             if not row:
@@ -1704,8 +1938,6 @@ class Panel:
                 detail = str(item.get("detail") or "")
             else:
                 state, detail = self._service_fallback(key, status)
-            if state != "ok":
-                trouble += 1
             if key == "youtube" and (getattr(self.controller, "cfg", {}) or {}).get(
                     "youtube_via_vpn"):
                 detail = (detail + " · через VPN") if detail else "через VPN"
@@ -1746,8 +1978,19 @@ class Panel:
                 button.set_command(lambda a=action: self._call(a))
                 installed = bool(self.controller.cfg.get("tgws_exe"))
                 button.set_enabled(installed and not busy.get("tgws"))
-        if self._services_summary is not None:
-            self._services_summary.configure(text=_services_brief(trouble))
+        if self._services_checked is not None:
+            self._services_checked.configure(text=self._checked_text())
+
+    def _checked_text(self) -> str:
+        """«проверено ЧЧ:ММ» — время последней проверки из отчёта health."""
+        report = getattr(self.controller, "health_report", {}) or {}
+        try:
+            stamp = float(report.get("checked") or 0)
+        except (TypeError, ValueError):
+            stamp = 0.0
+        if stamp <= 0:
+            return "не проверено"
+        return "проверено " + time.strftime("%H:%M", time.localtime(stamp))
 
     def _activity_period_text(self) -> str:
         try:
@@ -1763,9 +2006,7 @@ class Panel:
     def _render_activity(self) -> None:
         theme = self._theme
         period = self._activity_period_text()
-        if self._activity_period is not None:
-            self._activity_period.configure(text=period)
-        rows = list(getattr(self.controller, "activity_items", None) or [])[:5]
+        rows = list(getattr(self.controller, "activity_items", None) or [])[:ACTIVITY_ROWS]
         if self._activity_empty is not None:
             self._activity_empty.configure(text=f"{period} ничего не делал")
             if rows:
@@ -1791,7 +2032,7 @@ class Panel:
             holder["stamp"].configure(text=stamp)
             holder["text"].configure(text=text)
             if not holder["frame"].winfo_manager():
-                holder["frame"].pack(fill="x", pady=SPACE["xs"])
+                holder["frame"].pack(fill="x", pady=2)
 
     def _render_footer(self, status: dict, busy: dict) -> None:
         if self._footer is None:
@@ -1835,13 +2076,7 @@ class Panel:
             snapshot = routes.has_snapshot()
             if snapshot:
                 if not self._rollback.winfo_manager():
-                    # Подпись «за сутки: …» бывает скрыта, пока есть карточка —
-                    # тогда откат встаёт на правый край сам.
-                    anchor = self._activity_since
-                    if anchor is not None and anchor.winfo_manager():
-                        self._rollback.pack(side="right", before=anchor)
-                    else:
-                        self._rollback.pack(side="right")
+                    self._rollback.pack(side="right")
                 self._rollback.set_enabled(not busy.get("routes"))
             elif self._rollback.winfo_manager():
                 self._rollback.pack_forget()
