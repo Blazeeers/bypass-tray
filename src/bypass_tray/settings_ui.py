@@ -12,9 +12,12 @@ import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 
-from . import activity, blocked, components, config, presets, routes, xray
+from . import (
+    activity, blocked, components, config, health, presets, routes, status,
+    transfer, xray,
+)
 from .theme import SPACE, Theme
 from .widgets import (
     Card, Divider, Dropdown, HoverRow, PillButton, ScrollBody, Section,
@@ -657,6 +660,42 @@ class SettingsPage(tk.Frame):
         self._entry(paths, "tgws_exe",
                     placeholder="C:\\Tools\\TgWsProxy_windows.exe")
 
+        # --- перенос настроек ---
+        move = self._section(pad, "Перенос настроек")
+        self._label(
+            move,
+            "Файл JSON: настройки, маршруты и сети. Серверы попадают в файл "
+            "только по галочке — это ключи доступа.", caption=True)
+        move_row = tk.Frame(move, bg=theme.card)
+        move_row.pack(fill="x")
+        self.export_button = PillButton(
+            move_row, theme, "Экспорт…", self._export_settings,
+            kind="secondary", height=CONTROL_HEIGHT)
+        self.export_button.pack(side="left")
+        self.import_button = PillButton(
+            move_row, theme, "Импорт…", self._import_settings,
+            kind="secondary", height=CONTROL_HEIGHT)
+        self.import_button.pack(side="left", padx=(SPACE["sm"], 0))
+        self.wizard_button = PillButton(
+            move_row, theme, "Мастер настройки", self._run_wizard,
+            kind="secondary", height=CONTROL_HEIGHT)
+        self.wizard_button.pack(side="left", padx=(SPACE["sm"], 0))
+
+        secret_row = tk.Frame(move, bg=theme.card)
+        secret_row.pack(fill="x", pady=(SPACE["sm"], 0))
+        self.transfer_secrets = tk.BooleanVar(value=False)
+        self.transfer_secret_switch = ToggleSwitch(
+            secret_row, theme, False, command=self._toggle_transfer_secrets)
+        self.transfer_secret_switch.pack(side="left")
+        tk.Label(secret_row, text="включить серверы (секреты)",
+                 bg=theme.card, fg=theme.text_dim, font=theme.caption(),
+                 anchor="w").pack(side="left", padx=(SPACE["sm"], 0))
+        self.transfer_status = tk.Label(
+            move, text="", bg=theme.card, fg=theme.text_faint,
+            font=theme.caption(), anchor="w", justify="left",
+            wraplength=self.WIDTH - 160)
+        self.transfer_status.pack(fill="x", pady=(SPACE["xs"], 0))
+
         self.body.bind_tree()
         self.reload()
 
@@ -1178,6 +1217,199 @@ class SettingsPage(tk.Frame):
             color = self.theme.bad
         self.progress_label.configure(text=text, fg=color)
         self._refresh_status()
+
+    # ---- перенос настроек --------------------------------------------------
+    def _toggle_transfer_secrets(self, value: bool) -> None:
+        """Галочка секретов: включение подтверждается, отказ её снимает."""
+        if not value:
+            self.transfer_secrets.set(False)
+            return
+        answer = messagebox.askyesno(
+            "Серверы в файле",
+            "В файл попадут ссылки на серверы и подписка — это ключи доступа.\n"
+            "Храните его так же бережно, как пароль. Продолжить?",
+            parent=self.winfo_toplevel())
+        if not answer:
+            self.transfer_secret_switch.set(False)
+            self.transfer_secrets.set(False)
+            return
+        self.transfer_secrets.set(True)
+
+    def _export_settings(self) -> None:
+        if self._busy:
+            return
+        include = bool(self.transfer_secrets.get())
+        path = filedialog.asksaveasfilename(
+            parent=self.winfo_toplevel(), title="Экспорт настроек",
+            defaultextension=".json",
+            initialfile="bypass-tray-" + ("full" if include else "safe") + ".json",
+            filetypes=(("JSON", "*.json"), ("Все файлы", "*.*")))
+        if not path:
+            return
+        result = transfer.export_settings(
+            dict(getattr(self.controller, "cfg", None) or {}), Path(path),
+            include_secrets=include)
+        if result.get("ok"):
+            text = (f"Экспортировано: {len(result.get('keys') or [])} настроек, "
+                    f"{result.get('routes', 0)} правил, "
+                    f"{result.get('networks', 0)} сетей")
+            if include:
+                text += " · с серверами"
+            self.transfer_status.configure(text=text, fg=self.theme.ok)
+        else:
+            self.transfer_status.configure(
+                text="Не экспортировано: " + str(result.get("error") or ""),
+                fg=self.theme.bad)
+
+    def _import_settings(self) -> None:
+        if self._busy:
+            return
+        path = filedialog.askopenfilename(
+            parent=self.winfo_toplevel(), title="Импорт настроек",
+            filetypes=(("JSON", "*.json"), ("Все файлы", "*.*")))
+        if not path:
+            return
+        result = transfer.import_settings(Path(path))
+        if not result.get("ok"):
+            self.transfer_status.configure(
+                text="Не импортировано: " + str(result.get("error") or ""),
+                fg=self.theme.bad)
+            return
+        try:
+            self.controller.cfg = config.load_config()
+        except AttributeError:
+            pass
+        self.reload()
+        parts = [f"Применено ключей: {len(result.get('applied') or [])}"]
+        if result.get("routes"):
+            parts.append(f"правил: {result['routes']}")
+        if result.get("networks"):
+            parts.append(f"сетей: {result['networks']}")
+        if result.get("skipped"):
+            parts.append("пропущено: " + ", ".join(
+                str(key) for key in result["skipped"][:6]))
+        message = " · ".join(parts)
+        if result.get("backup"):
+            message += "\nБэкап: " + str(result["backup"])
+        self.transfer_status.configure(
+            text=message.replace("\n", " · "), fg=self.theme.ok)
+        try:
+            messagebox.showinfo("Импорт настроек", message,
+                                parent=self.winfo_toplevel())
+        except tk.TclError:
+            pass
+
+    def _wizard_start_sweep(self) -> bool:
+        """Подбор стратегии существующим механизмом: отдельный процесс + UAC."""
+        cfg = dict(getattr(self.controller, "cfg", None) or {})
+        if not str(cfg.get("zapret_dir") or "").strip():
+            self._wizard_sweep_note = "стратегия: сначала укажите папку zapret"
+            return False
+        sweep = getattr(self.controller, "start_sweep", None)
+        if not callable(sweep):
+            self._wizard_sweep_note = "стратегия: подбор здесь недоступен"
+            return False
+        try:
+            started = sweep()
+        except Exception as exc:  # noqa: BLE001
+            self._wizard_sweep_note = ("стратегия: не запустилась ("
+                                       + type(exc).__name__ + ")")
+            return False
+        if started:
+            self._wizard_sweep_note = ("стратегия: подбор запущен — Windows "
+                                       "спросит разрешение администратора")
+        else:
+            self._wizard_sweep_note = "стратегия: подбор уже идёт"
+        return bool(started)
+
+    def _run_wizard(self) -> None:
+        """Первая настройка: компоненты → стратегия → первая проверка."""
+        if self._busy:
+            return
+        self._busy = True
+        self._wizard_sweep_note = ""
+        for button in (self.install_button, self.export_button,
+                       self.import_button, self.wizard_button):
+            button.set_enabled(False)
+        self.transfer_status.configure(text="Мастер: проверяю компоненты…",
+                                       fg=self.theme.text_dim)
+
+        def say(text: str) -> None:
+            if not self._alive():
+                return
+            try:
+                self.after(0, lambda: self.transfer_status.configure(text=text))
+            except (tk.TclError, RuntimeError):
+                pass
+
+        def worker() -> None:
+            steps: list[str] = []
+            error = ""
+            try:
+                cfg = dict(getattr(self.controller, "cfg", None) or {})
+                state = components.installed(cfg)
+                missing = [name for name in ("zapret", "tgws")
+                           if not state.get(name)]
+                if missing:
+                    say("Мастер: ставлю отсутствующие компоненты…")
+                    result = components.install_all(
+                        lambda stage, text, percent: say("Мастер: " + text))
+                    components.remember_install(result)
+                    items = result.get("components") or {}
+                    for item, key, field in (
+                            (items.get("zapret") or {}, "zapret_dir", "dir"),
+                            (items.get("tgws") or {}, "tgws_exe", "exe")):
+                        if item.get("ok") and item.get(field):
+                            cfg[key] = str(item[field])
+                    if config.save_config(cfg):
+                        try:
+                            self.controller.cfg = cfg
+                        except AttributeError:
+                            pass
+                    failed = [str(item.get("error") or "ошибка")
+                              for item in items.values() if not item.get("ok")]
+                    steps.append("компоненты: " + (
+                        "установлены" if not failed
+                        else "; ".join(failed)[:100]))
+                else:
+                    steps.append("компоненты: уже на месте")
+                if self._alive():
+                    try:
+                        self.after(0, self._wizard_start_sweep)
+                    except (tk.TclError, RuntimeError):
+                        pass
+                say("Мастер: первая проверка сервисов…")
+                snapshot = dict(getattr(self.controller, "cfg", None) or {})
+                report = health.collect(
+                    snapshot, status.collect(snapshot), xray.status())
+                verdict = str(report.get("verdict") or "")
+                steps.append("проверка: " + (verdict or "без вердикта"))
+            except Exception as exc:  # noqa: BLE001
+                error = f"{type(exc).__name__}: {exc}"
+            if self._alive():
+                try:
+                    self.after(0, lambda: self._wizard_finished(steps, error))
+                except (tk.TclError, RuntimeError):
+                    pass
+
+        threading.Thread(target=worker, daemon=True, name="setup-wizard").start()
+
+    def _wizard_finished(self, steps: list[str], error: str) -> None:
+        self._busy = False
+        if not self._alive():
+            return
+        for button in (self.install_button, self.export_button,
+                       self.import_button, self.wizard_button):
+            button.set_enabled(True)
+        if error:
+            self.transfer_status.configure(text="Мастер: " + error,
+                                           fg=self.theme.bad)
+            return
+        note = getattr(self, "_wizard_sweep_note", "")
+        if note:
+            steps.append(note)
+        self.transfer_status.configure(text=" · ".join(steps), fg=self.theme.ok)
+        self.reload()
 
     # ---- сохранение --------------------------------------------------------
     def _proxy_running(self) -> bool:

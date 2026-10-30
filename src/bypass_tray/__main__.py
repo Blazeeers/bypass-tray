@@ -167,6 +167,12 @@ def main() -> int:
                         help="список стратегий через ';' (по умолчанию — все general*.bat)")
     parser.add_argument("--setup", action="store_true",
                         help="установить zapret и tg-ws-proxy, включить автозапуск и запустить виджет")
+    parser.add_argument("--export", default="", metavar="PATH",
+                        help="экспорт настроек в JSON; серверы (секреты) — только с --with-secrets")
+    parser.add_argument("--with-secrets", action="store_true",
+                        help="при --export включить в файл серверы (ключи доступа)")
+    parser.add_argument("--import", dest="import_path", default="", metavar="PATH",
+                        help="импорт настроек из JSON с резервной копией текущего конфига")
     parser.add_argument("--no-autostart", action="store_true",
                         help="при --setup не прописывать автозапуск")
     parser.add_argument("--health", action="store_true",
@@ -191,6 +197,28 @@ def main() -> int:
 
     if args.setup:
         return run_setup(autostart=not args.no_autostart)
+
+    if args.export:
+        from . import transfer
+
+        try:
+            result = transfer.export_settings(
+                config.load_config(), args.export,
+                include_secrets=args.with_secrets)
+        except Exception as exc:  # noqa: BLE001
+            result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        _print_json(result)
+        return 0 if result.get("ok") else 1
+
+    if args.import_path:
+        from . import transfer
+
+        try:
+            result = transfer.import_settings(args.import_path)
+        except Exception as exc:  # noqa: BLE001
+            result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        _print_json(result)
+        return 0 if result.get("ok") else 1
 
     if args.health:
         from . import health, xray
