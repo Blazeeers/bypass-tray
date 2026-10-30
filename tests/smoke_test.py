@@ -644,6 +644,24 @@ def main() -> int:
                   f"h={panel._last_height} vs {repeat_height}, "
                   f"page={panel._page_visible}")
 
+        # Порядок строк сервисов на панели идёт за конфигом, скрытая уходит.
+        ordered = config._default_health_items()
+        ordered.insert(0, ordered.pop(3))       # deepseek — первой строкой
+        ordered[-1]["show"] = False             # vpn скрыт (заодно и check)
+        fake.cfg["health_items"] = ordered
+        panel._render()
+        for _ in range(6):
+            root.update()
+            time.sleep(0.01)
+        expected = [record["id"] for record in ordered if record["show"]]
+        on_panel = [str(record.get("id")) for record in panel._services_order]
+        check("порядок строк на панели совпадает с конфигом",
+              on_panel == expected, f"{on_panel} vs {expected}")
+        check("скрытая строка ушла из панели карточки",
+              "vpn" not in panel._services
+              and len(panel._services) == len(expected),
+              f"{len(panel._services)} из {len(expected)}")
+
         panel._release()
         root.destroy()
         del root
@@ -3457,13 +3475,19 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
           len(settings.health_items) == 7, str(len(settings.health_items)))
     telegram_index = [record["id"] for record in settings.health_items].index(
         "telegram")
+    check("настройки: у строки один тумблер — «Показывать»",
+          all("check" not in info for info in settings.health_rows.values()))
     settings._set_health_flag(telegram_index, "show", False)
+    check("настройки: скрытие гасит и проверку сразу",
+          settings.health_items[telegram_index]["show"] is False
+          and settings.health_items[telegram_index]["check"] is False)
     settings._save()
     saved_config = config.load_config()
     saved_health = {record["id"]: record
                     for record in saved_config["health_items"]}
     check("настройки: «Показывать» сохраняется в конфиг",
-          saved_health["telegram"]["show"] is False)
+          saved_health["telegram"]["show"] is False
+          and saved_health["telegram"]["check"] is False)
     from bypass_tray.ui import service_records
 
     check("настройки: скрытая проверка ушла из строк панели",

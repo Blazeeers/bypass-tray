@@ -905,16 +905,14 @@ class SettingsPage(tk.Frame):
         self.reload()
 
     # ---- дашборд (проверки сервисов) ---------------------------------------
-    def _health_column_widths(self) -> tuple[int, int]:
-        """Ширины колонок тумблеров: по подписи шапки, чтобы центры совпали.
+    def _health_column_widths(self) -> int:
+        """Ширина колонки тумблера: по подписи шапки, чтобы центры совпали.
 
         Шапка и строки — разные гриды. С общим ``minsize`` ширина колонки
         равна ширине подписи, и тумблер с подписью встают на одну ось.
         """
         font = self.theme.caption()
-        check = max(HEALTH_SWITCH_COLUMN, font.measure("Проверять"))
-        show = max(HEALTH_SWITCH_COLUMN, font.measure("Показывать"))
-        return check, show
+        return max(HEALTH_SWITCH_COLUMN, font.measure("Показывать"))
 
     def _build_dashboard(self, parent: tk.Misc) -> None:
         """Секция «Дашборд»: состав проверок, порядок строк и видимость."""
@@ -923,21 +921,18 @@ class SettingsPage(tk.Frame):
         head = tk.Frame(section, bg=theme.card)
         head.pack(fill="x", pady=(0, SPACE["xs"]))
         head.columnconfigure(0, weight=1)
-        # Ширины колонок те же, что у строк: подписи встают ровно над
-        # тумблерами, иначе «Проверять» висело бы между ними.
-        widths = self._health_column_widths()
-        for column, text, width in ((1, "Проверять", widths[0]),
-                                    (2, "Показывать", widths[1])):
-            head.columnconfigure(column, minsize=width)
-            tk.Label(head, text=text, bg=theme.card, fg=theme.text_faint,
-                     font=theme.caption(), anchor="center").grid(
-                row=0, column=column, sticky="")
+        # Одна колонка — один тумблер: подпись стоит ровно над ним.
+        width = self._health_column_widths()
+        head.columnconfigure(1, minsize=width)
+        tk.Label(head, text="Показывать", bg=theme.card, fg=theme.text_faint,
+                 font=theme.caption(), anchor="center").grid(
+            row=0, column=1, sticky="")
         self.health_list = tk.Frame(section, bg=theme.card)
         self.health_list.pack(fill="x")
-        # Одна короткая строка вместо абзаца сверху: связь колонок читается
-        # из подписей и подсказок, а не из объяснения перед списком.
-        self._label(section, "Скрытая проверка продолжает влиять на иконку",
-                    caption=True)
+        # Одна короткая строка вместо абзаца сверху: связь колонки читается
+        # из подписи и подсказки, а не из объяснения перед списком.
+        self._label(section, "Скрытые проверки не выполняются и не влияют "
+                             "на иконку", caption=True)
         add_row = tk.Frame(section, bg=theme.card)
         add_row.pack(fill="x", pady=(SPACE["sm"], 0))
         self.health_add_button = PillButton(
@@ -1104,7 +1099,7 @@ class SettingsPage(tk.Frame):
         self._cancel_health_form()
 
     def _render_health_items(self) -> None:
-        """Список проверок: имя и два тумблера; порядок — перетаскиванием."""
+        """Список проверок: имя и тумблер «Показывать»; порядок — перетаскиванием."""
         holder = getattr(self, "health_list", None)
         if holder is None:
             return
@@ -1116,34 +1111,27 @@ class SettingsPage(tk.Frame):
         self.health_rows = {}
         self._health_row_widgets = []
         theme = self.theme
-        widths = self._health_column_widths()
+        width = self._health_column_widths()
         for index, record in enumerate(self.health_items):
             item_id = str(record.get("id") or "")
             row = tk.Frame(holder, bg=theme.card, cursor="sb_v_double_arrow")
             row.pack(fill="x", pady=(0, SPACE["xs"]))
             row.columnconfigure(0, weight=1)
-            for column, width in ((1, widths[0]), (2, widths[1])):
-                row.columnconfigure(column, minsize=width)
+            row.columnconfigure(1, minsize=width)
             name = tk.Label(row, text=str(record.get("title") or item_id),
                             bg=theme.card, fg=theme.text, font=theme.body(),
                             anchor="w", cursor="sb_v_double_arrow")
             name.grid(row=0, column=0, sticky="w")
-            check = ToggleSwitch(
-                row, theme, bool(record.get("check", True)),
-                command=lambda value, i=index: self._set_health_flag(
-                    i, "check", value),
-                tooltip="Входит в расчёт состояния: влияет на цвет иконки и на "
-                        "счётчик сервисов")
-            check.grid(row=0, column=1, sticky="")
+            # Один тумблер: видимость и участие в проверке — одно и то же.
             show = ToggleSwitch(
                 row, theme, bool(record.get("show", True)),
                 command=lambda value, i=index: self._set_health_flag(
                     i, "show", value),
-                tooltip="Строка видна на панели; скрытая проверка продолжает "
-                        "влиять на иконку, если включено «Проверять»")
-            show.grid(row=0, column=2, sticky="")
-            # Тянем за саму строку и подпись; тумблеры остаются тумблерами:
-            # нажатие на них драг не начинает (у них своя привязка Button-1).
+                tooltip="Строка видна на панели. Скрытые проверки не "
+                        "выполняются и не влияют на иконку")
+            show.grid(row=0, column=1, sticky="")
+            # Тянем за саму строку и подпись; тумблер остаётся тумблером:
+            # нажатие на него драг не начинает (у него своя привязка Button-1).
             for handle in (row, name):
                 handle.bind("<Button-1>",
                             lambda event, i=index: self._health_press(event, i))
@@ -1155,9 +1143,9 @@ class SettingsPage(tk.Frame):
                             lambda event, i=index: self._health_menu(event, i))
             self._health_row_widgets.append(row)
             self.health_rows[item_id] = {
-                "row": row, "name": name, "check": check, "show": show,
-                # Встроенную проверку удалить нельзя — только скрыть или
-                # выключить: её id живёт в истории и в сводке по суткам.
+                "row": row, "name": name, "show": show,
+                # Встроенную проверку удалить нельзя — только скрыть:
+                # её id живёт в истории и в сводке по суткам.
                 "can_delete": str(record.get("kind") or "") != "builtin",
             }
         # Строки пересоздаются после сборки страницы: колесо на них вешает
@@ -1279,6 +1267,7 @@ class SettingsPage(tk.Frame):
             return
         items.insert(target, record)
         self._render_health_items()
+        self._publish_health()
 
     def _health_menu(self, event, index: int) -> None:
         """Правый клик по строке: порядок и флаги без перетаскивания."""
@@ -1310,8 +1299,6 @@ class SettingsPage(tk.Frame):
             label="Ниже", command=lambda: self._move_health(index, 1),
             state="normal" if index < len(self.health_items) - 1 else "disabled")
         menu.add_separator()
-        menu.add_command(label="Проверять",
-                         command=lambda: self._flip_health_flag(index, "check"))
         menu.add_command(label="Показывать",
                          command=lambda: self._flip_health_flag(index, "show"))
         if str(self.health_items[index].get("kind") or "") != "builtin":
@@ -1330,13 +1317,35 @@ class SettingsPage(tk.Frame):
 
 
     def _set_health_flag(self, index: int, key: str, value) -> None:
-        """Тумблер «Проверять»/«Показывать» правит рабочую копию списка."""
+        """Тумблер «Показывать»: видимость и участие в проверке — одно поле.
+
+        ``key`` оставлен ради совместимости вызовов, но оба флага пишутся
+        вместе: скрытая строка не проверяется и не считается.
+        """
         if not 0 <= index < len(self.health_items):
             return
-        self.health_items[index][key] = bool(value)
+        flag = bool(value)
+        self.health_items[index]["show"] = flag
+        self.health_items[index]["check"] = flag
+        self._publish_health()
+
+    def _publish_health(self) -> None:
+        """Отдать список панели сразу: главная читает ``controller.cfg``.
+
+        В файл изменения попадут по «Сохранить» (или при закрытии настроек),
+        но панель не должна ждать перезапуска, чтобы показать новый порядок
+        и убрать скрытые строки.
+        """
+        cfg = getattr(self.controller, "cfg", None)
+        if isinstance(cfg, dict):
+            cfg["health_items"] = [dict(record) for record in self.health_items]
+        panel = getattr(self.controller, "panel", None)
+        refresh = getattr(panel, "refresh_services", None)
+        if callable(refresh):
+            refresh()
 
     def _move_health(self, index: int, delta: int) -> None:
-        """Сдвиг из контекстного меню; в конфиг попадёт по «Сохранить»."""
+        """Сдвиг из контекстного меню; панель обновляется сразу."""
         target = index + delta
         if not (0 <= index < len(self.health_items)
                 and 0 <= target < len(self.health_items)):
@@ -1344,6 +1353,7 @@ class SettingsPage(tk.Frame):
         items = self.health_items
         items[index], items[target] = items[target], items[index]
         self._render_health_items()
+        self._publish_health()
 
     def _delete_health(self, index: int) -> None:
         """Удалить свою проверку; встроенную не трогаем ни при каких условиях."""
@@ -1354,6 +1364,7 @@ class SettingsPage(tk.Frame):
         del self.health_items[index]
         self._render_health_items()
         self._update_health_counter()
+        self._publish_health()
 
     def _update_health_counter(self) -> None:
         counter = getattr(self, "health_counter", None)

@@ -189,7 +189,7 @@ class SaveOrderTests(_TempData):
 
 @unittest.skipUnless(_tk_available(), "Tk недоступен в этой среде")
 class PanelVisibilityTests(_TempData):
-    """Панель: скрытая строка отсутствует, выключенная — не в счётчике."""
+    """Панель: скрытая строка отсутствует и не считается в плитке."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -221,22 +221,59 @@ class PanelVisibilityTests(_TempData):
         self.panel._render()
         self.pump()
 
+    def panel_order(self) -> list[str]:
+        return [str(record.get("id")) for record in self.panel._services_order]
+
     def test_hidden_row_is_absent(self) -> None:
         self.records("telegram", show=False)
         self.assertNotIn("telegram", self.panel._services)
         self.assertIn("zapret", self.panel._services)
         self.assertEqual(len(self.panel._services), 6)
 
-    def test_hidden_but_checked_counts_in_tile(self) -> None:
+    def test_hidden_row_is_not_counted_in_tile(self) -> None:
+        # Скрытая строка не проверяется: плитка считает ровно видимые.
         self.records("telegram", show=False, check=True)
         tile = self.panel._tiles["services"]["value"].cget("text")
-        self.assertEqual(tile, "7 из 7")
+        self.assertEqual(tile, "6 из 6")
 
-    def test_check_false_is_visible_but_not_counted(self) -> None:
+    def test_visible_row_with_check_false_is_shown_and_counted(self) -> None:
+        # show — старший флаг: нормализация подтягивает check за ним.
         self.records("telegram", show=True, check=False)
         self.assertIn("telegram", self.panel._services)
         tile = self.panel._tiles["services"]["value"].cget("text")
-        self.assertEqual(tile, "6 из 6")
+        self.assertEqual(tile, "7 из 7")
+
+    def test_panel_rebuilds_in_config_order(self) -> None:
+        records = config._default_health_items()
+        records.insert(0, records.pop(1))  # youtube — первой
+        self.fake.cfg["health_items"] = records
+        self.panel._render()
+        self.pump()
+        self.assertEqual(self.panel_order(),
+                         [record["id"] for record in records])
+        # Порядок виджетов в сетке идёт за списком: первая ячейка — youtube.
+        first = self.panel._services_order[0]["id"]
+        self.assertEqual(self.panel._services[first]["cell"].grid_info()["row"], 0)
+        self.assertEqual(self.panel._services[records[1]["id"]]["cell"]
+                         .grid_info()["row"], 1)
+
+    def test_tick_with_settings_open_keeps_services_before_journal(self) -> None:
+        # Пересборка при скрытой главной не должна уводить карточку в конец.
+        records = config._default_health_items()
+        records.insert(0, records.pop(2))
+        self.panel._open_settings()
+        self.pump()
+        self.fake.cfg["health_items"] = records
+        self.panel._render()  # тик, пока открыты настройки
+        self.pump()
+        self.assertEqual(self.panel_order(),
+                         [record["id"] for record in records])
+        slaves = list(self.panel._body.inner.pack_slaves())
+        self.assertIn(self.panel._services_card, slaves)
+        self.assertIn(self.panel._activity_card, slaves)
+        self.assertLess(slaves.index(self.panel._services_card),
+                        slaves.index(self.panel._activity_card))
+        self.panel._close_settings()
 
     def test_all_hidden_removes_card(self) -> None:
         records = config._default_health_items()

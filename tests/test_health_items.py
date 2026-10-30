@@ -137,6 +137,23 @@ class ConfigModelTests(_TempData):
         self.assertTrue(config.health_items_report())
         self.assertTrue(list(self.data.glob("config.json.bak-*")))
 
+    def test_show_and_check_are_one_flag(self) -> None:
+        items, problems = config.normalise_health_items([
+            _https("hidden", show=False, check=True),
+            _https("visible", show=True, check=False),
+        ])
+        self.assertEqual(problems, [])
+        flags = [(item["id"], item["show"], item["check"]) for item in items]
+        self.assertEqual(flags, [("hidden", False, False),
+                                 ("visible", True, True)])
+
+    def test_old_record_with_only_check_keeps_intent(self) -> None:
+        raw = _https("old")
+        raw.pop("show")
+        raw["check"] = False
+        items, _ = config.normalise_health_items([raw])
+        self.assertEqual((items[0]["show"], items[0]["check"]), (False, False))
+
     def test_expect_and_timeout_are_clamped(self) -> None:
         items, _ = config.normalise_health_items([
             _https("a", expect={"status": "418", "contains": "x"}, timeout=99),
@@ -151,11 +168,11 @@ class ConfigModelTests(_TempData):
 class EngineTests(_TempData):
     """Движок: какие записи выполняются и что попадает в отчёт."""
 
-    def test_check_false_is_skipped_entirely(self) -> None:
+    def test_hidden_builtin_is_skipped_entirely(self) -> None:
         records = config._default_health_items()
         for record in records:
             if record["id"] == "youtube":
-                record["check"] = False
+                record["show"] = False
         ok = lambda *a, **k: health._item("x", "x", "ok", "", 0)  # noqa: E731
         with mock.patch.object(health, "_check_youtube") as youtube, \
                 mock.patch.object(health, "_check_discord", lambda *a, **k: ok()), \
@@ -168,16 +185,14 @@ class EngineTests(_TempData):
         self.assertNotIn("youtube", ids)
         self.assertEqual(len(ids), len(BUILTIN_ORDER) - 1)
 
-    def test_show_false_is_checked_and_counted(self) -> None:
+    def test_hidden_item_is_not_checked(self) -> None:
+        # Один тумблер «Показывать»: скрытая строка не выполняется вовсе.
         record = _https("svc_hidden", show=False)
         with mock.patch.object(health, "_fetch_direct",
                                return_value=_response(200)) as fetch:
             result = health.collect(self.cfg([record]), {}, {"running": False})
-        fetch.assert_called_once()
-        self.assertEqual(len(result["items"]), 1)
-        self.assertEqual(result["items"][0]["id"], "svc_hidden")
-        self.assertEqual(result["items"][0]["state"], "ok")
-        self.assertEqual(result["level"], "ok")
+        fetch.assert_not_called()
+        self.assertEqual(result["items"], [])
 
     def test_report_order_follows_config(self) -> None:
         records = [_tcp("first", target="a.test:1"),

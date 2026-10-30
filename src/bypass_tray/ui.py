@@ -78,7 +78,11 @@ def service_records(cfg: dict | None) -> list[dict]:
 
 
 def checked_records(cfg: dict | None) -> list[dict]:
-    """Все записи с ``check=true`` — по ним считается плитка, скрытые тоже."""
+    """Записи, которые реально проверяются: ``show`` и ``check`` — один флаг.
+
+    Скрытая строка не проверяется, поэтому набор совпадает с видимым:
+    плитка «Сервисы» считает ровно те строки, что есть на панели.
+    """
     raw = (cfg or {}).get("health_items") if isinstance(cfg, dict) else None
     records, _problems = config.normalise_health_items(raw)
     return [record for record in records if record.get("check", True)]
@@ -1177,8 +1181,8 @@ class Panel:
 
         report = getattr(self.controller, "health_report", {}) or {}
         checked = bool(report.get("checked")) or bool(items)
-        # Считаем только включённые проверки (``check=true``): скрытая строка
-        # из карточки ушла, но здоровье сервиса она всё ещё проверяет.
+        # `show` и `check` — один флаг: скрытая строка не проверяется,
+        # поэтому плитка и карточка считают один и тот же набор.
         records = checked_records(getattr(self.controller, "cfg", {}) or {})
         total = len(records)
         ok_count = 0
@@ -1666,9 +1670,11 @@ class Panel:
         self._services_divider = None
         self._services_checked = None
         self._service_columns_count = 0
+        # Точка вставки — карточка журнала, если она есть: pack(before=…)
+        # не требует, чтобы сосед был на экране. Проверка winfo_ismapped()
+        # здесь ломала порядок: при пересборке с открытыми настройками
+        # главная скрыта, и «Сервисы» уезжали в самый конец страницы.
         before = self._activity_card
-        if before is not None and not before.winfo_ismapped():
-            before = None
         self._build_services(before=before)
         if self._body is not None:
             self._body.bind_tree()
@@ -1678,6 +1684,21 @@ class Panel:
                               ).get("items", []) if isinstance(item, dict)},
                 getattr(self.controller, "status", {}) or {},
                 getattr(self.controller, "busy", {}) or {})
+
+    def refresh_services(self) -> None:
+        """Пересобрать карточку сервисов после правки проверок в настройках.
+
+        Настройки зовут это сразу после смены тумблера или порядка, чтобы
+        главная не ждала следующего тика и не держала старый список.
+        """
+        if self._body is None or self._root is None:
+            return
+        self._services_signature = None
+        try:
+            self._ensure_services()
+        except tk.TclError:
+            # Окно уже уничтожается: пересобирать нечего.
+            self._root = None
 
     def _sync_service_columns(self, event=None) -> None:
         """Раскладывает сервисы по фактической ширине карточки."""

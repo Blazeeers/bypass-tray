@@ -315,6 +315,14 @@ def normalise_health_items(value) -> tuple[list[dict], list[str]]:
                 problems.append(f"#{index} ({item_id}): больше "
                                 f"{HEALTH_MAX_CUSTOM} своих проверок")
                 continue
+        # Видимость и участие в проверке — одно поле: на панели одна
+        # колонка «Показывать». Старый конфиг мог хранить их порознь (и даже
+        # show=false/check=true), поэтому приводим к согласованности здесь:
+        # иначе остались бы записи «скрыта, но проверяется».
+        flag = _health_bool(raw.get("show"), True)
+        if "show" not in raw and "check" in raw:
+            # Запись, где задан только ``check``: это и было намерение.
+            flag = _health_bool(raw.get("check"), True)
         items.append({
             "id": item_id,
             "title": title,
@@ -324,8 +332,8 @@ def normalise_health_items(value) -> tuple[list[dict], list[str]]:
             "expect": _normalise_expect(raw.get("expect")) if kind == "https" else {},
             "via": _health_via(raw.get("via")),
             "level": _health_level(item_id, raw.get("level"), kind),
-            "check": _health_bool(raw.get("check"), True),
-            "show": _health_bool(raw.get("show"), True),
+            "check": flag,
+            "show": flag,
             "timeout": _health_timeout(raw.get("timeout")),
         })
         seen.add(item_id)
