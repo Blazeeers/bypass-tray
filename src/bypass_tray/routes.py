@@ -21,6 +21,7 @@ import os
 import socket
 import ssl
 import tempfile
+import threading
 import time
 import urllib.parse
 from pathlib import Path
@@ -723,6 +724,18 @@ def apply_audit(result: dict, cfg: dict | None = None,
 #: Сколько снимков прежнего состояния держим: откат работает на несколько шагов.
 SNAPSHOT_LIMIT = 3
 
+#: ``has_snapshot`` зовётся панелью каждый тик: без кэша это ``glob`` и чтение
+#: файла в UI-потоке. Кэш живёт ``SNAPSHOT_CACHE_TTL`` секунд и сбрасывается
+#: там, где снимки появляются и расходуются, — так кнопка отката не отстаёт.
+SNAPSHOT_CACHE_TTL = 2.0
+_SNAPSHOT_CACHE: dict = {"at": 0.0, "dir": "", "value": False}
+_SNAPSHOT_LOCK = threading.Lock()
+
+
+def _snapshot_cache_reset() -> None:
+    with _SNAPSHOT_LOCK:
+        _SNAPSHOT_CACHE["at"] = 0.0
+
 
 def snapshots_dir() -> Path:
     """Каталог снимков прежнего ``route_overrides.json``."""
@@ -743,6 +756,7 @@ def _snapshot_save(reason: str) -> bool:
     Формат ``route_overrides.json`` не меняется: снимок лежит рядом, в своём
     каталоге, и содержит прежние ``{"at", "routes"}`` целиком плюс причину.
     """
+    _snapshot_cache_reset()
     previous = _load_file()
     stamp = time.time()
     directory = snapshots_dir()
@@ -772,8 +786,23 @@ def _snapshot_save(reason: str) -> bool:
 
 
 def has_snapshot() -> bool:
-    """Есть ли снимок для отката: панель показывает действие только тогда."""
-    return bool(last_snapshot())
+    """Есть ли снимок для отката: панель показывает действие только тогда.
+
+    Ответ кэшируется на ``SNAPSHOT_CACHE_TTL``: панель спрашивает каждый тик,
+    а снимки меняются только через этот модуль. После сохранения и отката кэш
+    сбрасывается явно, поэтому кнопка появляется и исчезает сразу.
+    """
+    directory = str(snapshots_dir())
+    now = time.monotonic()
+    with _SNAPSHOT_LOCK:
+        cached = _SNAPSHOT_CACHE
+        if (cached["dir"] == directory
+                and now - cached["at"] <= SNAPSHOT_CACHE_TTL):
+            return bool(cached["value"])
+    value = bool(last_snapshot())
+    with _SNAPSHOT_LOCK:
+        _SNAPSHOT_CACHE.update(at=time.monotonic(), dir=directory, value=value)
+    return value
 
 
 def last_snapshot() -> dict:
@@ -832,6 +861,10 @@ def rollback_last(cfg: dict | None = None) -> dict:
     target = _route_map(last["snapshot"].get("routes"))
     current = load_overrides()
     changed = _changed_domains(current, target)
+    if not changed:
+        # Откатывать нечего: файл не трогаем и снимок не расходуем, иначе
+        # пользователь молча терял бы шаг отката без всякой пользы.
+        return {"ok": True, "changed": 0}
     try:
         snapshot_at = float(last["snapshot"].get("at") or 0)
     except (TypeError, ValueError):
@@ -843,21 +876,34 @@ def rollback_last(cfg: dict | None = None) -> dict:
         return {"ok": False, "changed": 0, "restarted": False,
                 "error": last_write_error() or "маршруты не записались"}
     restarted = False
-    if changed:
-        from . import xray as xray_module
+    restart_error = ""
+    from . import xray as xray_module
 
-        if xray_module.is_running():
-            server = xray_module.saved_server()
-            outcome = (xray_module.switch_to(server, cfg or {})
-                       if server is not None else xray_module.restart(cfg or {}))
-            restarted = bool(outcome.get("ok"))
+    if xray_module.is_running():
+        server = xray_module.saved_server()
+        outcome = (xray_module.switch_to(server, cfg or {})
+                   if server is not None else xray_module.restart(cfg or {}))
+        outcome = outcome if isinstance(outcome, dict) else {}
+        restarted = bool(outcome.get("ok"))
+        if not restarted:
+            restart_error = str(outcome.get("error") or "ядро не перезапустилось")
     from . import activity
 
-    activity.log(f"откатил маршруты: изменено {len(changed)}", kind="ok")
+    if restart_error:
+        # Файл уже вернулся к снимку, но работающее ядро осталось на старом
+        # конфиге: сказать «всё хорошо» было бы обманом.
+        activity.log(f"откат записан, но Xray не перезапустился: {restart_error}",
+                     kind="warn")
+    else:
+        activity.log(f"откатил маршруты: изменено {len(changed)}", kind="ok")
     try:
         last["path"].unlink()
     except (OSError, KeyError):
         pass
+    _snapshot_cache_reset()
+    if restart_error:
+        return {"ok": False, "changed": len(changed), "restarted": False,
+                "error": restart_error}
     return {"ok": True, "changed": len(changed), "restarted": restarted,
             "reason": str(last.get("reason") or ""),
             "at": float(last.get("at") or 0)}

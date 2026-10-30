@@ -17,7 +17,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
-from bypass_tray import activity, config, health, history  # noqa: E402
+from bypass_tray import activity, config, diagnose, health, history  # noqa: E402
 
 NOW = 1_700_000_000.0
 HOUR = 3600.0
@@ -93,6 +93,34 @@ class SummariseTests(unittest.TestCase):
         self.assertEqual(data["server_switches"], 3)
         # Неудачная попытка лечением не считается.
         self.assertEqual(data["heals"], 1)
+
+    def test_rows_without_level_do_not_break_uptime(self) -> None:
+        """Шесть строк без ``level`` — не повод объявлять нулевой uptime."""
+        rows = [_row(NOW - index * HOUR, "") for index in range(6)]
+        data = history.summarise(rows, [], 24, NOW)
+        self.assertIsNone(data["uptime_pct"])
+        self.assertEqual(data["reports"], 6)
+        self.assertEqual(data["reports_rated"], 0)
+        self.assertFalse(diagnose._unstable(data))
+
+    def test_mixed_rows_rate_only_known_levels(self) -> None:
+        rows = [
+            _row(NOW - 3 * HOUR, "ok"),
+            _row(NOW - 2 * HOUR, "down"),
+            _row(NOW - 1 * HOUR, ""),
+        ]
+        data = history.summarise(rows, [], 24, NOW)
+        self.assertEqual(data["uptime_pct"], 50)
+        self.assertEqual(data["reports"], 3)
+        self.assertEqual(data["reports_rated"], 2)
+        self.assertFalse(diagnose._unstable(data))
+
+    def test_unstable_needs_rated_reports(self) -> None:
+        rows = [_row(NOW - index * 60, "ok" if index % 2 else "down")
+                for index in range(6)]
+        data = history.summarise(rows, [], 24, NOW)
+        self.assertEqual(data["reports_rated"], 6)
+        self.assertTrue(diagnose._unstable(data))
 
     def test_empty_data_gives_none_uptime(self) -> None:
         data = history.summarise([], [], 24, NOW)

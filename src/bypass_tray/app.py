@@ -105,8 +105,6 @@ class TrayApp:
         self._level_candidate: str = ""
         self._level_hits = 0
         self._level_at = 0.0
-        #: Строка диагноза для подсказки: (время расчёта, текст).
-        self._diagnose_cache: tuple[float, str] = (0.0, "")
         self._user_off = False
         cached = health.load_cache(self.cfg)
         if cached:
@@ -122,6 +120,8 @@ class TrayApp:
         self._net_checked = 0.0
         # Последние отправленные авто-тосты: (время, текст) по ключу.
         self._notified: dict[str, tuple[float, str]] = {}
+        # Последние предупреждения в журнал: (время, текст) по ключу.
+        self._logged: dict[str, tuple[float, str]] = {}
 
     # ---- прокси Xray -------------------------------------------------------
     def set_proxy(self, enable: bool) -> None:
@@ -256,6 +256,22 @@ class TrayApp:
             return
         self._notified[key] = (now, message)
         self.notify(message)
+
+    def _log_throttled(self, key: str, message: str, hours: float = 1.0) -> None:
+        """Предупреждение в журнал не чаще раза в ``hours`` на ту же причину.
+
+        В отличие от ``_notify_throttled`` пишет всегда, даже при ``quiet_icon``:
+        сбой, о котором пользователь узнает только по отсутствию прокси, обязан
+        оставить след.
+        """
+        if not message:
+            return
+        now = time.time()
+        last = self._logged.get(key)
+        if last and last[1] == message and now - last[0] < hours * 3600:
+            return
+        self._logged[key] = (now, message)
+        activity.log(message, kind="warn")
 
     def load_servers(self, force: bool = False) -> None:
         """Обновляет список серверов в фоне (сеть + проверка доступности)."""
@@ -490,22 +506,39 @@ class TrayApp:
                     server = xray.system_proxy_server()
                     own = f"127.0.0.1:{port}"
                     if not enabled:
-                        xray.set_system_proxy(True, port, stream)
-                        self.proxy["system_proxy_owned"] = "ours"
+                        outcome = xray.set_system_proxy(True, port, stream)
+                        outcome = outcome if isinstance(outcome, dict) else {}
+                        if outcome.get("ok"):
+                            self.proxy["system_proxy_owned"] = "ours"
+                        else:
+                            self._log_throttled(
+                                "system-proxy-on",
+                                "системный прокси не включился: "
+                                + str(outcome.get("error") or "нет ответа"))
                     elif server.strip() == own:
                         self.proxy["system_proxy_owned"] = "ours"
                     else:
                         # Чужой прокси не перезаписываем, только отмечаем.
                         self.proxy["system_proxy_owned"] = "foreign"
                         self.proxy["system_proxy_server"] = server
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    self._log_throttled(
+                        "system-proxy-on",
+                        f"системный прокси не включился: {type(exc).__name__}")
         else:
             try:
                 if xray.system_proxy_enabled():
-                    xray.set_system_proxy(False, port)
-            except Exception:  # noqa: BLE001
-                pass
+                    outcome = xray.set_system_proxy(False, port)
+                    outcome = outcome if isinstance(outcome, dict) else {}
+                    if not outcome.get("ok"):
+                        self._log_throttled(
+                            "system-proxy-off",
+                            "системный прокси не выключился: "
+                            + str(outcome.get("error") or "нет ответа"))
+            except Exception as exc:  # noqa: BLE001
+                self._log_throttled(
+                    "system-proxy-off",
+                    f"системный прокси не выключился: {type(exc).__name__}")
 
     # ---- журнал действий ---------------------------------------------------
     def refresh_activity(self) -> None:
@@ -593,8 +626,12 @@ class TrayApp:
             try:
                 done = guard.heal(self.cfg, snapshot_status, snapshot_proxy, report)
                 self._report_guard(done)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                # Падение надзирателя раньше пропадало бесследно: без записи
+                # в журнал «тишина» неотличима от «всё хорошо».
+                self._log_throttled(
+                    "guard-error:" + type(exc).__name__,
+                    f"надзиратель не отработал: {type(exc).__name__}")
             finally:
                 self.guard_at = time.time()
                 self.guard_running = False
@@ -755,26 +792,20 @@ class TrayApp:
     def _diagnose_note(self) -> str:
         """Строка диагноза для подсказки иконки: коротко и без секретов.
 
-        Считается не чаще раза в 30 с: ``tray_state`` зовётся на каждом
-        ``refresh``, а сводка истории читает файл. При ``ok`` строки нет —
-        подсказка не должна повторять «всё работает».
+        Кэш живёт в ``diagnose`` (``CACHE_TTL``): второй, свой, здесь только
+        добавлял бы рассинхрон. При ``ok`` строки нет — подсказка не должна
+        повторять «всё работает».
         """
-        now = time.time()
-        cached_at, cached_text = self._diagnose_cache
-        if cached_at and now - cached_at < 30:
-            return cached_text
         try:
             data = diagnose.diagnose(
                 self.health_report, dict(self.proxy or {}), self.cfg,
-                history.summary(), now=now)
+                history.summary())
         except Exception:  # noqa: BLE001
             # Диагноз — украшение подсказки: его сбой не должен ломать трей.
             data = {}
-        text = ""
         if str(data.get("level") or "ok") != "ok":
-            text = str(data.get("title") or "")
-        self._diagnose_cache = (now, text)
-        return text
+            return str(data.get("title") or "")
+        return ""
 
     def _level_title(self, level: str) -> str:
         """Подсказка уровня: причина и время последней проверки."""

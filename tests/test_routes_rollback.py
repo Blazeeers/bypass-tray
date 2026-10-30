@@ -336,6 +336,53 @@ class RollbackTests(unittest.TestCase):
         self.assertGreaterEqual(routes._load_file()["at"], started)
         self.assertFalse(routes.due(60))
 
+    def test_rollback_reports_restart_failure(self) -> None:
+        """Файл откатился, а ядро — нет: ответ обязан быть честным."""
+        routes.save_overrides({
+            "a.example": {"route": "direct", "since": 1, "checked": 1},
+        }, at=1.0)
+        routes.apply_audit(_audit(("a.example", "proxy")),
+                           {"routing_mode": "blocked"})
+        with mock.patch("bypass_tray.xray.is_running", return_value=True), \
+                mock.patch("bypass_tray.xray.saved_server", return_value=None), \
+                mock.patch("bypass_tray.xray.restart",
+                           return_value={"ok": False, "error": "порт занят"}), \
+                mock.patch("bypass_tray.activity.log") as log:
+            outcome = routes.rollback_last({"routing_mode": "blocked"})
+
+        self.assertFalse(outcome["ok"], outcome)
+        self.assertFalse(outcome["restarted"])
+        self.assertEqual(outcome["error"], "порт занят")
+        self.assertEqual(outcome["changed"], 1)
+        warnings = [call for call in log.call_args_list
+                    if "откат записан" in str(call.args[0])
+                    and call.kwargs.get("kind") == "warn"]
+        self.assertEqual(len(warnings), 1, log.call_args_list)
+        # Маршруты при этом действительно вернулись к снимку.
+        self.assertEqual(routes.load_overrides()["a.example"]["route"], "direct")
+
+    def test_rollback_without_changes_touches_nothing(self) -> None:
+        """Нечего откатывать — файл, снимок и журнал остаются как были."""
+        routes.save_overrides({
+            "a.example": {"route": "direct", "since": 1, "checked": 1},
+        }, at=1.0)
+        routes.apply_audit(_audit(("a.example", "proxy")),
+                           {"routing_mode": "blocked"})
+        self.assertTrue(routes.has_snapshot())
+        # Возвращаем файл ровно к состоянию снимка: откат уже не меняет ничего.
+        routes.save_overrides({
+            "a.example": {"route": "direct", "since": 1, "checked": 1},
+        }, at=2.0)
+        before = _file_state(self.root)
+
+        with mock.patch("bypass_tray.activity.log") as log:
+            outcome = routes.rollback_last({"routing_mode": "blocked"})
+
+        self.assertEqual(outcome, {"ok": True, "changed": 0})
+        self.assertEqual(_file_state(self.root), before)
+        self.assertTrue(routes.has_snapshot(), "снимок израсходован без изменений")
+        log.assert_not_called()
+
     def test_broken_snapshot_does_not_block_rollback(self) -> None:
         """Битый последний снимок пропускается: работает предыдущий."""
         routes.save_overrides({

@@ -246,7 +246,10 @@ def _unstable(summary: dict) -> bool:
     иначе держал бы предупреждение на сутки вперёд.
     """
     try:
-        reports = int(summary.get("reports") or 0)
+        # Записи без уровня не дают ни одного процента: для «нестабильно»
+        # нужны именно оценённые отчёты, а не общее число строк.
+        rated = summary.get("reports_rated")
+        reports = int(rated if rated is not None else summary.get("reports") or 0)
     except (TypeError, ValueError):
         reports = 0
     if reports < MIN_REPORTS_UNSTABLE:

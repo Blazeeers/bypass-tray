@@ -113,18 +113,16 @@ def _stability_numbers(data: dict) -> dict:
         except (TypeError, ValueError):
             return 0
 
-    # «uptime» уже посчитан, если на вход пришёл результат этой же функции:
-    # так карточка и подпись могут звать её по очереди, не теряя процент.
-    uptime = (data or {}).get("uptime")
-    if uptime is None:
-        uptime = (data or {}).get("uptime_pct")
+    # Процент берётся только из сводки: «в сети» — это ``uptime_pct``, и
+    # второго расчёта (из каких-то других ключей) быть не должно.
+    uptime = (data or {}).get("uptime_pct")
     try:
         uptime = None if uptime is None else int(uptime)
     except (TypeError, ValueError):
         uptime = None
     return {
         "reports": number("reports"),
-        "uptime": uptime,
+        "uptime_pct": uptime,
         "incidents": number("incidents"),
         "switches": number("server_switches"),
         "heals": number("heals"),
@@ -133,7 +131,7 @@ def _stability_numbers(data: dict) -> dict:
 
 def _uptime_part(stats: dict) -> str:
     """Кусок про долю «в сети»: «в сети 83%», при неизвестном проценте — «—»."""
-    uptime = stats["uptime"]
+    uptime = stats["uptime_pct"]
     return "в сети —" if uptime is None else f"в сети {uptime}%"
 
 
@@ -141,7 +139,7 @@ def _services_brief(count: int) -> str:
     """Сводка по не-ok пунктам: «всё в порядке» или «N требуют внимания»."""
     if count <= 0:
         return "всё в порядке"
-    word = "требует" if count % 10 == 1 and count % 100 != 11 else "требуют"
+    word = _plural(count, "требует", "требуют", "требуют")
     return f"{count} {word} внимания"
 
 
@@ -1607,8 +1605,8 @@ class Panel:
                 blocked = blocked or bool(busy.get("servers"))
             button.set_enabled(not blocked)
         if self._rollback is not None:
-            # Один опрос снимка на кадр: has_snapshot() читает файлы с диска,
-            # а кнопка нужна, только когда откат возможен.
+            # Один опрос снимка на кадр: has_snapshot() кэширует ответ в
+            # routes, поэтому тик панели не ходит за файлами на диск.
             snapshot = routes.has_snapshot()
             if snapshot:
                 if not self._rollback.winfo_manager():

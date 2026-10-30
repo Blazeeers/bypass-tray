@@ -21,7 +21,7 @@ from bypass_tray import ui  # noqa: E402
 
 def _stats(reports: int, uptime: int | None, incidents: int = 0,
            switches: int = 0, heals: int = 0) -> dict:
-    return {"reports": reports, "uptime": uptime, "incidents": incidents,
+    return {"reports": reports, "uptime_pct": uptime, "incidents": incidents,
             "server_switches": switches, "heals": heals}
 
 

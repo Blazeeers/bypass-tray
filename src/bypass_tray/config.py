@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import threading
 import time
@@ -97,6 +98,26 @@ def _backup_broken(path: Path) -> None:
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
     try:
         os.replace(path, path.with_name(f"{path.name}.bak-{stamp}"))
+    except OSError:
+        pass
+
+
+def _backup_copy(path: Path) -> None:
+    """Копия читаемого файла перед перезаписью: ``*.bak-<время>``.
+
+    В отличие от ``_backup_broken`` файл остаётся на месте: его содержимое
+    нормализуется или мигрирует, и прежний вариант нужен для разбора.
+    """
+    if not path.exists():
+        return
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    target = path.with_name(f"{path.name}.bak-{stamp}")
+    number = 1
+    while target.exists():
+        target = path.with_name(f"{path.name}.bak-{stamp}-{number}")
+        number += 1
+    try:
+        shutil.copy2(path, target)
     except OSError:
         pass
 
@@ -351,6 +372,8 @@ def load_config() -> dict:
         cfg.update(data)
     elif existed:
         return cfg
+    else:
+        data = None
     # Пишем файл только когда это действительно нужно: первый запуск,
     # миграция старых списков или найденные пути компонентов. Иначе чтение
     # конфига не должно трогать файл и его mtime.
@@ -358,10 +381,22 @@ def load_config() -> dict:
     # Старые config.json читаются как раньше: без ключа режим — "blocked",
     # неизвестное значение тоже сводится к нему (без записи файла).
     cfg["routing_mode"] = normalise_routing_mode(cfg.get("routing_mode"))
+    normalised = False
+    if isinstance(data, dict):
+        # Мусорное значение (``"routing_mode": 123``) или отброшенные
+        # не-строки в списке: файл будет переписан нормализованным, поэтому
+        # перед этим нужна копия — как у нечитаемого JSON.
+        normalised = (
+            ("routing_mode" in data
+             and data.get("routing_mode") != cfg["routing_mode"])
+            or ("xray_links" in data
+                and data.get("xray_links") != cfg["xray_links"]))
     changed = raw is None
+    migrated = False
     if "xray_routes" not in cfg:
         _migrate_routes(cfg)
         changed = True
+        migrated = True
     if not cfg.get("zapret_dir"):
         found = autodetect_zapret()
         if found != cfg.get("zapret_dir"):
@@ -373,6 +408,10 @@ def load_config() -> dict:
             cfg["tgws_exe"] = found
             changed = True
     if changed:
+        if raw is not None and (migrated or normalised):
+            # Перезапись не по воле пользователя: прежние байты сохраняем
+            # рядом, чтобы нормализацию можно было проверить и отменить.
+            _backup_copy(CONFIG_FILE)
         save_config(cfg)
     return cfg
 

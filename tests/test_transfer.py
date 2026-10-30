@@ -131,6 +131,40 @@ class TransferTests(unittest.TestCase):
         self.assertIn("routing_mode", result["applied"])
         self.assertNotIn("чужой_ключ", config.load_config())
 
+    def test_import_rejects_wrong_types_and_keeps_config_valid(self) -> None:
+        """Мусор в файле не попадает в конфиг даже частично."""
+        payload = {
+            "version": transfer.FORMAT_VERSION, "at": 1,
+            "app": config.APP_NAME, "secrets_included": False,
+            "settings": {
+                "routing_mode": "ALL",
+                "tgws_port": "abc",
+                "health_minutes": "x",
+                "xray_direct_domains": [123, True, "*.ok.example"],
+            },
+            "xray_routes": {}, "networks": {},
+        }
+        path = self.dir / "junk.json"
+        path.write_text(json.dumps(payload, ensure_ascii=False),
+                        encoding="utf-8")
+
+        result = transfer.import_settings(path)
+
+        self.assertTrue(result["ok"], result)
+        self.assertIn("tgws_port", result["skipped"])
+        self.assertIn("health_minutes", result["skipped"])
+        self.assertIn("tgws_port", result["skipped_reasons"])
+        # Известный режим приводится к нижнему регистру, а не отбрасывается.
+        self.assertIn("routing_mode", result["applied"])
+        self.assertIn("xray_direct_domains", result["applied"])
+        self.assertEqual(result["dropped"], {"xray_direct_domains": 2})
+
+        loaded = config.load_config()
+        self.assertEqual(loaded["routing_mode"], "all")
+        self.assertIsInstance(loaded["tgws_port"], int)
+        self.assertIsInstance(loaded["health_minutes"], int)
+        self.assertEqual(loaded["xray_direct_domains"], ["*.ok.example"])
+
     def test_import_makes_backup_of_current_config(self) -> None:
         config.save_config(sample_cfg(routing_mode="blocked"))
         path = self.dir / "up.json"
@@ -288,6 +322,32 @@ class TransferTests(unittest.TestCase):
 
         self.assertTrue(result["ok"], result)
         self.assertEqual(networks.all()["gw-1"]["server"], "node-a")
+
+
+class ConfigNormaliseBackupTests(unittest.TestCase):
+    """Мусор в config.json нормализуется, но прежний файл не теряется."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        config.set_config_dir(self.dir)
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(config.set_config_dir, None)
+
+    def test_junk_routing_mode_is_backed_up_and_normalised(self) -> None:
+        (self.dir / "config.json").write_text(
+            json.dumps({"routing_mode": 123}), encoding="utf-8")
+
+        cfg = config.load_config()
+
+        self.assertEqual(cfg["routing_mode"], "blocked")
+        backups = list(self.dir.glob("config.json.bak-*"))
+        self.assertEqual(len(backups), 1, backups)
+        # Копия — исходные байты, а рабочий файл — уже нормализованный.
+        self.assertEqual(json.loads(backups[0].read_text(encoding="utf-8")),
+                         {"routing_mode": 123})
+        saved = json.loads(config.CONFIG_FILE.read_text(encoding="utf-8"))
+        self.assertEqual(saved["routing_mode"], "blocked")
 
 
 #: Сервер для ``xray.build_config``: нужен только ``outbound``.

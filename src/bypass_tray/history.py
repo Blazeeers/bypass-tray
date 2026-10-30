@@ -152,6 +152,7 @@ def summarise(report_rows: list[dict], activity_rows: list[dict],
             if isinstance(row, dict) and _as_time(row.get("at"), 0.0) >= cutoff]
 
     total = len(kept)
+    rated = 0
     ok_count = 0
     by_service: dict[str, int] = {}
     worst = ""
@@ -160,15 +161,19 @@ def summarise(report_rows: list[dict], activity_rows: list[dict],
 
     for row in kept:
         level = str(row.get("level") or "")
-        if level == "ok":
-            ok_count += 1
+        rank = _LEVEL_RANK.get(level)
+        if rank is not None:
+            # Доля «в сети» считается только по записям с известным уровнем:
+            # старые строки без ``level`` иначе размывали бы знаменатель до нуля.
+            rated += 1
+            if level == "ok":
+                ok_count += 1
         items = row.get("items")
         if isinstance(items, dict):
             for item_id, state in items.items():
                 if str(state) in ("bad", "warn"):
                     key = str(item_id)
                     by_service[key] = by_service.get(key, 0) + 1
-        rank = _LEVEL_RANK.get(level)
         if rank is None:
             # Запись без уровня (старый формат) в счёт сбоев не идёт, но и
             # «здоровьем» не считается: её просто не видно в этих числах.
@@ -191,13 +196,14 @@ def summarise(report_rows: list[dict], activity_rows: list[dict],
             heals += 1
 
     return {
-        "uptime_pct": (round(100.0 * ok_count / total) if total else None),
+        "uptime_pct": (round(100.0 * ok_count / rated) if rated else None),
         "incidents": incidents,
         "worst": worst or None,
         "by_service": by_service,
         "first_at": _as_time(kept[0].get("at"), 0.0) if kept else None,
         "last_at": _as_time(kept[-1].get("at"), 0.0) if kept else None,
         "reports": total,
+        "reports_rated": rated,
         "server_switches": switches,
         "heals": heals,
     }

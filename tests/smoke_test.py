@@ -3601,9 +3601,10 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
     # --- битый конфиг: бэкап без перезаписи ----------------------------
     print("\n-- битый конфиг --")
     config_path = tmp / "config.json"
+    before_backups = set(tmp.glob("config.json.bak-*"))
     config_path.write_text("{ это не json", encoding="utf-8")
     recovered = config.load_config()
-    backups = list(tmp.glob("config.json.bak-*"))
+    backups = list(set(tmp.glob("config.json.bak-*")) - before_backups)
     check("битый конфиг: возвращены умолчания", recovered.get("zapret_dir") == "",
           repr(recovered.get("zapret_dir")))
     check("битый конфиг: сделан бэкап", len(backups) == 1,

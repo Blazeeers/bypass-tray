@@ -167,11 +167,63 @@ def _read_payload(path) -> tuple[dict | None, str]:
     return data, ""
 
 
+def _coerce_setting(key: str, value, default) -> tuple[bool, object, str, int]:
+    """Значение из файла в типе ``DEFAULTS``.
+
+    Мусор не должен попадать в конфиг: строка ``"abc"`` в числовом ключе
+    превращала бы порт в строку, а список с числами ломал бы построение
+    маршрутов. Возвращает ``(подходит, значение, причина отказа, отброшено)``:
+    ``отброшено`` — сколько не-строк выкинуто из списка.
+    """
+    if isinstance(default, bool):
+        if isinstance(value, bool):
+            return True, value, "", 0
+        if isinstance(value, int) and value in (0, 1):
+            return True, bool(value), "", 0
+        if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+            return True, value.strip().lower() == "true", "", 0
+        return False, None, "ожидалось true/false", 0
+    if isinstance(default, int):
+        if isinstance(value, bool):
+            return False, None, "ожидалось целое число", 0
+        if isinstance(value, int):
+            return True, value, "", 0
+        if isinstance(value, str):
+            try:
+                return True, int(value.strip()), "", 0
+            except ValueError:
+                return False, None, "ожидалось целое число", 0
+        return False, None, "ожидалось целое число", 0
+    if isinstance(default, str):
+        if not isinstance(value, str):
+            return False, None, "ожидалось строковое значение", 0
+        return True, value, "", 0
+    if isinstance(default, list):
+        if not isinstance(value, list):
+            return False, None, "ожидался список строк", 0
+        kept = [item for item in value if isinstance(item, str)]
+        return True, kept, "", len(value) - len(kept)
+    return False, None, "неизвестный тип значения", 0
+
+
+def _mode_setting(value) -> str:
+    """Режим маршрутизации: только известное значение, иначе пустая строка.
+
+    ``normalise_routing_mode`` на мусоре отдаёт ``blocked`` — для импорта это
+    была бы тихая подмена, поэтому неизвестное значение здесь — отказ.
+    """
+    if not isinstance(value, str):
+        return ""
+    mode = config.normalise_routing_mode(value)
+    return mode if mode == value.strip().lower() else ""
+
+
 def import_settings(path, apply: bool = True) -> dict:
     """Читает файл переноса и применяет его к текущему профилю.
 
-    Меняются только ключи из ``DEFAULTS``; неизвестные перечисляются в
-    ``skipped`` и не трогают конфиг. Маршруты проходят через
+    Меняются только ключи из ``DEFAULTS``; неизвестные и не прошедшие
+    проверку типа перечисляются в ``skipped`` (причина — в
+    ``skipped_reasons``) и не трогают конфиг. Маршруты проходят через
     ``routes.normalise_routes``, сети — через ``networks.remember``, то есть
     валидацию и атомарную запись дают существующие функции.
 
@@ -180,17 +232,38 @@ def import_settings(path, apply: bool = True) -> dict:
     data, error = _read_payload(path)
     if data is None:
         return {"ok": False, "error": error, "applied": [], "skipped": [],
+                "skipped_reasons": {}, "dropped": {},
                 "backup": "", "secrets_included": False}
 
     current = config.load_config()
     applied: list[str] = []
     skipped: list[str] = []
+    skipped_reasons: dict[str, str] = {}
+    dropped: dict[str, int] = {}
     for key, value in data["settings"].items():
         if key not in config.DEFAULTS or key == ROUTES_KEY:
             skipped.append(key)
+            skipped_reasons[key] = "неизвестный ключ"
             continue
-        current[key] = value
+        if key == "routing_mode":
+            mode = _mode_setting(value)
+            if not mode:
+                skipped.append(key)
+                skipped_reasons[key] = "неизвестный режим маршрутизации"
+                continue
+            current[key] = mode
+            applied.append(key)
+            continue
+        ok, coerced, reason, removed = _coerce_setting(
+            key, value, config.DEFAULTS[key])
+        if not ok:
+            skipped.append(key)
+            skipped_reasons[key] = reason
+            continue
+        current[key] = coerced
         applied.append(key)
+        if removed:
+            dropped[key] = removed
 
     raw_routes = data.get(ROUTES_KEY)
     route_count = 0
@@ -205,6 +278,7 @@ def import_settings(path, apply: bool = True) -> dict:
             applied.append(ROUTES_KEY)
         else:
             skipped.append(ROUTES_KEY)
+            skipped_reasons[ROUTES_KEY] = "ожидался объект с правилами"
 
     raw_networks = data.get("networks")
     network_items: list[tuple[str, dict]] = []
@@ -219,11 +293,14 @@ def import_settings(path, apply: bool = True) -> dict:
             applied.append("networks")
         else:
             skipped.append("networks")
+            skipped_reasons["networks"] = "ожидался объект сетей"
 
     report = {
         "ok": True,
         "applied": applied,
         "skipped": skipped,
+        "skipped_reasons": skipped_reasons,
+        "dropped": dropped,
         "backup": "",
         "secrets_included": bool(data.get("secrets_included")),
         "routes": route_count,
