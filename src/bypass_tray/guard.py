@@ -176,7 +176,7 @@ def _heal_routes(cfg: dict) -> list[dict]:
         return []
     try:
         result = routes.audit(cfg)
-        applied = routes.apply_audit(result, cfg)
+        applied = routes.apply_audit(result, cfg, reason="auto")
     except Exception as exc:  # noqa: BLE001
         return [_action("warn", f"аудит маршрутов не удался: {exc}")]
     changed = applied.get("changed") or []

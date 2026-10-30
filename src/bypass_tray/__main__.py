@@ -175,6 +175,10 @@ def main() -> int:
                         help="напечатать JSON аудита маршрутов доменов и выйти")
     parser.add_argument("--apply", action="store_true",
                         help="при --route-audit применить найденные маршруты")
+    parser.add_argument("--routes-plan", action="store_true",
+                        help="напечатать JSON сухого прогона маршрутов и выйти")
+    parser.add_argument("--routes-rollback", action="store_true",
+                        help="откатить последнее изменение маршрутов и напечатать JSON")
     parser.add_argument("--updates", action="store_true",
                         help="напечатать JSON проверки обновлений и выйти")
     args = parser.parse_args()
@@ -195,6 +199,29 @@ def main() -> int:
                       "error": f"{type(exc).__name__}: {exc}"}
         _print_json(result)
         return 0
+
+    if args.routes_plan:
+        from . import routes
+
+        cfg = config.load_config()
+        try:
+            result = routes.plan(cfg)
+        except Exception as exc:  # noqa: BLE001
+            result = {"at": time.time(), "changes": 0,
+                      "error": f"{type(exc).__name__}: {exc}"}
+        _print_json(result)
+        return 0
+
+    if args.routes_rollback:
+        from . import routes
+
+        cfg = config.load_config()
+        try:
+            result = routes.rollback_last(cfg)
+        except Exception as exc:  # noqa: BLE001
+            result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        _print_json(result)
+        return 0 if result.get("ok") else 1
 
     if args.route_audit:
         from . import routes

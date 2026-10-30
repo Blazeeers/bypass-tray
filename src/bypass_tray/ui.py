@@ -19,7 +19,7 @@ from tkinter import messagebox
 
 from PIL import ImageTk
 
-from . import icons
+from . import icons, routes
 from .secrets import redact_text
 from .settings_ui import SettingsPage
 from .theme import SPACE, Theme, resolve_dark
@@ -276,6 +276,8 @@ class Panel:
         self._activity_rows: list[dict] = []
         self._activity_empty: tk.Label | None = None
         self._buttons: dict[str, PillButton] = {}
+        #: Откат последнего изменения маршрутов: в шапке карточки журнала.
+        self._rollback: PillButton | None = None
         self._servers_open = False
         self._servers_section: AnimatedSection | None = None
         self._servers_frame: tk.Frame | None = None
@@ -463,6 +465,9 @@ class Panel:
         kind, payload = event
         if kind == "ok":
             self._ui_error = ""
+        elif kind == "routes_plan":
+            # Сухой прогон вернулся из фонового потока: диалог — здесь.
+            self._ask_routes(payload)
         elif kind == "failed":
             self._report_action_failed(str(payload))
         elif kind == "error":
@@ -909,6 +914,12 @@ class Panel:
             header, text="", bg=theme.card, fg=theme.text_faint,
             font=theme.caption(), anchor="w")
         self._activity_period.pack(side="left", padx=(SPACE["sm"], 0))
+        # Откат живёт рядом с журналом: там видно, что именно виджет сделал сам.
+        self._rollback = PillButton(header, theme, "Откатить маршруты",
+                                    self._confirm_rollback, kind="ghost",
+                                    height=ROW_CONTROL_HEIGHT, pad_x=SPACE["md"])
+        self._rollback.pack(side="right")
+        self._rollback.set_enabled(False)
         self._activity_empty = tk.Label(
             inner, text="", bg=theme.card, fg=theme.text_faint,
             font=theme.body(), anchor="w",
@@ -1290,6 +1301,10 @@ class Panel:
             if key == "subscription":
                 blocked = blocked or bool(busy.get("servers"))
             button.set_enabled(not blocked)
+        if self._rollback is not None:
+            # Действие есть смысл показывать, только когда откат возможен.
+            self._rollback.set_enabled(routes.has_snapshot()
+                                       and not busy.get("routes"))
 
     # ---- компоновка и прокрутка -------------------------------------------
     def _header_height(self) -> int:
@@ -1439,13 +1454,55 @@ class Panel:
 
     # ---- действия ----------------------------------------------------------
     def _confirm_routes(self) -> None:
-        """Спрашивает подтверждение и применяет маршруты с перезапуском Xray."""
+        """Спрашивает подтверждение и применяет маршруты с перезапуском Xray.
+
+        Сначала сухой прогон в фоне: в диалоге видно, что именно изменится.
+        Без изменений перезапуск не предлагается вовсе.
+        """
+        plan_fn = getattr(self.controller, "plan_routes", None)
+        if not callable(plan_fn):
+            # Контроллер без сухого прогона: прежний вопрос про перезапуск.
+            self._ask_routes(None)
+            return
+        self._call_plan(plan_fn)
+
+    def _call_plan(self, plan_fn) -> None:
+        """Сухой прогон в фоне; диалог покажет UI-поток по готовности."""
+        key = (plan_fn, "plan")
+        if key in self._inflight:
+            return
+        self._inflight.add(key)
+
+        def run() -> None:
+            try:
+                plan = plan_fn()
+            except Exception as exc:  # noqa: BLE001
+                self._queue.put(("error", exc))
+            else:
+                self._queue.put(("routes_plan", plan))
+            finally:
+                self._inflight.discard(key)
+            self._queue.put("render")
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _ask_routes(self, plan) -> None:
+        """Подтверждение применения: резюме прогона вместо глухого вопроса."""
+        summary = str((plan or {}).get("summary") or "") if isinstance(plan, dict) else ""
+        if summary and not (plan or {}).get("changes"):
+            try:
+                messagebox.showinfo("Проверить маршруты", summary,
+                                    parent=self._root)
+            except tk.TclError:
+                pass
+            return
+        question = ("Туннель перезапустится на несколько секунд. Продолжить?"
+                    if not summary else
+                    f"{summary}.\n\nТуннель перезапустится на несколько "
+                    "секунд. Продолжить?")
         try:
-            answer = messagebox.askyesno(
-                "Проверить маршруты",
-                "Туннель перезапустится на несколько секунд. Продолжить?",
-                parent=self._root,
-            )
+            answer = messagebox.askyesno("Проверить маршруты", question,
+                                         parent=self._root)
         except tk.TclError:
             return
         if not answer:
@@ -1453,6 +1510,23 @@ class Panel:
         apply_now = getattr(self.controller, "apply_routes", None)
         if callable(apply_now):
             self._call(apply_now)
+
+    def _confirm_rollback(self) -> None:
+        """Откат последнего изменения маршрутов: подтверждение и контроллер."""
+        try:
+            answer = messagebox.askyesno(
+                "Откатить маршруты",
+                "Вернуть маршруты к состоянию до последнего изменения? "
+                "Туннель может перезапуститься на несколько секунд.",
+                parent=self._root,
+            )
+        except tk.TclError:
+            return
+        if not answer:
+            return
+        rollback = getattr(self.controller, "rollback_routes", None)
+        if callable(rollback):
+            self._call(rollback)
 
     def _call(self, fn, *args) -> None:
         """Просит контроллер выполнить действие; панель не блокируется.

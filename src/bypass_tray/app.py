@@ -92,6 +92,8 @@ class TrayApp:
         self.guard_running = False
         self.route_report: dict = {}
         self.route_running = False
+        #: Отчёт, который показан в диалоге подтверждения: применяем ровно его.
+        self.route_plan_report: dict | None = None
         self.updates_report: dict = {}
         self.updates_running = False
         self.activity_items: list = []
@@ -947,11 +949,15 @@ class TrayApp:
             try:
                 report = routes.audit(self.cfg)
                 self.route_report = report
-                applied = routes.apply_audit(report, self.cfg)
+                applied = routes.apply_audit(report, self.cfg, reason="manual")
                 changed = applied.get("changed") or []
                 if changed:
                     activity.log("маршруты обновлены — применятся при следующем подключении")
                     self.notify(f"Маршруты: изменено {len(changed)}")
+                elif applied.get("saved") is False:
+                    # Запись не состоялась (например, файл повреждён): «нет
+                    # изменений» здесь было бы неправдой.
+                    self.notify(f"Маршруты не сохранены: {applied.get('error') or '?'}")
                 else:
                     self.notify("Маршруты: изменений нет")
             except Exception as exc:  # noqa: BLE001
@@ -966,6 +972,47 @@ class TrayApp:
         threading.Thread(target=worker, daemon=True, name="routes").start()
         return True
 
+    def plan_routes(self) -> dict:
+        """Сухой прогон для диалога: что изменится. Ничего не пишет и не рвёт.
+
+        Отчёт запоминается: если человек подтвердит, применяется именно он, а
+        не результат второго аудита (сеть за это время могла ответить иначе).
+        """
+        report = routes.audit(self.cfg)
+        self.route_report = report
+        self.route_plan_report = report
+        return routes.plan(self.cfg, result=report)
+
+    def rollback_routes(self) -> bool:
+        """Откат последнего изменения маршрутов — из панели."""
+        if self.route_running:
+            return False
+        self.route_running = True
+        self.busy["routes"] = "откатываю маршруты…"
+        self._signature = None
+
+        def worker() -> None:
+            try:
+                outcome = routes.rollback_last(self.cfg)
+                if not outcome.get("ok"):
+                    self.notify(f"Откат не удался: {outcome.get('error') or '?'}")
+                else:
+                    message = f"Маршруты откатил: {int(outcome.get('changed') or 0)}"
+                    if outcome.get("restarted"):
+                        message += " (прокси перезапущен)"
+                    self.notify(message)
+            except Exception as exc:  # noqa: BLE001
+                self.notify(f"Откат не удался: {type(exc).__name__}")
+            finally:
+                self.route_running = False
+                self.busy.pop("routes", None)
+                self.refresh_activity()
+                self._signature = None
+                self.refresh()
+
+        threading.Thread(target=worker, daemon=True, name="route-rollback").start()
+        return True
+
     def apply_routes(self) -> bool:
         """Аудит и немедленное применение — с перезапуском Xray."""
         if self.route_running:
@@ -973,10 +1020,13 @@ class TrayApp:
         self.route_running = True
         self.busy["routes"] = "применяю маршруты…"
         self._signature = None
+        # Отчёт подтверждённого плана одноразовый.
+        report = self.route_plan_report
+        self.route_plan_report = None
 
         def worker() -> None:
             try:
-                outcome = routes.apply_now(self.cfg)
+                outcome = routes.apply_now(self.cfg, result=report)
                 changed = int(outcome.get("changed") or 0)
                 if changed:
                     message = f"Маршруты применены: {changed}"
@@ -991,6 +1041,8 @@ class TrayApp:
                             "routes",
                             "Маршруты сохранены, но прокси не перезапустился",
                         )
+                elif outcome.get("saved") is False:
+                    self.notify(f"Маршруты не применены: {outcome.get('error') or '?'}")
                 else:
                     self.notify("Маршруты: изменений нет")
             except Exception as exc:  # noqa: BLE001

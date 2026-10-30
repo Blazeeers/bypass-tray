@@ -431,27 +431,89 @@ def overrides_path() -> Path:
     return config_dir() / "route_overrides.json"
 
 
-def _load_file() -> dict:
-    """Сырой файл: ``{"at": время, "routes": {домен: запись}}``.
+#: Текст ошибки для неразбираемого файла маршрутов. Политика та же, что у
+#: ``config.json``: молча поверх не пишем — иначе один сбой чтения стёр бы
+#: весь набор маршрутов без возможности откатиться.
+BROKEN_MESSAGE = "route_overrides.json повреждён — не трогаю"
+
+
+def _read_state() -> tuple[dict, str]:
+    """Сырой файл и признак проблемы: ``({"at", "routes"}, error)``.
+
+    ``error`` пуст, когда файла нет или он разобран. Неразбираемый файл
+    отдаётся пустым набором, но с непустым ``error``: вызывающий код обязан
+    отказаться от записи, а не затирать чужие байты.
 
     Старый плоский формат (``{домен: запись}``) читается как есть — файлы
     предыдущей версии остаются рабочими.
     """
+    path = overrides_path()
     try:
-        data = json.loads(overrides_path().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {"at": 0.0, "routes": {}}
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return {"at": 0.0, "routes": {}}, ""
+    except OSError as exc:
+        return {"at": 0.0, "routes": {}}, f"{path.name} не читается — не трогаю: {exc}"
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        return {"at": 0.0, "routes": {}}, BROKEN_MESSAGE
     if not isinstance(data, dict):
-        return {"at": 0.0, "routes": {}}
+        return {"at": 0.0, "routes": {}}, BROKEN_MESSAGE
     routes_part = data.get("routes")
     if isinstance(routes_part, dict):
         try:
             at = float(data.get("at") or 0)
         except (TypeError, ValueError):
             at = 0.0
-        return {"at": at, "routes": routes_part}
+        return {"at": at, "routes": routes_part}, ""
     flat = {str(key): value for key, value in data.items() if isinstance(value, dict)}
-    return {"at": 0.0, "routes": flat}
+    return {"at": 0.0, "routes": flat}, ""
+
+
+def _load_file() -> dict:
+    """Сырой файл: ``{"at": время, "routes": {домен: запись}}``."""
+    return _read_state()[0]
+
+
+def _preserve_broken() -> str:
+    """Копия неразбираемого файла рядом: ``route_overrides.json.broken-<время>``.
+
+    Сам файл не переписывается, поэтому разбирать его можно спокойно. Те же
+    байты второй раз не копируются: почасовой аудит не станет плодить файлы.
+    Пустая строка — копия не сделана.
+    """
+    path = overrides_path()
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return ""
+    try:
+        for old in sorted(path.parent.glob(path.name + ".broken-*")):
+            try:
+                if old.read_bytes() == raw:
+                    return str(old)
+            except OSError:
+                continue
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+        target = path.with_name(f"{path.name}.broken-{stamp}")
+        counter = 2
+        while target.exists():
+            target = path.with_name(f"{path.name}.broken-{stamp}-{counter}")
+            counter += 1
+        temp = target.with_name(f"{target.name}.tmp-{os.getpid()}")
+        try:
+            temp.write_bytes(raw)
+            os.replace(temp, target)
+        except OSError:
+            try:
+                temp.unlink()
+            except OSError:
+                pass
+            return ""
+        return str(target)
+    except OSError:
+        return ""
 
 
 def load_overrides() -> dict:
@@ -470,32 +532,20 @@ def save_overrides(data: dict, at: float | None = None) -> bool:
                              json.dumps(payload, ensure_ascii=False, indent=2)))
 
 
-def apply_audit(result: dict, cfg: dict | None = None) -> dict:
-    """Переносит результат аудита в оверрайды.
+def _compute_overrides(result: dict, cfg: dict, overrides: dict,
+                       at: float) -> dict:
+    """Новый набор маршрутов по результату аудита — без записи на диск.
 
-    Пользовательские правила из ``cfg["xray_routes"]`` важнее автоподбора:
-    такие домены не перезаписываются (и старый оверрайд для них удаляется).
-
-    Сохраняются и ``direct``, и ``proxy``: direct — тоже решение аудита, а не
-    отсутствие записи. ``unknown`` не сохраняется вовсе. Исключение — режим
-    ``all``: там любой ``direct`` аудита увёл бы трафик мимо VPN, поэтому
-    direct-решения не пишутся, а оставшиеся от сессий в ``blocked`` удаляются.
-
-    Прунинг — только у полного аудита (``result["full"]``) или по явному
-    списку ``result["prune_domains"]``: тогда удаляется запись домена, который
-    в этот раз не проверялся, то есть выпал из аудита. Частичный аудит не
-    трогает маршруты, которых он не касался: стереть лишнее хуже, чем
-    оставить. У неизменившегося маршрута сохраняется исходное ``since``.
-
-    Возвращает ``{"changed": [...], "overrides": {...}, "saved": bool}``;
-    при неудачной записи ``changed`` пуст и есть ``error``.
+    Общий расчёт для ``apply_audit`` и ``plan``: решения те же, разница лишь в
+    том, что потом делают с результатом. Что именно изменилось, вызывающий
+    считает сравнением «было/стало» (``_changed_domains``): список правок,
+    собранный по ходу расчёта, пропускал удаления — например, чистку
+    устаревшего ``direct`` в режиме ``all``.
     """
-    at = float(result.get("at") or time.time())
-    overrides = dict(_load_file()["routes"])
-    user_direct, user_proxy = user_routes(cfg or {})
-    mode = normalise_routing_mode((cfg or {}).get("routing_mode"))
+    overrides = dict(overrides)
+    user_direct, user_proxy = user_routes(cfg)
+    mode = normalise_routing_mode(cfg.get("routing_mode"))
     locked = set(user_direct) | set(user_proxy)
-    changed: list[str] = []
     audited: set[str] = set()
     for item in result.get("items") or []:
         domain = clean_domain(item.get("domain") or "")
@@ -506,16 +556,13 @@ def apply_audit(result: dict, cfg: dict | None = None) -> dict:
         audited.add(domain)
         if domain in locked:
             # Своё правило сильнее любого автоподбора.
-            if domain in overrides:
-                overrides.pop(domain, None)
-                changed.append(domain)
+            overrides.pop(domain, None)
             continue
         if route not in ("direct", "proxy", "broken"):
             continue
         if route == "direct" and mode == "all":
             # В режиме "all" direct-решение аудита увело бы домен мимо VPN.
-            # Такое не пишем и чистим оставшееся от прошлых сессий: маршрут
-            # домена в этом режиме и так идёт через прокси, перезапуск не нужен.
+            # Такое не пишем и чистим оставшееся от прошлых сессий.
             overrides.pop(domain, None)
             continue
         previous = overrides.get(domain) or {}
@@ -529,8 +576,6 @@ def apply_audit(result: dict, cfg: dict | None = None) -> dict:
             old_since = float(previous.get("since") or 0)
         except (TypeError, ValueError):
             old_since = 0.0
-        if not same:
-            changed.append(domain)
         overrides[domain] = {
             "route": route,
             "since": old_since if same and old_since else at,
@@ -551,11 +596,301 @@ def apply_audit(result: dict, cfg: dict | None = None) -> dict:
                 continue
             if domain not in audited:
                 overrides.pop(domain, None)
-                changed.append(domain)
+    return overrides
+
+
+def apply_audit(result: dict, cfg: dict | None = None,
+                reason: str = "manual") -> dict:
+    """Переносит результат аудита в оверрайды.
+
+    Пользовательские правила из ``cfg["xray_routes"]`` важнее автоподбора:
+    такие домены не перезаписываются (и старый оверрайд для них удаляется).
+
+    Сохраняются и ``direct``, и ``proxy``: direct — тоже решение аудита, а не
+    отсутствие записи. ``unknown`` не сохраняется вовсе. Исключение — режим
+    ``all``: там любой ``direct`` аудита увёл бы трафик мимо VPN, поэтому
+    direct-решения не пишутся, а оставшиеся от сессий в ``blocked`` удаляются.
+
+    Прунинг — только у полного аудита (``result["full"]``) или по явному
+    списку ``result["prune_domains"]``: тогда удаляется запись домена, который
+    в этот раз не проверялся, то есть выпал из аудита. Частичный аудит не
+    трогает маршруты, которых он не касался: стереть лишнее хуже, чем
+    оставить. У неизменившегося маршрута сохраняется исходное ``since``.
+
+    Прежнее состояние перед записью уходит в снимок: ``reason`` — ``"auto"``
+    у надзирателя, ``"manual"`` у кнопки и CLI. По снимку работает
+    ``rollback_last``. Если маршруты не меняются, снимок не делается — иначе
+    почасовой аудит вытеснил бы из цепочки настоящее изменение.
+
+    Изменение считается сравнением «было/стало», а не подсчётом решений в
+    ходе расчёта: в режиме ``all`` устаревший ``direct`` удаляется без нового
+    правила, и это тоже изменение — со снимком и с перезапуском Xray. Так
+    обещанный планом результат (``plan``) и настоящий совпадают.
+
+    Повреждённый ``route_overrides.json`` не перезаписывается — политика та же,
+    что у ``config.json``: молча поверх не пишем. Байты уходят в копию
+    ``route_overrides.json.broken-<время>``, маршруты остаются как были, а в
+    ответе — ``saved: False`` и ``error``; Xray не перезапускается.
+
+    Возвращает ``{"changed": [...], "overrides": {...}, "saved": bool}``;
+    при неудачной записи ``changed`` пуст и есть ``error``.
+    """
+    at = float(result.get("at") or time.time())
+    current_file, read_error = _read_state()
+    current = dict(current_file["routes"])
+    if read_error:
+        # Файл не разобрать: писать поверх нельзя — прежние маршруты пропали
+        # бы бесследно. Копию байтов оставляем рядом для разбора руками.
+        return {"changed": [], "overrides": current, "saved": False,
+                "error": read_error, "broken_copy": _preserve_broken()}
+    overrides = _compute_overrides(result, cfg or {}, current, at)
+    changed = _changed_domains(current, overrides)
+    if changed and not _snapshot_save(reason):
+        # Без снимка откат невозможен: менять маршруты молча нечестно.
+        return {"changed": [], "overrides": current, "saved": False,
+                "error": last_write_error() or "снимок не сохранился"}
     if not save_overrides(overrides, at=at):
         return {"changed": [], "overrides": overrides, "saved": False,
                 "error": last_write_error()}
     return {"changed": changed, "overrides": overrides, "saved": True}
+
+
+# ---- снимки и откат -------------------------------------------------------
+
+#: Сколько снимков прежнего состояния держим: откат работает на несколько шагов.
+SNAPSHOT_LIMIT = 3
+
+
+def snapshots_dir() -> Path:
+    """Каталог снимков прежнего ``route_overrides.json``."""
+    return config_dir() / "route_overrides_prev"
+
+
+def _snapshot_files() -> list[Path]:
+    """Файлы снимков от старого к новому: имя — время создания."""
+    try:
+        return sorted(snapshots_dir().glob("*.json"))
+    except OSError:
+        return []
+
+
+def _snapshot_save(reason: str) -> bool:
+    """Сохраняет прежнее состояние маршрутов перед записью нового.
+
+    Формат ``route_overrides.json`` не меняется: снимок лежит рядом, в своём
+    каталоге, и содержит прежние ``{"at", "routes"}`` целиком плюс причину.
+    """
+    previous = _load_file()
+    stamp = time.time()
+    directory = snapshots_dir()
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
+    # Имя с нулями: сортировка по имени совпадает с порядком времени.
+    target = directory / f"{int(stamp * 1_000_000):016d}.json"
+    while target.exists():
+        # Два изменения в одну микросекунду не должны затереть друг друга.
+        stamp += 0.000001
+        target = directory / f"{int(stamp * 1_000_000):016d}.json"
+    payload = {
+        "at": stamp,
+        "reason": str(reason or "manual"),
+        "snapshot": {"at": previous["at"], "routes": previous["routes"]},
+    }
+    if not atomic_write(target, json.dumps(payload, ensure_ascii=False, indent=2)):
+        return False
+    for old in _snapshot_files()[:-SNAPSHOT_LIMIT]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    return True
+
+
+def has_snapshot() -> bool:
+    """Есть ли снимок для отката: панель показывает действие только тогда."""
+    return bool(last_snapshot())
+
+
+def last_snapshot() -> dict:
+    """Последний читаемый снимок: ``{"at", "reason", "snapshot", "path"}``.
+
+    Идём от новых файлов к старым и пропускаем нечитаемые: один битый снимок
+    не должен запирать откат, когда глубже в цепочке лежат рабочие.
+    ``{}`` — пригодных снимков нет.
+    """
+    for path in reversed(_snapshot_files()):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict) or not isinstance(data.get("snapshot"), dict):
+            continue
+        return {**data, "path": path}
+    return {}
+
+
+def _route_map(routes_part) -> dict[str, dict]:
+    """Записи маршрутов из снимка в том же виде, что и в файле."""
+    if not isinstance(routes_part, dict):
+        return {}
+    return {str(key): dict(value) for key, value in routes_part.items()
+            if isinstance(value, dict)}
+
+
+def _changed_domains(current: dict, target: dict) -> list[str]:
+    """Домены, чей маршрут различается между двумя наборами."""
+    changed = []
+    for name in sorted(set(current) | set(target)):
+        before = str((current.get(name) or {}).get("route") or "")
+        after = str((target.get(name) or {}).get("route") or "")
+        if before != after:
+            changed.append(name)
+    return changed
+
+
+def rollback_last(cfg: dict | None = None) -> dict:
+    """Возвращает предыдущий снимок в ``route_overrides.json``.
+
+    Снимок считается израсходованным: следующий откат шагнёт на шаг назад по
+    цепочке (до ``SNAPSHOT_LIMIT`` шагов). Пользовательские ``xray_routes``
+    не трогаются: они живут в конфиге, а не в маршрутах. Xray перезапускается
+    только если он запущен и набор маршрутов правда изменился.
+
+    Время аудита после отката — не старее текущего: иначе ``due()`` сразу
+    объявил бы маршруты просроченными и надзиратель в тот же час вернул бы
+    свои решения. Так откат держится ``route_audit_minutes``.
+    """
+    last = last_snapshot()
+    if not last:
+        return {"ok": False, "changed": 0, "restarted": False,
+                "error": "снимков нет — откатывать нечего"}
+    target = _route_map(last["snapshot"].get("routes"))
+    current = load_overrides()
+    changed = _changed_domains(current, target)
+    try:
+        snapshot_at = float(last["snapshot"].get("at") or 0)
+    except (TypeError, ValueError):
+        snapshot_at = 0.0
+    # Сценарий «ночью поменял, утром откатил»: старый ``at`` из снимка сделал
+    # бы маршруты просроченными в ту же минуту.
+    at = max(snapshot_at, time.time())
+    if not save_overrides(target, at=at):
+        return {"ok": False, "changed": 0, "restarted": False,
+                "error": last_write_error() or "маршруты не записались"}
+    restarted = False
+    if changed:
+        from . import xray as xray_module
+
+        if xray_module.is_running():
+            server = xray_module.saved_server()
+            outcome = (xray_module.switch_to(server, cfg or {})
+                       if server is not None else xray_module.restart(cfg or {}))
+            restarted = bool(outcome.get("ok"))
+    from . import activity
+
+    activity.log(f"откатил маршруты: изменено {len(changed)}", kind="ok")
+    try:
+        last["path"].unlink()
+    except (OSError, KeyError):
+        pass
+    return {"ok": True, "changed": len(changed), "restarted": restarted,
+            "reason": str(last.get("reason") or ""),
+            "at": float(last.get("at") or 0)}
+
+
+_PLAN_PREVIEW = 4
+
+
+def _plan_items(rows: list[dict], route_key: str) -> str:
+    """Короткий перечень доменов для резюме: не длиннее ``_PLAN_PREVIEW``."""
+    shown = [f"{row['domain']} → {row[route_key]}" if route_key else row["domain"]
+             for row in rows[:_PLAN_PREVIEW]]
+    text = ", ".join(shown)
+    hidden = len(rows) - _PLAN_PREVIEW
+    return f"{text} и ещё {hidden}" if hidden > 0 else text
+
+
+def plan(cfg: dict, result: dict | None = None) -> dict:
+    """Что изменится при применении аудита — ничего не записывая.
+
+    ``result`` — готовый отчёт ``audit``: тогда сеть не трогается вовсе и
+    прогон работает офлайн. Без него отчёт собирается здесь же; недоступная
+    сеть даёт ``unknown`` и, значит, «изменений нет» — тоже без падения.
+
+    Возвращает добавления, смены маршрута, удаления, нетронутые пользовательские
+    домены и готовое человеческое резюме. Повреждённый файл маршрутов план не
+    толкует по-своему: применение его не тронет, поэтому в резюме — та же
+    ошибка, ``changes: 0`` и пустой ``restart_needed``.
+    """
+    current_file, read_error = _read_state()
+    current = dict(current_file["routes"])
+    mode = normalise_routing_mode((cfg or {}).get("routing_mode"))
+    if read_error:
+        return {
+            "at": time.time(),
+            "mode": mode,
+            "changes": 0,
+            "restart_needed": False,
+            "added": [],
+            "changed": [],
+            "removed": [],
+            "kept_user": [],
+            "summary": read_error,
+            "error": read_error,
+        }
+    if result is None:
+        result = audit(cfg or {})
+    at = float(result.get("at") or time.time())
+    proposed = _compute_overrides(result, cfg or {}, current, at)
+    user_direct, user_proxy = user_routes(cfg or {})
+    locked = set(user_direct) | set(user_proxy)
+
+    added: list[dict] = []
+    retargeted: list[dict] = []
+    removed: list[dict] = []
+    for domain in sorted(set(current) | set(proposed)):
+        old_route = str((current.get(domain) or {}).get("route") or "")
+        new_route = str((proposed.get(domain) or {}).get("route") or "")
+        if not old_route and new_route:
+            added.append({"domain": domain, "route": new_route})
+        elif old_route and not new_route:
+            removed.append({"domain": domain, "route": old_route})
+        elif old_route != new_route:
+            retargeted.append({"domain": domain, "from": old_route,
+                               "to": new_route})
+
+    moved = {row["domain"] for row in added + retargeted + removed}
+    seen = {clean_domain(item.get("domain") or "")
+            for item in result.get("items") or []}
+    kept_user = sorted(name for name in seen
+                       if name and name in locked and name not in moved)
+
+    parts = []
+    if retargeted:
+        parts.append(f"изменятся {len(retargeted)}: "
+                     + _plan_items(retargeted, "to"))
+    if added:
+        parts.append(f"добавятся {len(added)}: " + _plan_items(added, "route"))
+    if removed:
+        parts.append(f"удалятся {len(removed)}: " + _plan_items(removed, ""))
+    summary = "; ".join(parts) or "изменений нет"
+    if kept_user:
+        summary += f"; свои правила не трону: {len(kept_user)}"
+
+    changes = len(added) + len(retargeted) + len(removed)
+    return {
+        "at": at,
+        "mode": mode,
+        "changes": changes,
+        "restart_needed": changes > 0,
+        "added": added,
+        "changed": retargeted,
+        "removed": removed,
+        "kept_user": kept_user,
+        "summary": summary,
+    }
 
 
 def _domains_by_route(route: str) -> list[str]:
@@ -605,14 +940,19 @@ def fresh(minutes: int = 60) -> bool:
     return not due(minutes)
 
 
-def apply_now(cfg: dict) -> dict:
+def apply_now(cfg: dict, result: dict | None = None) -> dict:
     """Явное применение маршрутов — для кнопки UI.
 
     Единственное место, где маршруты применяются сразу с перезапуском Xray.
     Надзиратель эту функцию не зовёт: живой туннель он не рвёт.
+
+    ``result`` — готовый отчёт ``plan`` (диалог панели уже показал его
+    пользователю): тогда повторного аудита нет и применяется ровно то, что
+    человек подтвердил.
     """
-    result = audit(cfg)
-    applied = apply_audit(result, cfg)
+    if result is None:
+        result = audit(cfg)
+    applied = apply_audit(result, cfg, reason="manual")
     if not applied.get("saved", True):
         # Запись не удалась: применять нечего, Xray читал бы прежний файл.
         return {"changed": 0, "need_restart": False, "restarted": False,
