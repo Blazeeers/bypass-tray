@@ -14,7 +14,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog
 
-from . import activity, blocked, components, config, routes, xray
+from . import activity, blocked, components, config, presets, routes, xray
 from .theme import SPACE, Theme
 from .widgets import (
     Card, Divider, Dropdown, HoverRow, PillButton, ScrollBody, Section,
@@ -406,6 +406,36 @@ class SettingsPage(tk.Frame):
             "tgws_exe": tk.StringVar(value=_text_value(cfg, "tgws_exe")),
         }
 
+        # --- сценарии (до «Поведения»: это первое, что ищут в настройках) ---
+        scenarios = self._section(pad, "Сценарии")
+        self._label(
+            scenarios,
+            "Готовый набор режима и тумблеров. Применяется к форме сразу, а в "
+            "файл попадает после «Сохранить». Свои маршруты и выбранные "
+            "серверы сценарий не трогает.", caption=True)
+        chips = tk.Frame(scenarios, bg=theme.card)
+        chips.pack(fill="x", pady=(0, SPACE["xs"]))
+        self.preset_buttons: dict[str, PillButton] = {}
+        chip_pad = SPACE["sm"]
+        for preset in presets.PRESETS:
+            text = str(preset["title"])
+            # Ширина по жирному начертанию: активный чип рисуется primary,
+            # и обычная ширина обрезала бы его текст.
+            width = theme.body("bold").measure(text) + 2 * chip_pad
+            button = PillButton(
+                chips, theme, text,
+                lambda pid=preset["id"]: self._apply_preset(pid),
+                kind="secondary", height=CONTROL_HEIGHT, pad_x=chip_pad,
+                width=width)
+            button.pack(side="left", padx=(0, chip_pad))
+            self.tooltips.append(Tooltip(button, str(preset["hint"])))
+            self.preset_buttons[preset["id"]] = button
+        self.preset_status = tk.Label(
+            scenarios, text="", bg=theme.card, fg=theme.text_faint,
+            font=theme.caption(), anchor="w", justify="left",
+            wraplength=self.WIDTH - 120)
+        self.preset_status.pack(fill="x")
+
         # --- поведение (три тумблера применяются сразу, YouTube — по «Сохранить»)
         behavior = self._section(pad, "Поведение")
         is_autostart = getattr(self.controller, "is_autostart", None)
@@ -419,7 +449,7 @@ class SettingsPage(tk.Frame):
             ("quiet", "Без уведомлений", bool(cfg.get("quiet_icon", True)), self._set_quiet),
             ("guard", "Автолечение", bool(cfg.get("guard_enabled", True)), self._set_guard),
             ("youtube", "YouTube через VPN",
-             bool(cfg.get("youtube_via_vpn", False)), None),
+             bool(cfg.get("youtube_via_vpn", False)), self._set_youtube),
         )
         for index, (key, title, value, setter) in enumerate(rows):
             if index:
@@ -498,6 +528,7 @@ class SettingsPage(tk.Frame):
             mode_row, theme,
             [("blocked", "Только заблокированное"), ("all", "Всё, кроме РФ")],
             config.normalise_routing_mode(cfg.get("routing_mode")),
+            command=lambda _value: self._refresh_preset_chips(),
             bg=theme.card, height=CONTROL_HEIGHT, width=340)
         self.routing_segment.pack(side="left")
         self._label(
@@ -523,7 +554,8 @@ class SettingsPage(tk.Frame):
                  bg=theme.card, fg=theme.text, font=theme.body(),
                  anchor="w").grid(row=0, column=0, sticky="w")
         self.blocked_toggle = ToggleSwitch(
-            blocked_row, theme, bool(cfg.get("blocked_list_enabled", True)))
+            blocked_row, theme, bool(cfg.get("blocked_list_enabled", True)),
+            command=lambda _value: self._refresh_preset_chips())
         self.blocked_toggle.grid(row=0, column=1, sticky="e",
                                  padx=(SPACE["md"], 0))
         self._label(blocked_section,
@@ -729,6 +761,7 @@ class SettingsPage(tk.Frame):
         self._render_rules()
         self._refresh_blocked_status()
         self._refresh_status()
+        self._refresh_preset_chips()
 
     def height_request(self) -> int:
         """Сколько нужно окну под страницу (с прокруткой ограничивает панель)."""
@@ -759,6 +792,56 @@ class SettingsPage(tk.Frame):
                 apply(bool(value))
             except Exception:  # noqa: BLE001
                 pass
+
+    def _set_youtube(self, _value: bool) -> None:
+        """Тумблер YouTube — часть сценария: подсветка чипа догоняет форму."""
+        self._refresh_preset_chips()
+
+    # ---- сценарии ----------------------------------------------------------
+    def _preset_values(self) -> dict:
+        """Значения формы, из которых складывается сценарий."""
+        return {
+            "routing_mode": config.normalise_routing_mode(
+                self.routing_segment.get()),
+            "youtube_via_vpn": bool(self.toggles["youtube"].get()),
+            "blocked_list_enabled": bool(self.blocked_toggle.get()),
+        }
+
+    def _refresh_preset_chips(self) -> None:
+        """Подсветить чип сценария, который сейчас собран в форме."""
+        buttons = getattr(self, "preset_buttons", None)
+        if not buttons:
+            return
+        current = presets.active(self._preset_values())
+        for preset_id, button in buttons.items():
+            button.set_kind("primary" if preset_id == current else "secondary")
+        status = getattr(self, "preset_status", None)
+        if status is not None and current is None:
+            # Набор на экране больше не совпадает ни с одним сценарием —
+            # оставленный текст «нажмите Сохранить» был бы враньём.
+            status.configure(text="", fg=self.theme.text_faint)
+
+    def _apply_preset(self, preset_id) -> None:
+        """Подставить сценарий в форму, не записывая config.json.
+
+        Маршруты (``self.rules``) и выбранные серверы (``self.rule_servers``)
+        не трогаются: сценарий меняет только режим и два тумблера.
+        """
+        current = self._preset_values()
+        merged = presets.apply(current, preset_id)
+        if merged is current or merged == current:
+            # Тот же набор уже в форме — писать в журнал нечего.
+            self._refresh_preset_chips()
+            return
+        self.routing_segment.set(str(merged["routing_mode"]))
+        self.toggles["youtube"].set(bool(merged["youtube_via_vpn"]))
+        self.blocked_toggle.set(bool(merged["blocked_list_enabled"]))
+        name = presets.title(preset_id)
+        self.preset_status.configure(
+            text=f"«{name}»: нажмите «Сохранить», чтобы применить",
+            fg=self.theme.text_dim)
+        activity.log(f"сценарий: {name}", kind="info")
+        self._refresh_preset_chips()
 
     # ---- список заблокированных -------------------------------------------
     @staticmethod
@@ -1105,6 +1188,7 @@ class SettingsPage(tk.Frame):
     def _save(self) -> bool:
         cfg = dict(self.controller.cfg or {})
         previous_mode = config.normalise_routing_mode(cfg.get("routing_mode"))
+        preset_before = presets.active(cfg)
         port, port_error = _parse_port(self.vars["xray_port"].get())
         if port is None:
             self._mark_entry_error("xray_port", True)
@@ -1144,6 +1228,11 @@ class SettingsPage(tk.Frame):
         self.controller.cfg = cfg
         self._saved_rules = dict(self.rules)
         self._saved_rule_servers = dict(self.rule_servers)
+        preset_after = presets.active(cfg)
+        if preset_after is not None and preset_after != preset_before:
+            activity.log(
+                f"сценарий: {presets.title(preset_after)} — сохранён",
+                kind="info")
         # Перечитываем тумблеры/поля из сохранённого cfg: старые галочки
         # не должны оставаться после смены настроек.
         self.reload()
