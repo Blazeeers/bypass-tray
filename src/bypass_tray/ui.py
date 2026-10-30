@@ -25,7 +25,7 @@ from .settings_ui import SettingsPage
 from .theme import SPACE, Theme, resolve_dark
 from .widgets import (
     AnimatedSection, Card, Chip, Divider, HoverRow, IconButton, PillButton,
-    ScrollBody, StatusDot,
+    ScrollBody, StatusDot, Tooltip,
 )
 
 WINDOW_W = 720
@@ -71,41 +71,97 @@ ROUTING_MODE_TEXT = {
     "all": "через VPN: всё, кроме РФ",
 }
 
+#: Подробности покрытия — в подсказке к строке: в карточке места нет.
+COVERAGE_HINT = ("Свои настройки прокси, игры и Electron идут мимо VPN; "
+                 "tg-ws-proxy отдельного прокси не требует")
+
+
+def _plural(count: int, one: str, few: str, many: str) -> str:
+    """Русская форма слова по числу: 1 сбой / 2 сбоя / 5 сбоев, но 11 сбоев."""
+    if count % 10 == 1 and count % 100 != 11:
+        return one
+    if 2 <= count % 10 <= 4 and not 12 <= count % 100 <= 14:
+        return few
+    return many
+
 
 def _domain_word(count: int) -> str:
     """Склонение слова «домен» для счётчика исключений."""
-    if count % 10 == 1 and count % 100 != 11:
-        return "домен"
-    if 2 <= count % 10 <= 4 and not 12 <= count % 100 <= 14:
-        return "домена"
-    return "доменов"
+    return _plural(count, "домен", "домена", "доменов")
+
+
+def _incident_word(count: int) -> str:
+    """Склонение слова «сбой»: 1 сбой / 2 сбоя / 5 сбоев."""
+    return _plural(count, "сбой", "сбоя", "сбоев")
+
+
+def _times_word(count: int) -> str:
+    """Склонение слова «раз»: 1 раз / 2 раза / 5 раз."""
+    return _plural(count, "раз", "раза", "раз")
+
+
+#: Меньше стольких отчётов за сутки — карточка «Стабильность» не нужна:
+#: по одной-двум проверкам проценты ничего не значат, а место они занимают.
+MIN_STABILITY_REPORTS = 3
+
+
+def _stability_numbers(data: dict) -> dict:
+    """Числа за сутки из готовой сводки — один разбор на два формата текста."""
+    def number(key: str) -> int:
+        try:
+            return int((data or {}).get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    # «uptime» уже посчитан, если на вход пришёл результат этой же функции:
+    # так карточка и подпись могут звать её по очереди, не теряя процент.
+    uptime = (data or {}).get("uptime")
+    if uptime is None:
+        uptime = (data or {}).get("uptime_pct")
+    try:
+        uptime = None if uptime is None else int(uptime)
+    except (TypeError, ValueError):
+        uptime = None
+    return {
+        "reports": number("reports"),
+        "uptime": uptime,
+        "incidents": number("incidents"),
+        "switches": number("server_switches"),
+        "heals": number("heals"),
+    }
+
+
+def _uptime_part(stats: dict) -> str:
+    """Кусок про долю «в сети»: «в сети 83%», при неизвестном проценте — «—»."""
+    uptime = stats["uptime"]
+    return "в сети —" if uptime is None else f"в сети {uptime}%"
+
+
+def _services_brief(count: int) -> str:
+    """Сводка по не-ok пунктам: «всё в порядке» или «N требуют внимания»."""
+    if count <= 0:
+        return "всё в порядке"
+    word = "требует" if count % 10 == 1 and count % 100 != 11 else "требуют"
+    return f"{count} {word} внимания"
 
 
 def coverage_text(system_proxy: bool, bypass: list[str]) -> str:
-    """Две строки про фактическое покрытие: что через VPN, а что нет.
+    """Одна строка про фактическое покрытие: системный прокси и исключения.
 
     Компактно намеренно: главная карточка обязана оставаться ниже страницы
-    настроек, иначе окно при её открытии меняет высоту и дёргается.
+    настроек, иначе окно при её открытии меняет высоту и дёргается. Поэтому
+    «свои настройки прокси, игры, Electron» живут в подсказке, а не здесь.
     """
-    if system_proxy:
-        first = "Покрытие: браузеры и приложения, уважающие системный прокси."
-    else:
-        first = "Покрытие: системный прокси не применён — трафик идёт мимо VPN."
-    parts: list[str] = []
+    if not system_proxy:
+        return "Покрытие: системный прокси не применён"
     from . import xray as xray_module
 
     # В реестре каждое имя лежит дважды (``x.com`` и ``*.x.com``) вместе со
     # служебными записями — считать надо настоящие домены.
     count = xray_module.count_bypass_domains(list(bypass or []))
-    if count:
-        parts.append(f"Исключено: {count} {_domain_word(count)}")
-    parts.append("не покрыто: свои настройки прокси, игры, Electron; "
-                 "tg-ws-proxy не требует")
-    tail = " · ".join(parts)
     if not count:
-        # Без счётчика строка начинается с «не покрыто» — с заглавной.
-        tail = tail[:1].upper() + tail[1:]
-    return first + "\n" + tail
+        return "Покрытие: системный прокси"
+    return f"Покрытие: системный прокси · исключено {count} {_domain_word(count)}"
 
 
 def clean_server_name(name: str) -> str:
@@ -278,6 +334,14 @@ class Panel:
         self._diagnose_visible = False
         self._diagnose_key: tuple | None = None
         self._vpn_card: Card | None = None
+        #: Карточки главной, которые прячутся и возвращаются: стабильность
+        #: (нет данных) и журнал (точка возврата для pack(before=...)).
+        self._services_card: Card | None = None
+        self._stability_card: Card | None = None
+        self._activity_card: Card | None = None
+        self._stability_visible = True
+        self._services_summary: tk.Label | None = None
+        self._activity_since: tk.Label | None = None
         self._activity_rows: list[dict] = []
         self._activity_empty: tk.Label | None = None
         self._buttons: dict[str, PillButton] = {}
@@ -395,6 +459,12 @@ class Panel:
         self._header_update_icon = None
         self._header_update_text = None
         self._activity_period = None
+        self._activity_since = None
+        self._services_summary = None
+        self._services_card = None
+        self._stability_card = None
+        self._activity_card = None
+        self._stability_visible = True
         self._ui_error = ""
         self._inflight = set()
         self._vpn = {}
@@ -584,9 +654,12 @@ class Panel:
         self._build_diagnose()
         self._vpn_card = self._card_box()
         self._build_vpn(self._vpn_card.inner)
-        self._build_services(self._card())
-        self._build_stability(self._card())
-        self._build_activity(self._card())
+        self._services_card = self._card_box()
+        self._build_services(self._services_card.inner)
+        self._stability_card = self._card_box()
+        self._build_stability(self._stability_card.inner)
+        self._activity_card = self._card_box()
+        self._build_activity(self._activity_card.inner)
         self._build_actions()
 
         self._footer = tk.Label(
@@ -801,16 +874,16 @@ class Panel:
         if running:
             color = theme.accent
             tooltip = "Проверяю…"
-        elif outdated:
-            color = theme.warn
-            tooltip = "Обновить всё"
+            badge = None
         else:
+            # Иконка остаётся нейтральной в любом случае: о находке сообщает
+            # точка в углу кнопки, а не перекраска всей иконки.
             color = theme.header_dim
             tooltip = "Обновить всё"
+            badge = theme.accent if outdated else None
         # Кнопка перерисовывается каждую секунду: set_image/set_tooltip зовём
         # только при смене значения, иначе всплывающая подсказка гаснет на
         # следующем тике.
-        badge = theme.warn if outdated and not running else None
         icon_state = (color, badge)
         if icon_state != self._header_update_icon:
             self._header_update_icon = icon_state
@@ -949,22 +1022,43 @@ class Panel:
         )
         self._vpn["refresh"].pack(side="left", padx=(SPACE["sm"], 0))
 
-        # Покрытие: две строки без заголовка — компактно, чтобы главная
-        # страница оставалась ниже страницы настроек.
+        # Покрытие: тонкий разделитель на всю ширину и одна строка с иконкой.
+        # Без разделителя блок читался как продолжение аккордеона выше.
+        Divider(inner, theme).pack(fill="x", pady=(SPACE["sm"], SPACE["sm"]))
+        coverage_row = tk.Frame(inner, bg=theme.card)
+        coverage_row.pack(fill="x")
+        info = tk.Label(coverage_row, text="ⓘ", bg=theme.card,
+                        fg=theme.text_faint, font=theme.caption(), anchor="w")
+        info.pack(side="left", padx=(0, SPACE["xs"]))
         self._vpn["coverage"] = tk.Label(
-            inner, text="", bg=theme.card, fg=theme.text_faint,
-            font=theme.caption(), anchor="w", justify="left",
-            wraplength=CARD_TEXT_WIDTH)
-        self._vpn["coverage"].pack(fill="x", pady=(SPACE["sm"], 0))
+            coverage_row, text="", bg=theme.card, fg=theme.text_faint,
+            font=theme.caption(), anchor="w", justify="left")
+        self._vpn["coverage"].pack(side="left", fill="x", expand=True)
+        # Подробности («свои настройки прокси, игры, Electron») — в подсказке.
+        self._vpn["coverage_tip"] = Tooltip(
+            self._vpn["coverage"], COVERAGE_HINT, theme=theme)
 
     # -- карточка сервисов ---------------------------------------------------
     def _build_services(self, inner: tk.Frame) -> None:
         theme = self._theme
+        # Заголовок со сводкой: без него список читался безымянным. Рост —
+        # ровно одна строка title (~17 px), дальше ряд кнопок не сдвигается.
+        head = tk.Frame(inner, bg=theme.card)
+        head.pack(fill="x")
+        tk.Label(head, text="Сервисы", bg=theme.card, fg=theme.text,
+                 font=theme.title(), anchor="w").pack(side="left")
+        self._services_summary = tk.Label(
+            head, text="", bg=theme.card, fg=theme.text_faint,
+            font=theme.caption(), anchor="e")
+        self._services_summary.pack(side="right")
         for index, (key, title, _icon_name) in enumerate(SERVICES):
             row = HoverRow(inner, theme)
             row.pack(fill="x")
             grid = tk.Frame(row, bg=theme.card)
-            grid.pack(fill="x", pady=SPACE["sm"])
+            # Первая строка ближе к заголовку: сам заголовок уже даёт зазор,
+            # и карточка не растёт лишними пикселями.
+            grid.pack(fill="x", pady=((SPACE["xs"] // 2, SPACE["sm"])
+                                      if index == 0 else SPACE["sm"]))
             grid.columnconfigure(1, weight=1)
 
             # Состояние сервиса читается по точке; иконки брендов набора
@@ -1020,26 +1114,83 @@ class Panel:
         self._stability_line.pack(fill="x")
 
     def _render_stability(self, summary: dict | None = None) -> None:
+        """Карточка — только при достаточном числе отчётов, иначе подпись.
+
+        Пустая карточка на 90 px отвечала «пока нет данных» и занимала место;
+        пока отчётов меньше ``MIN_STABILITY_REPORTS``, те же числа идут одной
+        мелкой строкой в шапку журнала.
+        """
+        data = history.summary() if summary is None else summary
+        stats = _stability_numbers(data)
+        enough = stats["reports"] >= MIN_STABILITY_REPORTS
+        card = getattr(self, "_stability_card", None)
+        if card is not None:
+            if enough and not self._stability_visible:
+                card.pack(fill="x", padx=SPACE["lg"], pady=(0, SPACE["md"]),
+                          before=self._activity_card)
+                self._stability_visible = True
+            elif not enough and self._stability_visible:
+                card.pack_forget()
+                self._stability_visible = False
         line = getattr(self, "_stability_line", None)
-        if line is None:
+        if line is not None:
+            line.configure(text=self._stability_text(stats))
+        # Подпись в шапке журнала повторяет карточку — держим её только пока
+        # карточки нет, иначе одни и те же числа читаются дважды.
+        self._toggle_activity_since(not (enough and card is not None), stats)
+
+    def _toggle_activity_since(self, visible: bool, stats: dict) -> None:
+        """Подпись «за сутки: …» в шапке журнала — есть, только если нет карточки."""
+        label = self._activity_since
+        if label is None:
             return
-        line.configure(text=self._stability_text(summary))
+        if not visible:
+            if label.winfo_manager():
+                label.pack_forget()
+            return
+        label.configure(text=self._stability_brief(stats))
+        if not label.winfo_manager():
+            label.pack(side="right", padx=(SPACE["md"], 0))
+            # Кнопка отката могла занять правый край — подпись должна быть правее.
+            rollback = self._rollback
+            if rollback is not None and rollback.winfo_manager():
+                rollback.pack_configure(before=label)
 
     def _stability_text(self, summary: dict | None = None) -> str:
-        """Одна строка о сутках: доля «в сети», сбои, смены сервера, лечение."""
+        """Строка карточки: доля «в сети», сбои, смены сервера, лечение.
+
+        Части с нулём не показываются: нет сбоев — нет куска, и так далее.
+        """
         data = history.summary() if summary is None else summary
-        reports = int(data.get("reports") or 0)
-        if not reports:
+        stats = _stability_numbers(data)
+        if not stats["reports"]:
             return "пока нет данных за сутки"
-        uptime = data.get("uptime_pct")
-        uptime_text = "—" if uptime is None else f"{int(uptime)}%"
-        incidents = int(data.get("incidents") or 0)
-        if reports < 3:
+        parts = [_uptime_part(stats)]
+        if stats["incidents"]:
+            parts.append(f"{stats['incidents']} {_incident_word(stats['incidents'])}")
+        if stats["switches"]:
+            count = stats["switches"]
+            parts.append(f"сервер менялся {count} {_times_word(count)}")
+        if stats["heals"]:
+            parts.append(f"автолечение {stats['heals']}")
+        text = " · ".join(parts)
+        if stats["reports"] < MIN_STABILITY_REPORTS:
             # По одному-двум отчётам процент ничего не значит — честнее так.
-            return f"мало данных · в сети {uptime_text} · сбоев {incidents}"
-        return (f"в сети {uptime_text} · сбоев {incidents}"
-                f" · сервер менялся {int(data.get('server_switches') or 0)} раз"
-                f" · автолечение {int(data.get('heals') or 0)}")
+            return "мало данных · " + text
+        return text
+
+    def _stability_brief(self, summary: dict | None = None) -> str:
+        """Та же сводка одной фразой — для шапки журнала."""
+        data = history.summary() if summary is None else summary
+        stats = _stability_numbers(data)
+        if stats["reports"] < MIN_STABILITY_REPORTS:
+            if not stats["reports"]:
+                return "за сутки: нет данных"
+            return "за сутки: мало данных"
+        parts = [_uptime_part(stats)]
+        if stats["incidents"]:
+            parts.append(f"{stats['incidents']} {_incident_word(stats['incidents'])}")
+        return "за сутки: " + " · ".join(parts)
 
     # -- карточка журнала ----------------------------------------------------
     def _build_activity(self, inner: tk.Frame) -> None:
@@ -1053,11 +1204,17 @@ class Panel:
             header, text="", bg=theme.card, fg=theme.text_faint,
             font=theme.caption(), anchor="w")
         self._activity_period.pack(side="left", padx=(SPACE["sm"], 0))
+        # Сводка за сутки, пока карточка стабильности не нужна. Пакуется
+        # раньше кнопки отката, поэтому при нехватке места уступает ей.
+        self._activity_since = tk.Label(
+            header, text="", bg=theme.card, fg=theme.text_faint,
+            font=theme.caption(), anchor="e")
+        self._activity_since.pack(side="right", padx=(SPACE["md"], 0))
         # Откат живёт рядом с журналом: там видно, что именно виджет сделал сам.
+        # Пакуется только когда снимок есть — иначе это шум в шапке.
         self._rollback = PillButton(header, theme, "Откатить маршруты",
                                     self._confirm_rollback, kind="ghost",
                                     height=ROW_CONTROL_HEIGHT, pad_x=SPACE["md"])
-        self._rollback.pack(side="right")
         self._rollback.set_enabled(False)
         self._activity_empty = tk.Label(
             inner, text="", bg=theme.card, fg=theme.text_faint,
@@ -1319,6 +1476,7 @@ class Panel:
     def _render_services(self, items: dict, status: dict, busy: dict) -> None:
         theme = self._theme
         zapret_status = status.get("zapret") or {}
+        trouble = 0
         for key, _title, _icon_name in SERVICES:
             row = self._services.get(key)
             if not row:
@@ -1329,6 +1487,8 @@ class Panel:
                 detail = str(item.get("detail") or "")
             else:
                 state, detail = self._service_fallback(key, status)
+            if state != "ok":
+                trouble += 1
             if key == "youtube" and (getattr(self.controller, "cfg", {}) or {}).get(
                     "youtube_via_vpn"):
                 detail = (detail + " · через VPN") if detail else "через VPN"
@@ -1369,6 +1529,8 @@ class Panel:
                 button.set_command(lambda a=action: self._call(a))
                 installed = bool(self.controller.cfg.get("tgws_exe"))
                 button.set_enabled(installed and not busy.get("tgws"))
+        if self._services_summary is not None:
+            self._services_summary.configure(text=_services_brief(trouble))
 
     def _activity_period_text(self) -> str:
         try:
@@ -1445,9 +1607,21 @@ class Panel:
                 blocked = blocked or bool(busy.get("servers"))
             button.set_enabled(not blocked)
         if self._rollback is not None:
-            # Действие есть смысл показывать, только когда откат возможен.
-            self._rollback.set_enabled(routes.has_snapshot()
-                                       and not busy.get("routes"))
+            # Один опрос снимка на кадр: has_snapshot() читает файлы с диска,
+            # а кнопка нужна, только когда откат возможен.
+            snapshot = routes.has_snapshot()
+            if snapshot:
+                if not self._rollback.winfo_manager():
+                    # Подпись «за сутки: …» бывает скрыта, пока есть карточка —
+                    # тогда откат встаёт на правый край сам.
+                    anchor = self._activity_since
+                    if anchor is not None and anchor.winfo_manager():
+                        self._rollback.pack(side="right", before=anchor)
+                    else:
+                        self._rollback.pack(side="right")
+                self._rollback.set_enabled(not busy.get("routes"))
+            elif self._rollback.winfo_manager():
+                self._rollback.pack_forget()
 
     # ---- компоновка и прокрутка -------------------------------------------
     def _header_height(self) -> int:

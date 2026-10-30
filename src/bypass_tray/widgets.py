@@ -537,6 +537,12 @@ class Tooltip:
 class IconButton(tk.Canvas):
     """Кнопка-иконка с подсветкой при наведении и подсказкой."""
 
+    #: Точка-бейдж: диаметр и отступ от правого верхнего угла, пиксели.
+    #: Мелкая точка вместо перекраски всей иконки: цвет иконки остаётся
+    #: нейтральным, а «есть новое» читается уголком.
+    BADGE_SIZE = 5
+    BADGE_INSET = 3
+
     def __init__(self, master: tk.Misc, theme: Theme, image, command,
                  tooltip: str = "", bg: str | None = None, size: int = 30):
         self.theme = theme
@@ -571,7 +577,7 @@ class IconButton(tk.Canvas):
         self._render()
 
     def set_badge(self, color: str | None) -> None:
-        """Маленькая точка в правом верхнем углу (янтарная — есть обновления)."""
+        """Маленькая акцентная точка в правом верхнем углу (есть обновления)."""
         if color == self._badge:
             return
         self._badge = color
@@ -589,10 +595,10 @@ class IconButton(tk.Canvas):
                          fill=fill, outline="")
         self.create_image(size / 2, size / 2, image=self._image)
         if self._badge:
-            dot = SPACE["sm"]
-            self.create_oval(size - dot - 2, 2, size - 2, dot + 2,
-                             fill=self._badge, outline=self._bg,
-                             width=2)
+            dot, inset = self.BADGE_SIZE, self.BADGE_INSET
+            right, top = size - inset, inset
+            self.create_oval(right - dot, top, right, top + dot,
+                             fill=self._badge, outline="")
 
 
 class Segmented(tk.Canvas):
