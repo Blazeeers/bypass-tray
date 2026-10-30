@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 import tkinter as tk
@@ -107,6 +108,31 @@ def _merge_legacy_routes(cfg: dict) -> None:
                     mapping.setdefault(name, route)
         cfg[key] = []
     cfg["xray_routes"] = mapping
+
+
+#: Ключи, от которых зависит конфиг ядра или системный прокси. Только их
+#: изменение требует перезапуска: иначе любое сохранение рвало соединения.
+PROXY_KEYS = (
+    "routing_mode",
+    "xray_links",
+    "xray_subscription",
+    "xray_routes",
+    "xray_port",
+    "xray_system_proxy",
+    "youtube_via_vpn",
+    "blocked_list_enabled",
+    "xray_direct_domains",
+    "xray_extra_domains",
+)
+
+
+def _proxy_signature(cfg: dict) -> str:
+    """Слепок прокси-релевантных настроек для сравнения «до/после».
+
+    ``sort_keys`` — чтобы порядок ключей и правил не выглядел изменением.
+    """
+    return json.dumps({key: (cfg or {}).get(key) for key in PROXY_KEYS},
+                      sort_keys=True, ensure_ascii=False, default=str)
 
 
 BEHAVIOR_TIPS = {
@@ -664,8 +690,9 @@ class SettingsPage(tk.Frame):
         move = self._section(pad, "Перенос настроек")
         self._label(
             move,
-            "Файл JSON: настройки, маршруты и сети. Серверы попадают в файл "
-            "только по галочке — это ключи доступа.", caption=True)
+            "Файл JSON: настройки, правила сайтов и стратегии по сетям. "
+            "Без галочки не попадают серверы, подписка, SSID и шлюзы; "
+            "ключ сети остаётся, чтобы стратегия нашлась.", caption=True)
         move_row = tk.Frame(move, bg=theme.card)
         move_row.pack(fill="x")
         self.export_button = PillButton(
@@ -1419,6 +1446,7 @@ class SettingsPage(tk.Frame):
 
     def _save(self) -> bool:
         cfg = dict(self.controller.cfg or {})
+        proxy_before = _proxy_signature(cfg)
         previous_mode = config.normalise_routing_mode(cfg.get("routing_mode"))
         preset_before = presets.active(cfg)
         port, port_error = _parse_port(self.vars["xray_port"].get())
@@ -1469,16 +1497,20 @@ class SettingsPage(tk.Frame):
         # не должны оставаться после смены настроек.
         self.reload()
         self.progress_label.configure(text="Сохранено", fg=self.theme.ok)
+        mode_changed = cfg["routing_mode"] != previous_mode
+        if mode_changed:
+            # Смена режима применяется только перезапуском ядра: пишем в
+            # журнал, чтобы она не осталась невидимой.
+            activity.log(
+                "режим маршрутизации: "
+                + ROUTING_MODE_NAMES.get(cfg["routing_mode"],
+                                         cfg["routing_mode"]),
+                kind="info")
         restart = getattr(self.controller, "restart_proxy", None)
-        if callable(restart) and self._proxy_running():
-            if cfg["routing_mode"] != previous_mode:
-                # Применяется только перезапуском ядра: записываем в журнал,
-                # чтобы смена режима не осталась невидимой.
-                activity.log(
-                    "режим маршрутизации: "
-                    + ROUTING_MODE_NAMES.get(cfg["routing_mode"],
-                                             cfg["routing_mode"]),
-                    kind="info")
+        # Перезапуск — только когда поменялось то, что читает ядро или
+        # системный прокси: смена пути zapret и прочие поля соединений не рвут.
+        proxy_changed = _proxy_signature(cfg) != proxy_before
+        if proxy_changed and callable(restart) and self._proxy_running():
             if restart() is False:
                 self.progress_label.configure(
                     text="Сохранено, но прокси занят — перезапустите вручную",

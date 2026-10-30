@@ -3401,6 +3401,34 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
     check("настройки: YouTube через VPN сохранён",
           saved_cfg.get("youtube_via_vpn") is True)
 
+    # --- настройки: перезапуск только при прокси-ключах -----------------
+    print("\n-- настройки: перезапуск прокси --")
+    save_fake = FakeController()
+    # Контроллер должен видеть ровно тот конфиг, что прочитает форма:
+    # иначе форма соберётся по пустым полям, и разница будет не в zapret_dir.
+    save_fake.cfg = config.load_config()
+    save_window = SettingsWindow(settings_root, theme.Theme(False), save_fake)
+    save_window.open()
+    for _ in range(4):
+        settings_root.update()
+        time.sleep(0.02)
+    save_fake.calls.pop("restart_proxy", None)
+    save_window.vars["zapret_dir"].set("F:/Zapret-other")
+    saved = save_window._save()
+    check("настройки: смена только zapret_dir не перезапускает прокси",
+          saved is True and not save_fake.calls.get("restart_proxy"),
+          str(save_fake.calls.get("restart_proxy")))
+    save_fake.calls.pop("restart_proxy", None)
+    current_mode = config.normalise_routing_mode(
+        config.load_config().get("routing_mode"))
+    save_window.routing_segment.set(
+        "all" if current_mode == "blocked" else "blocked")
+    saved = save_window._save()
+    check("настройки: смена режима маршрутизации перезапускает прокси",
+          saved is True and bool(save_fake.calls.get("restart_proxy")),
+          str(saved))
+    save_window._close()
+
     # --- установка из настроек: state и пути сразу ----------------------
     print("\n-- установка из настроек --")
     rule_fake.cfg["zapret_dir"] = ""

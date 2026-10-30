@@ -8,12 +8,15 @@ from __future__ import annotations
 import base64
 import json
 import sys
+import tempfile
+import time
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
+from bypass_tray import activity, config  # noqa: E402
 from bypass_tray.secrets import (  # noqa: E402
     MASK, redact_link, redact_obj, redact_text,
 )
@@ -292,8 +295,39 @@ class AmbiguousValueTests(unittest.TestCase):
         self.assertEqual(redact_obj({"token": "a" * 19})["token"], "a" * 19)
 
 
+class ActivityRedactionTests(unittest.TestCase):
+    """Старые записи журнала маскируются при чтении, файл не переписывается."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        config.set_config_dir(self.dir)
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(config.set_config_dir, None)
+
+    def test_recent_and_last_text_mask_old_entry(self) -> None:
+        raw = [{"at": time.time(),
+                "text": f"старое: vless://{UUID}@host.example:443#x",
+                "kind": "auto"}]
+        path = self.dir / "activity.json"
+        path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+        rows = activity.recent(limit=5)
+
+        self.assertEqual(len(rows), 1)
+        self.assertNotIn(UUID, rows[0]["text"])
+        self.assertNotIn(UUID, activity.last_text())
+        # Чтение ничего не пишет: файл остался прежним.
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), raw)
+
+    def test_recent_keeps_clean_text_unchanged(self) -> None:
+        activity.log("подобрал стратегию: general.bat", kind="ok")
+        rows = activity.recent(limit=5)
+        self.assertEqual(rows[0]["text"], "подобрал стратегию: general.bat")
+
+
 class LegacySuiteTests(unittest.TestCase):
-    """Старый набор (22 теста) на месте: регрессии не удалены."""
+    """Старый набор (22 теста) — не трогаем: регрессии не удалять."""
 
     def test_legacy_test_count_intact(self) -> None:
         legacy = (LinkTests, TextTests, ObjectTests)

@@ -52,12 +52,49 @@ def _routes_payload(cfg: dict) -> dict:
     )
 
 
+def _routes_for_export(cfg: dict, include_secrets: bool) -> dict:
+    """Правила для файла: в safe-режиме — без имён серверов.
+
+    Сервер в правиле — это доступ к нему, а не настройка маршрута: без
+    галочки в файл уходит только сам маршрут (``direct``/``proxy``).
+    """
+    payload = _routes_payload(cfg)
+    if include_secrets:
+        return payload
+    return {
+        name: (info.get("route") if isinstance(info, dict) else info)
+        for name, info in payload.items()
+    }
+
+
+def _networks_for_export(include_secrets: bool) -> dict:
+    """Сети для файла: в safe-режиме остаются ключ и стратегия.
+
+    ``server`` — доступ, ``ssid`` и ``gateway`` — приметы домашней сети;
+    без галочки их в файле нет. Ключ сети остаётся, иначе импорт не найдёт,
+    к какой сети относится стратегия.
+    """
+    saved = networks.all()
+    if include_secrets:
+        return saved
+    safe: dict = {}
+    for key, info in (saved or {}).items():
+        entry: dict = {}
+        if isinstance(info, dict):
+            entry["bat"] = str(info.get("bat") or "")
+            if "at" in info:
+                entry["at"] = info["at"]
+        safe[key] = entry
+    return safe
+
+
 def export_settings(cfg: dict, path, include_secrets: bool = False) -> dict:
     """Пишет файл переноса. Возвращает отчёт: путь, число правил и сетей.
 
     ``include_secrets=True`` добавляет в файл ``xray_links`` и
     ``xray_subscription`` — это ключи доступа, и файл после этого равен
-    резервной копии доступов.
+    резервной копии доступов. В safe-режиме вырезаны и имена серверов в
+    правилах, и приметы сетей (``server``/``ssid``/``gateway``).
     """
     target = Path(path)
     cfg = dict(cfg or {})
@@ -68,8 +105,8 @@ def export_settings(cfg: dict, path, include_secrets: bool = False) -> dict:
         "app": APP_NAME,
         "secrets_included": bool(include_secrets),
         "settings": settings,
-        ROUTES_KEY: _routes_payload(cfg),
-        "networks": networks.all(),
+        ROUTES_KEY: _routes_for_export(cfg, include_secrets),
+        "networks": _networks_for_export(include_secrets),
     }
     text = json.dumps(payload, ensure_ascii=False, indent=2)
     if not config.atomic_write(target, text):
@@ -206,13 +243,14 @@ def import_settings(path, apply: bool = True) -> dict:
         return report
 
     # Сети — после конфига: если конфиг не записался, профиль не должен
-    # остаться наполовину применённым.
+    # остаться наполовину применённым. Отсутствующий ``server`` — не «стереть»,
+    # а «не трогать»: safe-файл серверов не содержит.
     if network_items:
         for key, info in network_items:
+            details = {name: str(info.get(name) or "")
+                       for name in ("ssid", "gateway") if name in info}
             networks.remember(
-                key, str(info.get("bat") or ""),
-                {"ssid": str(info.get("ssid") or ""),
-                 "gateway": str(info.get("gateway") or "")},
-                server=str(info.get("server") or ""),
+                key, str(info.get("bat") or ""), details,
+                server=(str(info["server"]) if "server" in info else None),
             )
     return report

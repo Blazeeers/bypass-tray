@@ -563,6 +563,9 @@ class TrayApp:
                 self.health_running = False
                 self.busy.pop("health", None)
                 self.refresh_activity()
+                # Свежая запись уже в истории: кэш сводки не должен показывать
+                # старое до истечения TTL.
+                history.reset_summary_cache()
                 self._signature = None
                 self.update_icon()
 

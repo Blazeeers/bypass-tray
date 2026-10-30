@@ -37,6 +37,27 @@ _LEVEL_RANK = {"ok": 0, "degraded": 1, "down": 2}
 
 _LOCK = threading.Lock()
 
+#: Сводку просит каждое обновление панели — раз в секунду. Пересчитывать
+#: 2000 записей на каждый тик незачем: кэш живёт ``SUMMARY_TTL`` секунд и
+#: сбрасывается, когда меняется mtime истории или журнала.
+SUMMARY_TTL = 30.0
+_SUMMARY_CACHE: dict = {}
+_SUMMARY_LOCK = threading.Lock()
+
+
+def _file_stamp(path: Path) -> float:
+    """mtime файла или 0, если его нет: этого хватает признаку «изменилось»."""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def reset_summary_cache() -> None:
+    """Забыть сводку — после проверки карточка должна обновиться сразу."""
+    with _SUMMARY_LOCK:
+        _SUMMARY_CACHE.clear()
+
 
 def path() -> Path:
     return config_dir() / "health_history.json"
@@ -182,8 +203,8 @@ def summarise(report_rows: list[dict], activity_rows: list[dict],
     }
 
 
-def summary(hours: float = 24, now: float | None = None) -> dict:
-    """Сводка из файлов истории и журнала за то же окно."""
+def _build_summary(hours: float, now: float | None) -> dict:
+    """Свежий расчёт сводки из файлов (без кэша)."""
     from . import activity
 
     try:
@@ -191,3 +212,27 @@ def summary(hours: float = 24, now: float | None = None) -> dict:
     except (TypeError, ValueError):
         acts = []
     return summarise(rows(hours, now), acts, hours, now)
+
+
+def summary(hours: float = 24, now: float | None = None) -> dict:
+    """Сводка из файла истории и журнала за последние ``hours`` часов.
+
+    Без явного ``now`` результат кэшируется на ``SUMMARY_TTL``: панель зовёт
+    функцию каждый тик. Явное время — всегда честный пересчёт (тесты, CLI).
+    """
+    if now is not None:
+        return _build_summary(hours, now)
+    from . import activity
+
+    stamp = (float(hours), _file_stamp(path()), _file_stamp(activity.path()))
+    now_mono = time.monotonic()
+    with _SUMMARY_LOCK:
+        cached = _SUMMARY_CACHE.get("entry")
+        if (cached is not None and cached["stamp"] == stamp
+                and now_mono - cached["at"] <= SUMMARY_TTL):
+            return dict(cached["value"])
+    value = _build_summary(hours, None)
+    with _SUMMARY_LOCK:
+        _SUMMARY_CACHE["entry"] = {"stamp": stamp, "at": time.monotonic(),
+                                   "value": dict(value)}
+    return value

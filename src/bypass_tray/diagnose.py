@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 
 #: Порядок фактов: сначала то, из-за чего обычно всё и ломается.
@@ -34,6 +35,17 @@ ACTIONS = {
 
 #: Значения ``state``, которые бьют по работе обхода.
 _BAD = ("bad", "off", "")
+
+#: Меньше стольких отчётов за сутки — данных не хватает, чтобы называть
+#: состояние нестабильным (6 отчётов — хотя бы час проверок при периоде 10 мин).
+MIN_REPORTS_UNSTABLE = 6
+
+#: Диагноз зовётся на каждом тике панели, а входные данные меняются редко.
+#: Ответ запоминается на короткий срок: переход «устарело» опоздает максимум
+#: на этот TTL, зато правила не пересчитываются каждую секунду.
+CACHE_TTL = 15.0
+_CACHE_LOCK = threading.Lock()
+_CACHE: dict = {}
 
 
 def _action(kind: str | None) -> dict | None:
@@ -115,22 +127,27 @@ def _report_level(report: dict | None) -> str:
     return str((report or {}).get("level") or "")
 
 
-def diagnose(report: dict | None, proxy_status: dict | None, cfg: dict | None,
-             history_summary: dict | None = None,
-             now: float | None = None) -> dict:
-    """Один ответ: код, уровень, строка для человека, действие и факты.
+def _cache_key(report: dict | None, proxy: dict, cfg: dict,
+               summary: dict) -> tuple:
+    """Всё, от чего зависит ответ: изменилось — считаем заново."""
+    checked = (report or {}).get("checked") if isinstance(report, dict) else None
+    return (
+        tuple(sorted(_states(report).items())),
+        _report_level(report),
+        str(checked),
+        bool(proxy.get("running")),
+        str(proxy.get("routing_mode") or ""),
+        str(cfg.get("routing_mode") or ""),
+        _minutes(cfg),
+        summary.get("reports"),
+        summary.get("incidents"),
+        summary.get("uptime_pct"),
+    )
 
-    Порядок правил — приоритет. ``now`` передаётся явно в тестах; в жизни
-    берётся системное время.
-    """
-    cfg = cfg or {}
-    proxy = proxy_status or {}
-    summary = history_summary or {}
-    try:
-        stamp = float(time.time() if now is None else now)
-    except (TypeError, ValueError):
-        stamp = time.time()
 
+def _decide(report: dict | None, proxy: dict, cfg: dict, summary: dict,
+            stamp: float) -> dict:
+    """Правила по приоритету; вход уже нормализован, время разрешено."""
     states = _states(report)
     facts = _facts(states)
     running = bool(proxy.get("running"))
@@ -189,8 +206,51 @@ def diagnose(report: dict | None, proxy_status: dict | None, cfg: dict | None,
     return _answer("ok", "ok", "Всё работает", None, [])
 
 
+def diagnose(report: dict | None, proxy_status: dict | None, cfg: dict | None,
+             history_summary: dict | None = None,
+             now: float | None = None) -> dict:
+    """Один ответ: код, уровень, строка для человека, действие и факты.
+
+    Порядок правил — приоритет. ``now`` передаётся явно в тестах; в жизни
+    берётся системное время, и тогда ответ кэшируется на ``CACHE_TTL``.
+    """
+    cfg = cfg or {}
+    proxy = proxy_status or {}
+    summary = history_summary or {}
+    try:
+        stamp = float(time.time() if now is None else now)
+    except (TypeError, ValueError):
+        stamp = time.time()
+
+    if now is not None:
+        # Явное время — детерминированный расчёт без кэша (тесты, CLI).
+        return _decide(report, proxy, cfg, summary, stamp)
+
+    key = _cache_key(report, proxy, cfg, summary)
+    with _CACHE_LOCK:
+        cached = _CACHE.get("entry")
+        if (cached is not None and cached["key"] == key
+                and time.monotonic() - cached["at"] <= CACHE_TTL):
+            return dict(cached["value"])
+    value = _decide(report, proxy, cfg, summary, stamp)
+    with _CACHE_LOCK:
+        _CACHE["entry"] = {"key": key, "at": time.monotonic(),
+                           "value": dict(value)}
+    return value
+
+
 def _unstable(summary: dict) -> bool:
-    """Много сбоев за сутки при нынешнем «ok» — повод сказать о нестабильности."""
+    """Много сбоев за сутки при нынешнем «ok» — повод сказать о нестабильности.
+
+    По одному-двум отчётам «нестабильно» не объявляется: один ``degraded``
+    иначе держал бы предупреждение на сутки вперёд.
+    """
+    try:
+        reports = int(summary.get("reports") or 0)
+    except (TypeError, ValueError):
+        reports = 0
+    if reports < MIN_REPORTS_UNSTABLE:
+        return False
     try:
         incidents = int(summary.get("incidents") or 0)
     except (TypeError, ValueError):

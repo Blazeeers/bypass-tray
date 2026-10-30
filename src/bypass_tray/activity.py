@@ -51,6 +51,20 @@ def log(text: str, kind: str = "auto") -> None:
         _write((_read() + [entry])[-LIMIT:])
 
 
+def _safe(row: dict) -> dict:
+    """Запись с безопасным текстом.
+
+    ``log`` маскирует при записи, но старые ``activity.json`` писались до
+    этого: файл на диске не переписываем, маскируем при чтении.
+    """
+    text = redact_text(str(row.get("text") or ""))
+    if text == row.get("text"):
+        return row
+    masked = dict(row)
+    masked["text"] = text
+    return masked
+
+
 def recent(limit: int = 6, hours: float | None = None) -> list[dict]:
     """Последние записи (новые сверху), при ``hours`` — только за это время.
 
@@ -74,7 +88,7 @@ def recent(limit: int = 6, hours: float | None = None) -> list[dict]:
         rows = filtered
     if limit <= 0:
         return []
-    return list(reversed(rows[-limit:]))
+    return [_safe(row) for row in reversed(rows[-limit:])]
 
 
 def clear() -> None:
@@ -84,9 +98,9 @@ def clear() -> None:
 
 
 def last_text() -> str:
-    """Текст последней записи или пустая строка."""
+    """Текст последней записи (с маскированием) или пустая строка."""
     with _LOCK:
         rows = _read()
     if not rows:
         return ""
-    return str(rows[-1].get("text") or "")
+    return redact_text(str(rows[-1].get("text") or ""))

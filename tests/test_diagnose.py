@@ -181,6 +181,20 @@ class HistoryTests(unittest.TestCase):
                    hist=summary(incidents=9, uptime=40))
         self.assertEqual(data["code"], "api_down")
 
+    def test_single_degraded_report_is_not_unstable(self) -> None:
+        # Один отчёт не повод держать «Нестабильно за сутки» на сутки вперёд.
+        hist = {"incidents": 1, "uptime_pct": 0, "reports": 1}
+        data = run(report({"youtube": "warn"}, level="degraded"), hist=hist)
+        self.assertNotEqual(data["code"], "unstable")
+        self.assertEqual(data["code"], "degraded")
+
+    def test_low_uptime_with_few_reports_is_not_unstable(self) -> None:
+        hist = {"incidents": 0, "uptime_pct": 0, "reports": 5}
+        self.assertEqual(run(report(), hist=hist)["code"], "ok")
+        # Шестой отчёт — данных достаточно, правило снова работает.
+        hist = {"incidents": 0, "uptime_pct": 0, "reports": 6}
+        self.assertEqual(run(report(), hist=hist)["code"], "unstable")
+
 
 class OkTests(unittest.TestCase):
     def test_all_ok(self) -> None:
