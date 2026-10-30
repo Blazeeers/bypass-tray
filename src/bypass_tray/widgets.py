@@ -537,7 +537,10 @@ class Chip(tk.Canvas):
 
 
 class Tooltip:
-    """Подсказка над кнопкой; создаётся только по наведению."""
+    """Подсказка при наведении; создаётся только по требованию."""
+
+    #: Одновременно показывается не больше одной подсказки на всё приложение.
+    _visible: "Tooltip | None" = None
 
     def __init__(self, widget: tk.Misc, text: str, delay: int = 450,
                  theme: Theme | None = None):
@@ -552,6 +555,9 @@ class Tooltip:
         widget.bind("<Enter>", self._schedule, add="+")
         widget.bind("<Leave>", self.hide, add="+")
         widget.bind("<ButtonPress>", self.hide, add="+")
+        #: Виджет могут пересоздать (перерисовка списков): снимаем таймер
+        #: и окно, иначе подсказка «оторвётся» от уничтоженного виджета.
+        widget.bind("<Destroy>", self.hide, add="+")
 
     def _schedule(self, _event=None) -> None:
         self.hide()
@@ -569,6 +575,14 @@ class Tooltip:
         if self._window is not None or not self.text:
             return
         widget = self.widget
+        try:
+            if not widget.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        other = Tooltip._visible
+        if other is not None and other is not self:
+            other.hide()
         background, foreground, border = self._colors()
         try:
             window = tk.Toplevel(widget)
@@ -586,6 +600,7 @@ class Tooltip:
             y = widget.winfo_rooty() + widget.winfo_height() + 6
             window.geometry(f"+{max(0, x)}+{max(0, y)}")
             self._window = window
+            Tooltip._visible = self
         except tk.TclError:
             self._window = None
 
@@ -607,6 +622,8 @@ class Tooltip:
             except tk.TclError:
                 pass
             self._window = None
+        if Tooltip._visible is self:
+            Tooltip._visible = None
 
 
 class IconButton(tk.Canvas):
@@ -629,10 +646,13 @@ class IconButton(tk.Canvas):
         self._badge: str | None = None
         super().__init__(master, width=size, height=size, bg=self._bg,
                          highlightthickness=0, bd=0, cursor="hand2")
-        self._tooltip = Tooltip(self, tooltip, theme=theme)
+        self._tooltip = None
         self.bind("<Enter>", self._on_enter)
         self.bind("<Leave>", self._on_leave)
         self.bind("<Button-1>", self._on_click)
+        #: Подсказка — после биндов: её <Leave> добавляется через add="+",
+        #: иначе bind выше затирал бы скрытие.
+        self._tooltip = Tooltip(self, tooltip, theme=theme)
         self._render()
 
     def _on_enter(self, _event) -> None:
@@ -706,12 +726,14 @@ class Segmented(tk.Canvas):
         super().__init__(master, width=self._width, height=self._height,
                          bg=self._bg, highlightthickness=0, bd=0, cursor="hand2")
         self._tooltip: Tooltip | None = None
-        if self._tips:
-            first = self._tips.get(self._value) or next(iter(self._tips.values()))
-            self._tooltip = Tooltip(self, first, theme=theme)
         self.bind("<Button-1>", self._click)
         self.bind("<Motion>", self._motion)
         self.bind("<Leave>", self._leave)
+        #: Подсказка создаётся ПОСЛЕ биндов: Tooltip добавляет свой <Leave>
+        #: через add="+", иначе обычный bind ниже затирал бы скрытие.
+        if self._tips:
+            first = self._tips.get(self._value) or next(iter(self._tips.values()))
+            self._tooltip = Tooltip(self, first, theme=theme)
         self._draw()
 
     def get(self) -> str:
@@ -767,6 +789,9 @@ class Segmented(tk.Canvas):
             self._tooltip.set(text)
 
     def _leave(self, _event=None) -> None:
+        if self._tooltip is not None:
+            #: Страховка: подсказка прячется, даже если её <Leave> не сработал.
+            self._tooltip.hide()
         if self._hover != -1:
             self._hover = -1
             self._draw()
