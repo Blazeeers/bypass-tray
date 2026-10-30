@@ -1106,6 +1106,24 @@ class Panel:
                 column, weight=1 if column < columns else 0,
                 uniform="tile" if column < columns else "")
 
+    def _set_tile(self, key: str, text: str | None, color: str,
+                  hint: str) -> None:
+        """Значение плитки: крупно при данных, короткое тире — когда их нет.
+
+        Прочерк набран кеглем подписи и цветом ``text_faint``: крупное тире
+        в кегле значения читалось как полоса-заглушка, а не как «пусто».
+        """
+        tile = self._tiles.get(key)
+        if tile is None:
+            return
+        if text is None:
+            tile["value"].configure(text=TILE_NO_DATA, font=self._theme.caption(),
+                                    fg=self._theme.text_faint)
+        else:
+            tile["value"].configure(text=text, font=self._theme.value(),
+                                    fg=color)
+        tile["hint"].configure(text=hint)
+
     def _render_tiles(self, proxy: dict, items: dict, status: dict,
                       summary: dict) -> None:
         """Числа плиток — из тех же данных, что и карточки: заглушек нет."""
@@ -1116,11 +1134,11 @@ class Panel:
         latency = proxy.get("latency")
         latency_ok = isinstance(latency, int) and latency >= 0
         name = clean_server_name(proxy.get("server") or "") or "сервер не выбран"
-        vpn = self._tiles["vpn"]
-        vpn["value"].configure(
-            text=f"{latency} мс" if running and latency_ok else "—",
-            fg=theme.text if running else theme.text_faint)
-        vpn["hint"].configure(text=name if running else "не подключён")
+        self._set_tile(
+            "vpn",
+            f"{latency} мс" if running and latency_ok else None,
+            theme.text,
+            name if running else "не подключён")
 
         report = getattr(self.controller, "health_report", {}) or {}
         checked = bool(report.get("checked")) or bool(items)
@@ -1134,30 +1152,18 @@ class Panel:
                 state = self._service_fallback(key, status)[0]
             if state == "ok":
                 ok_count += 1
-        services = self._tiles["services"]
         if checked:
             trouble = total - ok_count
-            services["value"].configure(
-                text=f"{ok_count} из {total}",
-                fg=theme.text if not trouble else theme.warn)
-            services["hint"].configure(
-                text="все отвечают" if not trouble else _services_brief(trouble))
+            self._set_tile(
+                "services", f"{ok_count} из {total}",
+                theme.text if not trouble else theme.warn,
+                "все отвечают" if not trouble else _services_brief(trouble))
         else:
-            services["value"].configure(text="—", fg=theme.text_faint)
-            services["hint"].configure(text="не проверено")
+            self._set_tile("services", None, theme.text, "не проверено")
 
         stats = _stability_numbers(summary)
         enough = stats["reports"] >= MIN_STABILITY_REPORTS
         pct = stats["uptime_pct"]
-        uptime = self._tiles["uptime"]
-        if enough and pct is not None:
-            uptime["value"].configure(text=f"{pct}%", font=theme.value(),
-                                      fg=theme.text)
-        else:
-            # Нет данных — тонкое короткое тире кеглем подписи: крупный
-            # прочерк читался как полоса-заглушка, а не как «пусто».
-            uptime["value"].configure(text=TILE_NO_DATA, font=theme.caption(),
-                                      fg=theme.text_faint)
         if not stats["reports"]:
             hint = "нет данных"
         elif not enough:
@@ -1167,7 +1173,9 @@ class Panel:
             hint = f"в сети · {incidents} {_incident_word(incidents)}"
         else:
             hint = "в сети · без сбоев"
-        uptime["hint"].configure(text=hint)
+        self._set_tile("uptime",
+                       f"{pct}%" if enough and pct is not None else None,
+                       theme.text, hint)
         if self._uptime_tip is not None:
             self._uptime_tip.set(self._stability_text(summary))
 
@@ -1397,9 +1405,7 @@ class Panel:
         self._render()
         # Предпросмотр не сохраняется: без «Сохранить» панель обязана
         # вернуться к теме из конфига, иначе выбранное висит до перезапуска.
-        mode = theme_mode_from_cfg(getattr(self.controller, "cfg", {}) or {})
-        if mode != self.theme_mode():
-            self.set_theme_mode(mode)
+        self._revert_preview_theme()
 
     # -- карточка VPN --------------------------------------------------------
     def _build_vpn(self, inner: tk.Frame) -> None:
@@ -2332,9 +2338,23 @@ class Panel:
 
         threading.Thread(target=run, daemon=True).start()
 
+    def _revert_preview_theme(self) -> None:
+        """Возвращает тему из конфига, если панель ушла в предпросмотр.
+
+        Вызывается при уходе с настроек и при скрытии окна: несохранённый
+        выбор не должен жить дольше, чем открытые настройки. Если режим уже
+        совпадает с конфигом, ничего не происходит — лишней перестройки нет.
+        """
+        mode = theme_mode_from_cfg(getattr(self.controller, "cfg", {}) or {})
+        if mode != self.theme_mode():
+            self.set_theme_mode(mode)
+
     def _hide(self) -> None:
+        """Прячет окно в трей; несохранённый предпросмотр темы откатывается."""
         if self._root is not None:
             try:
                 self._root.withdraw()
             except tk.TclError:
                 pass
+        # Окно уже скрыто — перестройка после откатa темы не мигнёт на экране.
+        self._revert_preview_theme()
