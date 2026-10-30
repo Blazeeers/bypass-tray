@@ -19,7 +19,7 @@ from tkinter import messagebox
 
 from PIL import ImageTk
 
-from . import icons, routes
+from . import history, icons, routes
 from .secrets import redact_text
 from .settings_ui import SettingsPage
 from .theme import SPACE, Theme, resolve_dark
@@ -576,6 +576,7 @@ class Panel:
         tk.Frame(self._body.inner, bg=theme.bg, height=SPACE["md"]).pack(fill="x")
         self._build_vpn(self._card())
         self._build_services(self._card())
+        self._build_stability(self._card())
         self._build_activity(self._card())
         self._build_actions()
 
@@ -902,6 +903,43 @@ class Panel:
             if index < len(SERVICES) - 1:
                 Divider(inner, theme).pack(fill="x")
 
+    # -- карточка стабильности -----------------------------------------------
+    def _build_stability(self, inner: tk.Frame) -> None:
+        theme = self._theme
+        header = tk.Frame(inner, bg=theme.card)
+        header.pack(fill="x", pady=(0, SPACE["sm"]))
+        tk.Label(header, text="Стабильность за сутки", bg=theme.card,
+                 fg=theme.text, font=theme.title(), anchor="w"
+                 ).pack(side="left")
+        # Одна строка: панель упирается в высоту экрана, абзац тут лишний.
+        self._stability_line = tk.Label(
+            inner, text="", bg=theme.card, fg=theme.text_dim,
+            font=theme.body(), anchor="w", justify="left",
+            wraplength=CARD_TEXT_WIDTH)
+        self._stability_line.pack(fill="x")
+
+    def _render_stability(self) -> None:
+        line = getattr(self, "_stability_line", None)
+        if line is None:
+            return
+        line.configure(text=self._stability_text())
+
+    def _stability_text(self) -> str:
+        """Одна строка о сутках: доля «в сети», сбои, смены сервера, лечение."""
+        data = history.summary()
+        reports = int(data.get("reports") or 0)
+        if not reports:
+            return "пока нет данных за сутки"
+        uptime = data.get("uptime_pct")
+        uptime_text = "—" if uptime is None else f"{int(uptime)}%"
+        incidents = int(data.get("incidents") or 0)
+        if reports < 3:
+            # По одному-двум отчётам процент ничего не значит — честнее так.
+            return f"мало данных · в сети {uptime_text} · сбоев {incidents}"
+        return (f"в сети {uptime_text} · сбоев {incidents}"
+                f" · сервер менялся {int(data.get('server_switches') or 0)} раз"
+                f" · автолечение {int(data.get('heals') or 0)}")
+
     # -- карточка журнала ----------------------------------------------------
     def _build_activity(self, inner: tk.Frame) -> None:
         theme = self._theme
@@ -979,6 +1017,7 @@ class Panel:
             self._render_subtitle(running, level, busy, health_running)
         self._render_vpn(proxy, busy)
         self._render_services(items, status, busy)
+        self._render_stability()
         self._render_activity()
         self._render_header_update()
         self._render_footer(status, busy)

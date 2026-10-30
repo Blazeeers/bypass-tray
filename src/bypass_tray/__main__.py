@@ -171,6 +171,8 @@ def main() -> int:
                         help="при --setup не прописывать автозапуск")
     parser.add_argument("--health", action="store_true",
                         help="напечатать JSON проверки сервисов и выйти")
+    parser.add_argument("--history", action="store_true",
+                        help="напечатать стабильность за сутки из истории здоровья и выйти")
     parser.add_argument("--route-audit", action="store_true",
                         help="напечатать JSON аудита маршрутов доменов и выйти")
     parser.add_argument("--apply", action="store_true",
@@ -198,6 +200,12 @@ def main() -> int:
             result = {"checked": time.time(), "items": [], "verdict": "warn",
                       "error": f"{type(exc).__name__}: {exc}"}
         _print_json(result)
+        return 0
+
+    if args.history:
+        from . import history
+
+        _print_json(history.summary())
         return 0
 
     if args.routes_plan:

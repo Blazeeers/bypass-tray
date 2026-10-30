@@ -569,4 +569,12 @@ def collect(cfg: dict, status_state: dict | None = None, proxy: dict | None = No
         "level": level(items, cfg, proxy or {}),
     }
     _save_cache(result)
+    try:
+        from . import history
+
+        history.append(result)
+    except Exception:  # noqa: BLE001
+        # История — вспомогательная: её сбой не должен превращать сбор
+        # здоровья в ошибку. Пропуск виден по счётчику отчётов за сутки.
+        pass
     return result
