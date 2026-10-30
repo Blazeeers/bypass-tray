@@ -109,7 +109,7 @@ run.bat
   копируется в `bin` (сам `bin/` в git не хранится). Лицензии сторонних
   материалов — `THIRD_PARTY.md`.
 - Сборка `.exe`: `packaging/` есть в ветке; spec включает `bin`, `data`,
-  `LICENSE`, `THIRD_PARTY.md`, `version_info.txt` (0.6.3) и ONEDIR
+  `LICENSE`, `THIRD_PARTY.md`, `version_info.txt` (0.7.0) и ONEDIR
   `contents_directory="."`; подробности — README «Сборка .exe».
 - Не коммить `.venv/`.
 - Если меняешь автопоиск путей — обнови [docs/CONFIG.md](docs/CONFIG.md).
