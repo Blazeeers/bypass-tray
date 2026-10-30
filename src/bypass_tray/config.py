@@ -8,6 +8,7 @@ import shutil
 import sys
 import threading
 import time
+import urllib.parse
 from pathlib import Path
 
 APP_NAME = "bypass-tray"
@@ -125,6 +126,239 @@ def _backup_copy(path: Path) -> None:
 CONFIG_FILE = config_dir() / "config.json"
 STATE_FILE = config_dir() / "state.json"
 
+#: Виды проверок сервисов. ``builtin`` — встроенная проба по имени ``probe``;
+#: ``https``/``tcp`` — своя проверка адреса или порта.
+HEALTH_KINDS = ("builtin", "https", "tcp")
+#: Откуда ходить проверке: ``auto`` — напрямую, при отказе через прокси.
+HEALTH_VIA = ("auto", "proxy", "direct")
+HEALTH_LEVELS = ("critical", "minor")
+#: Встроенные пробы, которые допустимы в поле ``probe``.
+HEALTH_BUILTIN_PROBES = ("zapret", "youtube", "discord", "deepseek",
+                         "telegram", "tgwsproxy", "vpn")
+#: Встроенные проверки, отказ которых считается критичным.
+HEALTH_CRITICAL_BUILTINS = ("zapret", "youtube", "discord", "deepseek", "vpn")
+#: Предел своих проверок: больше — уже не дашборд, а мониторинг.
+HEALTH_MAX_CUSTOM = 10
+HEALTH_TIMEOUT_DEFAULT = 5.0
+HEALTH_TIMEOUT_MIN = 1.0
+HEALTH_TIMEOUT_MAX = 15.0
+
+#: Что в ``health_items`` отброшено и почему — по последнему чтению конфига.
+_HEALTH_ITEMS_REPORT: list[str] = []
+_HEALTH_LOG_AT = 0.0
+
+
+def _default_health_items() -> list[dict]:
+    """Встроенные проверки в порядке дашборда.
+
+    Возвращает новые словари: ``DEFAULTS`` не должен делиться изменяемыми
+    записями с конфигом, иначе правка настроек задним числом меняла бы
+    умолчания.
+    """
+    def record(item_id: str, title: str, level: str) -> dict:
+        return {
+            "id": item_id,
+            "title": title,
+            "kind": "builtin",
+            "probe": item_id,
+            "target": "",
+            "expect": {},
+            "via": "auto",
+            "level": level,
+            "check": True,
+            "show": True,
+            "timeout": 5,
+        }
+
+    return [
+        record("zapret", "zapret · обход DPI", "critical"),
+        record("youtube", "YouTube", "critical"),
+        record("discord", "Discord", "critical"),
+        record("deepseek", "DeepSeek API", "critical"),
+        record("telegram", "Telegram", "minor"),
+        record("tgwsproxy", "tg-ws-proxy", "minor"),
+        record("vpn", "VPN", "critical"),
+    ]
+
+
+def _health_text(value, limit: int) -> str:
+    text = str(value or "").strip()
+    return text[:limit]
+
+
+def _health_bool(value, default: bool = True) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
+
+
+def _health_timeout(value) -> int:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        seconds = HEALTH_TIMEOUT_DEFAULT
+    seconds = min(HEALTH_TIMEOUT_MAX, max(HEALTH_TIMEOUT_MIN, seconds))
+    return int(round(seconds))
+
+
+def _health_via(value) -> str:
+    via = str(value or "").strip().lower()
+    return via if via in HEALTH_VIA else "auto"
+
+
+def _health_level(item_id: str, value, kind: str) -> str:
+    level = str(value or "").strip().lower()
+    if level in HEALTH_LEVELS:
+        return level
+    if kind == "builtin":
+        return "critical" if item_id in HEALTH_CRITICAL_BUILTINS else "minor"
+    # Своя проверка по умолчанию второстепенная: один упавший сайт ещё не
+    # повод красить весь обход в красный.
+    return "minor"
+
+
+def _valid_https_target(target: str) -> bool:
+    try:
+        parts = urllib.parse.urlsplit(target)
+    except ValueError:
+        return False
+    return parts.scheme in ("http", "https") and bool(parts.hostname)
+
+
+def _valid_tcp_target(target: str) -> bool:
+    host, separator, port = target.rpartition(":")
+    if not separator or not host:
+        return False
+    try:
+        number = int(port)
+    except ValueError:
+        return False
+    return 1 <= number <= 65535
+
+
+def _normalise_expect(value) -> dict:
+    """Ожидание ответа: код (``any``/``2xx``/число) и подстрока тела."""
+    expect = {"status": "any", "contains": ""}
+    if not isinstance(value, dict):
+        return expect
+    status = value.get("status")
+    if isinstance(status, bool):
+        status = None
+    elif isinstance(status, int):
+        status = status if 100 <= status <= 599 else None
+    elif isinstance(status, str):
+        text = status.strip().lower()
+        if text in ("any", "2xx"):
+            status = text
+        elif text.isdigit() and 100 <= int(text) <= 599:
+            status = int(text)
+        else:
+            status = None
+    else:
+        status = None
+    expect["status"] = status if status is not None else "any"
+    contains = value.get("contains")
+    if isinstance(contains, str):
+        expect["contains"] = contains[:200]
+    return expect
+
+
+def normalise_health_items(value) -> tuple[list[dict], list[str]]:
+    """Проверки сервисов из конфига: годные записи и отчёт об отброшенном.
+
+    Мусор (нет ``id``/``title``, неизвестный ``kind``, битый ``target``,
+    повтор ``id``) отбрасывается, а не роняет чтение конфига: испорченный
+    вручную ``config.json`` не должен оставить пользователя без проверок.
+    Своих проверок не больше ``HEALTH_MAX_CUSTOM``.
+    """
+    if not isinstance(value, (list, tuple)):
+        problems = [] if value is None else ["health_items: ожидался список"]
+        return _default_health_items(), problems
+    items: list[dict] = []
+    problems: list[str] = []
+    seen: set[str] = set()
+    custom = 0
+    for index, raw in enumerate(value, start=1):
+        if not isinstance(raw, dict):
+            problems.append(f"#{index}: не запись")
+            continue
+        item_id = _health_text(raw.get("id"), 64)
+        title = _health_text(raw.get("title"), 80)
+        if not item_id or not title:
+            problems.append(f"#{index}: нет id или title")
+            continue
+        if item_id in seen:
+            problems.append(f"#{index}: повтор id {item_id}")
+            continue
+        kind = str(raw.get("kind") or "").strip().lower()
+        if kind not in HEALTH_KINDS:
+            problems.append(f"#{index} ({item_id}): неизвестный kind")
+            continue
+        probe = _health_text(raw.get("probe"), 32) if kind == "builtin" else ""
+        target = _health_text(raw.get("target"), 300) if kind != "builtin" else ""
+        if kind == "builtin":
+            if probe not in HEALTH_BUILTIN_PROBES:
+                problems.append(f"#{index} ({item_id}): неизвестная проба {probe or '—'}")
+                continue
+        elif kind == "https":
+            if not _valid_https_target(target):
+                problems.append(f"#{index} ({item_id}): битый адрес https")
+                continue
+        elif not _valid_tcp_target(target):
+            problems.append(f"#{index} ({item_id}): битый адрес tcp")
+            continue
+        if kind != "builtin":
+            custom += 1
+            if custom > HEALTH_MAX_CUSTOM:
+                problems.append(f"#{index} ({item_id}): больше "
+                                f"{HEALTH_MAX_CUSTOM} своих проверок")
+                continue
+        items.append({
+            "id": item_id,
+            "title": title,
+            "kind": kind,
+            "probe": probe,
+            "target": target,
+            "expect": _normalise_expect(raw.get("expect")) if kind == "https" else {},
+            "via": _health_via(raw.get("via")),
+            "level": _health_level(item_id, raw.get("level"), kind),
+            "check": _health_bool(raw.get("check"), True),
+            "show": _health_bool(raw.get("show"), True),
+            "timeout": _health_timeout(raw.get("timeout")),
+        })
+        seen.add(item_id)
+    if not items:
+        problems.append("health_items: ни одной годной записи — взяты встроенные")
+        return _default_health_items(), problems
+    return items, problems
+
+
+def health_items_report() -> list[str]:
+    """Что отброшено при последнем чтении ``health_items``."""
+    return list(_HEALTH_ITEMS_REPORT)
+
+
+def _log_health_items(problems: list[str]) -> None:
+    """Пишет в журнал одну строку об отброшенных записях (не чаще 10 минут)."""
+    global _HEALTH_LOG_AT
+    now = time.time()
+    if now - _HEALTH_LOG_AT < _READ_LOG_EVERY:
+        return
+    _HEALTH_LOG_AT = now
+    detail = "; ".join(problems[:3])
+    if len(problems) > 3:
+        detail += f" и ещё {len(problems) - 3}"
+    try:
+        from . import activity  # локальный импорт: activity импортирует config
+
+        activity.log(
+            f"проверки сервисов: отброшено записей — {len(problems)} ({detail})",
+            kind="warn")
+    except (ImportError, TypeError, ValueError):
+        pass
+
 DEFAULTS: dict = {
     "zapret_dir": "",
     "zapret_bat": "general (ALT).bat",
@@ -186,6 +420,9 @@ DEFAULTS: dict = {
     "activity_hours": 3,
     # Встроенный список заблокированных доменов Re:filter (data/geosite-refilter.dat).
     "blocked_list_enabled": True,
+    # Проверки сервисов: порядок списка — порядок на дашборде. Старый конфиг
+    # без ключа получает этот набор при чтении (с копией файла рядом).
+    "health_items": _default_health_items(),
 }
 
 #: Режимы маршрутизации Xray. Всё остальное при чтении конфига сводится к
@@ -435,6 +672,27 @@ def load_config() -> dict:
         _migrate_routes(cfg)
         changed = True
         migrated = True
+    # Проверки сервисов: старый конфиг получает встроенный набор в прежнем
+    # порядке. Отсутствие ключа не переписывает файл — чтение не должно менять
+    # mtime (правило проекта); ключ ляжет на диск при первом сохранении.
+    # Испорченный список, наоборот, нормализуется с копией файла рядом.
+    health_problems: list[str] = []
+    if isinstance(data, dict) and "health_items" not in data:
+        cfg["health_items"] = _default_health_items()
+    else:
+        cfg["health_items"], health_problems = normalise_health_items(
+            cfg.get("health_items"))
+        if isinstance(data, dict):
+            stored = data.get("health_items")
+            if stored is not None and stored != cfg["health_items"]:
+                # Список реально изменился: файл переписывается нормализованным,
+                # а прежние байты сохраняются рядом (``.bak-<время>``).
+                normalised = True
+                changed = True
+    global _HEALTH_ITEMS_REPORT
+    _HEALTH_ITEMS_REPORT = list(health_problems)
+    if health_problems:
+        _log_health_items(health_problems)
     if legacy_theme:
         # Переименование ключа — тоже миграция: файл пишется с ``theme_mode``.
         changed = True

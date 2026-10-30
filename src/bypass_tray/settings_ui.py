@@ -12,6 +12,7 @@ import json
 import threading
 import time
 import tkinter as tk
+import urllib.parse
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
@@ -38,6 +39,8 @@ ROUTING_MODE_NAMES = {
 CONTROL_HEIGHT = SPACE["xl"] + SPACE["md"]
 #: Высота компактного элемента в строке правила (28–32 px).
 ROW_CONTROL_HEIGHT = SPACE["xl"] + SPACE["sm"]
+#: Колонка тумблеров в списке проверок: два тумблера справа от имени.
+HEALTH_SWITCH_COLUMN = SPACE["xl"] * 2
 
 
 def _text_value(cfg: dict, key: str) -> str:
@@ -144,6 +147,108 @@ def _proxy_signature(cfg: dict) -> str:
                       sort_keys=True, ensure_ascii=False, default=str)
 
 
+#: Варианты сегментов формы своей проверки.
+HEALTH_KIND_ITEMS = (("https", "https"), ("tcp", "tcp"))
+HEALTH_VIA_ITEMS = (("auto", "авто"), ("proxy", "прокси"),
+                    ("direct", "напрямую"))
+HEALTH_LEVEL_ITEMS = (("critical", "критичная"), ("minor", "второстепенная"))
+
+
+def health_item_id(title: str, existing) -> str:
+    """Устойчивый id новой проверки: ``svc_<латиница>`` без повторов.
+
+    id живёт в истории и в отчёте, поэтому он не должен меняться от правки
+    заголовка: берём его один раз при добавлении.
+    """
+    used = {str(record.get("id") or "") for record in existing or []
+            if isinstance(record, dict)}
+    base = "".join(ch if ch.isascii() and ch.isalnum() else "_"
+                   for ch in str(title or "").lower()).strip("_")
+    base = (base[:40] or "check")
+    candidate = f"svc_{base}"
+    counter = 2
+    while candidate in used:
+        candidate = f"svc_{base}_{counter}"
+        counter += 1
+    return candidate
+
+
+def validate_health_item(values: dict, existing: list[dict]) -> tuple[dict | None, str]:
+    """Проверяет ввод формы своей проверки без Tk.
+
+    Возвращает ``(запись, "")`` либо ``(None, сообщение)``. Чистая функция:
+    мусорный ввод отсекается до касания конфига, и это видно в тесте.
+    """
+    if not isinstance(values, dict):
+        return None, "Пустая форма"
+    title = str(values.get("title") or "").strip()[:80]
+    if not title:
+        return None, "Укажите название проверки"
+    kind = str(values.get("kind") or "https").strip().lower()
+    if kind not in ("https", "tcp"):
+        return None, "Тип проверки: https или tcp"
+    target = str(values.get("target") or "").strip()
+    if not target:
+        return None, "Укажите адрес"
+    if kind == "https":
+        try:
+            parsed = urllib.parse.urlsplit(target)
+        except ValueError:
+            parsed = None
+        if (parsed is None or parsed.scheme not in ("http", "https")
+                or not parsed.hostname):
+            return None, "Адрес: нужен http:// или https:// с хостом"
+    else:
+        host, separator, port_text = target.rpartition(":")
+        if not separator or not host:
+            return None, "TCP-адрес: нужен host:port, например example.com:443"
+        if not port_text.isdigit() or not 1 <= int(port_text) <= 65535:
+            return None, "TCP-адрес: порт должен быть от 1 до 65535"
+    try:
+        timeout = int(round(float(str(values.get("timeout") or "").strip())))
+    except (TypeError, ValueError):
+        return None, "Таймаут: число от 1 до 15 секунд"
+    if not 1 <= timeout <= 15:
+        return None, "Таймаут: число от 1 до 15 секунд"
+    status = str(values.get("status") or "").strip().lower()
+    if status in ("", "любой", "any"):
+        expect_status = "any"
+    elif status == "2xx":
+        expect_status = "2xx"
+    elif status.isdigit() and 100 <= int(status) <= 599:
+        expect_status = int(status)
+    else:
+        return None, "Ожидаемый код: любой, 2xx или число 100–599"
+    custom = sum(1 for record in existing or []
+                 if isinstance(record, dict)
+                 and str(record.get("kind") or "") != "builtin")
+    if custom >= config.HEALTH_MAX_CUSTOM:
+        return None, (f"Своих проверок не больше {config.HEALTH_MAX_CUSTOM} — "
+                      "удалите лишнюю")
+    via = str(values.get("via") or "auto").strip().lower()
+    if via not in config.HEALTH_VIA:
+        via = "auto"
+    level = str(values.get("level") or "minor").strip().lower()
+    if level not in config.HEALTH_LEVELS:
+        level = "minor"
+    record = {
+        "id": health_item_id(title, existing),
+        "title": title,
+        "kind": kind,
+        "probe": "",
+        "target": target,
+        "expect": ({"status": expect_status,
+                    "contains": str(values.get("contains") or "").strip()[:200]}
+                   if kind == "https" else {}),
+        "via": via,
+        "level": level,
+        "check": True,
+        "show": True,
+        "timeout": timeout,
+    }
+    return record, ""
+
+
 BEHAVIOR_TIPS = {
     "autostart": "Запускать «Обходы» при входе в Windows и подключать VPN, "
                  "если включено автоподключение.",
@@ -195,6 +300,14 @@ class SettingsPage(tk.Frame):
         self._blocked_result = None
         self._blocked_text = ""
         self._blocked_run = 0
+        #: Проверки сервисов в форме: в конфиг попадают по «Сохранить».
+        self.health_items: list[dict] = []
+        self.health_rows: dict[str, dict] = {}
+        self.health_form: tk.Frame | None = None
+        self.health_form_open = False
+        self.health_error: tk.Label | None = None
+        self.health_vars: dict[str, tk.StringVar] = {}
+        self.health_segments: dict[str, Segmented] = {}
         self.tooltips: list[Tooltip] = []
         self._build()
 
@@ -538,6 +651,9 @@ class SettingsPage(tk.Frame):
             "застревает, трафик YouTube и Discord пойдёт через сервер.",
             caption=True)
 
+        # --- дашборд (проверки сервисов) ---
+        self._build_dashboard(pad)
+
         # --- VPN ---
         vpn = self._section(pad, "VPN и подписка")
         self._label(vpn, "Ссылка на подписку (её выдаёт провайдер). Хранится "
@@ -759,6 +875,281 @@ class SettingsPage(tk.Frame):
         self.body.bind_tree()
         self.reload()
 
+    # ---- дашборд (проверки сервисов) ---------------------------------------
+    def _build_dashboard(self, parent: tk.Misc) -> None:
+        """Секция «Дашборд»: состав проверок, порядок строк и видимость."""
+        theme = self.theme
+        section = self._section(parent, "Дашборд")
+        self._label(
+            section,
+            "Скрытая проверка продолжает влиять на иконку, если «Проверять» "
+            "включено.", caption=True)
+        head = tk.Frame(section, bg=theme.card)
+        head.pack(fill="x", pady=(0, SPACE["xs"]))
+        head.columnconfigure(0, weight=1)
+        # Ширины колонок те же, что у строк: подписи встают ровно над
+        # тумблерами, иначе «Проверять» висело бы между ними.
+        for column in (1, 2):
+            head.columnconfigure(column, minsize=HEALTH_SWITCH_COLUMN)
+        for column, text in ((1, "Проверять"), (2, "Показывать")):
+            tk.Label(head, text=text, bg=theme.card, fg=theme.text_faint,
+                     font=theme.caption(), anchor="e").grid(
+                row=0, column=column, sticky="e")
+        self.health_list = tk.Frame(section, bg=theme.card)
+        self.health_list.pack(fill="x")
+        add_row = tk.Frame(section, bg=theme.card)
+        add_row.pack(fill="x", pady=(SPACE["sm"], 0))
+        self.health_add_button = PillButton(
+            add_row, theme, "Добавить проверку", self._open_health_form,
+            kind="secondary", height=CONTROL_HEIGHT)
+        self.health_add_button.pack(side="left")
+        self.health_counter = tk.Label(
+            add_row, text="", bg=theme.card, fg=theme.text_faint,
+            font=theme.caption(), anchor="w")
+        self.health_counter.pack(side="left", padx=(SPACE["sm"], 0))
+        self.health_form = tk.Frame(section, bg=theme.card)
+        self._build_health_form(self.health_form)
+        self._render_health_items()
+        self._update_health_counter()
+
+    def _build_health_form(self, frame: tk.Frame) -> None:
+        """Компактная форма своей проверки; показывается по кнопке."""
+        theme = self.theme
+        Divider(frame, theme).pack(fill="x", pady=(SPACE["sm"], SPACE["sm"]))
+        self.health_vars = {
+            "title": tk.StringVar(),
+            "target": tk.StringVar(),
+            "timeout": tk.StringVar(value="5"),
+            "status": tk.StringVar(),
+            "contains": tk.StringVar(),
+        }
+
+        first = tk.Frame(frame, bg=theme.card)
+        first.pack(fill="x", pady=(0, SPACE["sm"]))
+        tk.Label(first, text="Название", bg=theme.card, fg=theme.text_dim,
+                 font=theme.caption(), anchor="w").pack(side="left")
+        TextField(first, theme, self.health_vars["title"], bg=theme.card,
+                  width=220, placeholder="например: Свой сайт").pack(
+            side="left", padx=(SPACE["sm"], SPACE["md"]))
+        tk.Label(first, text="Тип", bg=theme.card, fg=theme.text_dim,
+                 font=theme.caption()).pack(side="left")
+        self.health_segments["kind"] = Segmented(
+            first, theme, list(HEALTH_KIND_ITEMS), "https",
+            command=self._health_kind_changed, bg=theme.card,
+            height=CONTROL_HEIGHT, width=160)
+        self.health_segments["kind"].pack(side="left", padx=(SPACE["sm"], 0))
+
+        target_row = tk.Frame(frame, bg=theme.card)
+        target_row.pack(fill="x", pady=(0, SPACE["sm"]))
+        tk.Label(target_row, text="Адрес", bg=theme.card, fg=theme.text_dim,
+                 font=theme.caption(), anchor="w").pack(side="left")
+        TextField(target_row, theme, self.health_vars["target"],
+                  bg=theme.card, placeholder="https://example.com/health").pack(
+            side="left", fill="x", expand=True, padx=(SPACE["sm"], 0))
+
+        pick_row = tk.Frame(frame, bg=theme.card)
+        pick_row.pack(fill="x", pady=(0, SPACE["sm"]))
+        tk.Label(pick_row, text="Через", bg=theme.card, fg=theme.text_dim,
+                 font=theme.caption()).pack(side="left")
+        self.health_segments["via"] = Segmented(
+            pick_row, theme, list(HEALTH_VIA_ITEMS), "auto", bg=theme.card,
+            height=CONTROL_HEIGHT, width=240)
+        self.health_segments["via"].pack(side="left", padx=(SPACE["sm"], SPACE["md"]))
+        tk.Label(pick_row, text="Важность", bg=theme.card, fg=theme.text_dim,
+                 font=theme.caption()).pack(side="left")
+        self.health_segments["level"] = Segmented(
+            pick_row, theme, list(HEALTH_LEVEL_ITEMS), "minor", bg=theme.card,
+            height=CONTROL_HEIGHT, width=260)
+        self.health_segments["level"].pack(side="left", padx=(SPACE["sm"], 0))
+
+        timeout_row = tk.Frame(frame, bg=theme.card)
+        timeout_row.pack(fill="x", pady=(0, SPACE["sm"]))
+        tk.Label(timeout_row, text="Таймаут, с", bg=theme.card,
+                 fg=theme.text_dim, font=theme.caption()).pack(side="left")
+        TextField(timeout_row, theme, self.health_vars["timeout"],
+                  bg=theme.card, width=80).pack(side="left",
+                                                padx=(SPACE["sm"], SPACE["sm"]))
+        tk.Label(timeout_row, text="от 1 до 15", bg=theme.card,
+                 fg=theme.text_faint, font=theme.caption()).pack(side="left")
+
+        self.health_https_row = tk.Frame(frame, bg=theme.card)
+        self.health_https_row.pack(fill="x", pady=(0, SPACE["sm"]))
+        tk.Label(self.health_https_row, text="Ожидаемый код", bg=theme.card,
+                 fg=theme.text_dim, font=theme.caption()).pack(side="left")
+        TextField(self.health_https_row, theme, self.health_vars["status"],
+                  bg=theme.card, width=120,
+                  placeholder="любой / 2xx / 200").pack(
+            side="left", padx=(SPACE["sm"], SPACE["md"]))
+        tk.Label(self.health_https_row, text="Тело содержит", bg=theme.card,
+                 fg=theme.text_dim, font=theme.caption()).pack(side="left")
+        TextField(self.health_https_row, theme, self.health_vars["contains"],
+                  bg=theme.card, placeholder="подстрока ответа").pack(
+            side="left", fill="x", expand=True, padx=(SPACE["sm"], 0))
+
+        self.health_error = tk.Label(
+            frame, text="", bg=theme.card, fg=theme.bad,
+            font=theme.caption(), anchor="w", justify="left",
+            wraplength=self.WIDTH - 160)
+        self.health_error.pack(fill="x")
+
+        actions = tk.Frame(frame, bg=theme.card)
+        actions.pack(fill="x", pady=(SPACE["sm"], 0))
+        self.health_actions_row = actions
+        PillButton(actions, theme, "Сохранить", self._submit_health_form,
+                   kind="primary", height=CONTROL_HEIGHT).pack(side="left")
+        PillButton(actions, theme, "Отмена", self._cancel_health_form,
+                   kind="ghost", height=CONTROL_HEIGHT).pack(
+            side="left", padx=(SPACE["sm"], 0))
+
+    def _health_kind_changed(self, value) -> None:
+        """Поля «код» и «тело» нужны только HTTPS-проверке."""
+        row = getattr(self, "health_https_row", None)
+        if row is None:
+            return
+        if str(value) == "tcp":
+            row.pack_forget()
+        else:
+            before = getattr(self, "health_actions_row", None)
+            row.pack(fill="x", pady=(0, SPACE["sm"]),
+                     before=before if before is not None else None)
+
+    def _open_health_form(self) -> None:
+        """Показать форму добавления с пустыми полями."""
+        if self.health_form is None:
+            return
+        for key, var in self.health_vars.items():
+            var.set("5" if key == "timeout" else "")
+        self.health_segments["kind"].set("https")
+        self.health_segments["via"].set("auto")
+        self.health_segments["level"].set("minor")
+        self._health_kind_changed("https")
+        if self.health_error is not None:
+            self.health_error.configure(text="")
+        self.health_form.pack(fill="x", pady=(SPACE["sm"], 0))
+        self.health_form_open = True
+
+    def _cancel_health_form(self) -> None:
+        """Закрыть форму, ничего не меняя в списке."""
+        if self.health_form is None:
+            return
+        self.health_form.pack_forget()
+        self.health_form_open = False
+        if self.health_error is not None:
+            self.health_error.configure(text="")
+
+    def _submit_health_form(self) -> None:
+        """Проверить ввод и добавить запись; при ошибке форма остаётся."""
+        values = {
+            "title": self.health_vars["title"].get(),
+            "kind": self.health_segments["kind"].get(),
+            "target": self.health_vars["target"].get(),
+            "via": self.health_segments["via"].get(),
+            "level": self.health_segments["level"].get(),
+            "timeout": self.health_vars["timeout"].get(),
+            "status": self.health_vars["status"].get(),
+            "contains": self.health_vars["contains"].get(),
+        }
+        record, error = validate_health_item(values, self.health_items)
+        if record is None:
+            if self.health_error is not None:
+                self.health_error.configure(text=error, fg=self.theme.bad)
+            return
+        self.health_items.append(record)
+        self._render_health_items()
+        self._update_health_counter()
+        self._cancel_health_form()
+
+    def _render_health_items(self) -> None:
+        """Список проверок: имя, два тумблера, порядок и удаление своей."""
+        holder = getattr(self, "health_list", None)
+        if holder is None:
+            return
+        for child in list(holder.winfo_children()):
+            child.destroy()
+        self.health_rows = {}
+        theme = self.theme
+        for index, record in enumerate(self.health_items):
+            item_id = str(record.get("id") or "")
+            row = tk.Frame(holder, bg=theme.card)
+            row.pack(fill="x", pady=(0, SPACE["xs"]))
+            row.columnconfigure(0, weight=1)
+            for column in (1, 2):
+                row.columnconfigure(column, minsize=HEALTH_SWITCH_COLUMN)
+            name = tk.Label(row, text=str(record.get("title") or item_id),
+                            bg=theme.card, fg=theme.text, font=theme.body(),
+                            anchor="w")
+            name.grid(row=0, column=0, sticky="w")
+            check = ToggleSwitch(
+                row, theme, bool(record.get("check", True)),
+                command=lambda value, i=index: self._set_health_flag(
+                    i, "check", value))
+            check.grid(row=0, column=1, sticky="e", padx=(SPACE["md"], 0))
+            show = ToggleSwitch(
+                row, theme, bool(record.get("show", True)),
+                command=lambda value, i=index: self._set_health_flag(
+                    i, "show", value))
+            show.grid(row=0, column=2, sticky="e", padx=(SPACE["md"], 0))
+            up = PillButton(row, theme, "↑",
+                            lambda i=index: self._move_health(i, -1),
+                            kind="ghost", height=ROW_CONTROL_HEIGHT,
+                            pad_x=SPACE["xs"], width=30)
+            up.grid(row=0, column=3, padx=(SPACE["sm"], 0))
+            up.set_enabled(index > 0)
+            down = PillButton(row, theme, "↓",
+                              lambda i=index: self._move_health(i, 1),
+                              kind="ghost", height=ROW_CONTROL_HEIGHT,
+                              pad_x=SPACE["xs"], width=30)
+            down.grid(row=0, column=4, padx=(SPACE["xs"], 0))
+            down.set_enabled(index < len(self.health_items) - 1)
+            delete = None
+            if str(record.get("kind") or "") != "builtin":
+                # Встроенную проверку удалить нельзя — только скрыть или
+                # выключить: её id живёт в истории и в сводке по суткам.
+                delete = PillButton(row, theme, "×",
+                                    lambda i=index: self._delete_health(i),
+                                    kind="ghost", height=ROW_CONTROL_HEIGHT,
+                                    pad_x=SPACE["xs"], width=30)
+                delete.grid(row=0, column=5, padx=(SPACE["xs"], 0))
+            self.health_rows[item_id] = {
+                "row": row, "name": name, "check": check, "show": show,
+                "up": up, "down": down, "delete": delete,
+            }
+
+    def _set_health_flag(self, index: int, key: str, value) -> None:
+        """Тумблер «Проверять»/«Показывать» правит рабочую копию списка."""
+        if not 0 <= index < len(self.health_items):
+            return
+        self.health_items[index][key] = bool(value)
+
+    def _move_health(self, index: int, delta: int) -> None:
+        """Стрелка меняет порядок; в конфиг он попадёт по «Сохранить»."""
+        target = index + delta
+        if not (0 <= index < len(self.health_items)
+                and 0 <= target < len(self.health_items)):
+            return
+        items = self.health_items
+        items[index], items[target] = items[target], items[index]
+        self._render_health_items()
+
+    def _delete_health(self, index: int) -> None:
+        """Удалить свою проверку; встроенную не трогаем ни при каких условиях."""
+        if not 0 <= index < len(self.health_items):
+            return
+        if str(self.health_items[index].get("kind") or "") == "builtin":
+            return
+        del self.health_items[index]
+        self._render_health_items()
+        self._update_health_counter()
+
+    def _update_health_counter(self) -> None:
+        counter = getattr(self, "health_counter", None)
+        if counter is None:
+            return
+        custom = sum(1 for record in self.health_items
+                     if str(record.get("kind") or "") != "builtin")
+        counter.configure(
+            text=f"своих {custom} из {config.HEALTH_MAX_CUSTOM}")
+
     # ---- данные -----------------------------------------------------------
     def _routes_dirty(self) -> bool:
         """Отличаются ли правила на экране от тех, что лежат в конфиге."""
@@ -840,6 +1231,13 @@ class SettingsPage(tk.Frame):
         for key, switch in self.switches.items():
             switch.set(bool(self.vars[key].get()))
         self.blocked_toggle.set(bool(cfg.get("blocked_list_enabled", True)))
+        # Проверки сервисов: старый конфиг без ключа получает встроенный набор,
+        # испорченный — нормализуется (это уже сделал ``load_config``).
+        health_records, _health_problems = config.normalise_health_items(
+            cfg.get("health_items"))
+        self.health_items = [dict(record) for record in health_records]
+        self._render_health_items()
+        self._update_health_counter()
         mapping = cfg.get("xray_routes")
         if not isinstance(mapping, dict):
             mapping = {}
@@ -949,6 +1347,9 @@ class SettingsPage(tk.Frame):
             "theme": self.theme_segment.get(),
             "rules": dict(self.rules),
             "rule_servers": dict(self.rule_servers),
+            # Несохранённые правки проверок должны пережить перестройку при
+            # смене темы, как и остальные поля формы.
+            "health": [dict(record) for record in self.health_items],
         }
         if self._saved_rules is not None:
             state["saved_rules"] = dict(self._saved_rules)
@@ -983,6 +1384,11 @@ class SettingsPage(tk.Frame):
                 switch.set(bool(value))
         if "blocked" in state:
             self.blocked_toggle.set(bool(state["blocked"]))
+        if isinstance(state.get("health"), list):
+            self.health_items = [dict(record) for record in state["health"]
+                                 if isinstance(record, dict)]
+            self._render_health_items()
+            self._update_health_counter()
         if isinstance(state.get("theme"), str):
             self.set_theme_mode(state["theme"])
         if isinstance(state.get("rules"), dict):
@@ -1616,6 +2022,9 @@ class SettingsPage(tk.Frame):
         _merge_legacy_routes(cfg)
         cfg["zapret_dir"] = self.vars["zapret_dir"].get().strip()
         cfg["tgws_exe"] = self.vars["tgws_exe"].get().strip()
+        # Проверки сервисов сохраняются вместе с остальными настройками:
+        # состав, порядок и тумблеры — тот же список, что и на экране.
+        cfg["health_items"] = [dict(record) for record in self.health_items]
         if not config.save_config(cfg):
             self.progress_label.configure(
                 text="Не сохранено: config.json недоступен", fg=self.theme.warn)

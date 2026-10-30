@@ -177,6 +177,9 @@ def main() -> int:
                         help="при --setup не прописывать автозапуск")
     parser.add_argument("--health", action="store_true",
                         help="напечатать JSON проверки сервисов и выйти")
+    parser.add_argument("--check", default="", metavar="TARGET",
+                        help="разовая проверка адреса (URL или host:port): "
+                             "JSON и код 0/1")
     parser.add_argument("--diagnose", action="store_true",
                         help="напечатать диагноз по последнему отчёту проверки и выйти")
     parser.add_argument("--history", action="store_true",
@@ -217,6 +220,18 @@ def main() -> int:
             result = transfer.import_settings(args.import_path)
         except Exception as exc:  # noqa: BLE001
             result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        _print_json(result)
+        return 0 if result.get("ok") else 1
+
+    if args.check:
+        from . import health
+
+        try:
+            result = health.check_target(args.check, config.load_config())
+        except Exception as exc:  # noqa: BLE001
+            result = {"id": "check", "title": args.check, "ok": False,
+                      "state": "bad", "ms": 0,
+                      "detail": f"{type(exc).__name__}: {exc}"}
         _print_json(result)
         return 0 if result.get("ok") else 1
 

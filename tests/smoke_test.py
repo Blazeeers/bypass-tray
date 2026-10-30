@@ -125,6 +125,7 @@ class FakeController:
                 {"id": "discord", "state": "ok", "detail": "страница и шлюз · 1.4 с"},
                 {"id": "deepseek", "state": "ok", "detail": "напрямую · 0.4 с"},
                 {"id": "tgwsproxy", "state": "ok", "detail": "порт 1443 слушает"},
+                {"id": "telegram", "state": "ok", "detail": "сервер доступен"},
                 {"id": "vpn", "state": "ok", "detail": "подключён"},
             ],
         }
@@ -411,7 +412,7 @@ def main() -> int:
         check("плитка VPN: задержка из proxy.latency", vpn_tile == "51 мс",
               str(vpn_tile))
         services_tile = panel._tiles["services"]["value"].cget("text")
-        check("плитка «Сервисы»: 5 из 5", services_tile == "5 из 5",
+        check("плитка «Сервисы»: 7 из 7", services_tile == "7 из 7",
               str(services_tile))
         uptime_tile = panel._tiles["uptime"]
         # Истории за сутки в тестовом каталоге нет: плитка обязана показать
@@ -436,7 +437,7 @@ def main() -> int:
               str(journal_right))
         # Две колонки: разделитель на месте, а правая ячейка правее левой.
         left_x = panel._services["zapret"]["cell"].winfo_x()
-        right_x = panel._services["deepseek"]["cell"].winfo_x()
+        right_x = panel._services["telegram"]["cell"].winfo_x()
         check("сервисы: две колонки с разделителем",
               bool(panel._services_divider.winfo_ismapped()) and right_x > left_x,
               f"x={left_x}/{right_x}, разделитель "
@@ -3442,6 +3443,30 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
           saved_cfg.get("blocked_list_enabled") is False)
     check("настройки: YouTube через VPN сохранён",
           saved_cfg.get("youtube_via_vpn") is True)
+
+    # --- настройки: дашборд проверок ------------------------------------
+    print("\n-- настройки: дашборд проверок --")
+    check("настройки: строки проверок построены по конфигу",
+          len(settings.health_rows) == 7
+          and settings.health_rows["zapret"]["delete"] is None,
+          f"строк {len(settings.health_rows)}")
+    settings._delete_health(0)
+    check("настройки: встроенную проверку удалить нельзя",
+          len(settings.health_items) == 7, str(len(settings.health_items)))
+    telegram_index = [record["id"] for record in settings.health_items].index(
+        "telegram")
+    settings._set_health_flag(telegram_index, "show", False)
+    settings._save()
+    saved_config = config.load_config()
+    saved_health = {record["id"]: record
+                    for record in saved_config["health_items"]}
+    check("настройки: «Показывать» сохраняется в конфиг",
+          saved_health["telegram"]["show"] is False)
+    from bypass_tray.ui import service_records
+
+    check("настройки: скрытая проверка ушла из строк панели",
+          "telegram" not in [record["id"]
+                             for record in service_records(saved_config)])
 
     # --- настройки: перезапуск только при прокси-ключах -----------------
     print("\n-- настройки: перезапуск прокси --")

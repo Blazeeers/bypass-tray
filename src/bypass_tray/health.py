@@ -26,8 +26,41 @@ from . import config
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) bypass-tray"
 _CONTEXT = ssl.create_default_context()
 
+#: Сколько тела ответа читать при проверке ``contains``: страница целиком не
+#: нужна, а гигабайтная загрузка съела бы и время, и память.
+MAX_BODY = 64 * 1024
+
 
 # ---- сетевые примитивы ----------------------------------------------------
+
+
+def _error_name(exc: BaseException) -> str:
+    """Короткое имя ошибки для ``detail``: ``tls`` или класс исключения."""
+    if isinstance(exc, urllib.error.URLError):
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, ssl.SSLCertVerificationError) or (
+                isinstance(reason, ssl.SSLError)
+                and "CERTIFICATE_VERIFY_FAILED" in str(reason)):
+            return "tls"
+        return type(exc).__name__
+    if isinstance(exc, ssl.SSLError):
+        return "tls"
+    return type(exc).__name__
+
+
+def _ms(started: float) -> int:
+    return round((time.perf_counter() - started) * 1000)
+
+
+def _read_body(response) -> str:
+    """Тело ответа, не больше ``MAX_BODY``; ошибка чтения — пустая строка."""
+    try:
+        raw = response.read(MAX_BODY)
+    except (OSError, http.client.HTTPException, ValueError):
+        return ""
+    if isinstance(raw, str):
+        return raw
+    return raw.decode("utf-8", "replace")
 
 
 def _http(url: str, proxy_port: int | None = None, timeout: float = 5.0) -> dict:
@@ -44,19 +77,9 @@ def _http(url: str, proxy_port: int | None = None, timeout: float = 5.0) -> dict
             status = _http_via_proxy(url, int(proxy_port), timeout)
         else:
             status = _http_direct(url, timeout)
-    except urllib.error.URLError as exc:
-        reason = getattr(exc, "reason", None)
-        if isinstance(reason, ssl.SSLCertVerificationError) or (
-                isinstance(reason, ssl.SSLError)
-                and "CERTIFICATE_VERIFY_FAILED" in str(reason)):
-            error = "tls"
-        else:
-            error = type(exc).__name__
-    except ssl.SSLCertVerificationError:
-        error = "tls"
     except Exception as exc:  # noqa: BLE001
-        error = "tls" if isinstance(exc, ssl.SSLError) else type(exc).__name__
-    ms = round((time.perf_counter() - started) * 1000)
+        error = _error_name(exc)
+    ms = _ms(started)
     return {
         "ok": bool(status) and status < 500,
         "status": int(status or 0),
@@ -95,6 +118,54 @@ def _http_via_proxy(url: str, port: int, timeout: float) -> int:
     try:
         connection.request("GET", path, headers={"User-Agent": UA})
         return int(connection.getresponse().status)
+    finally:
+        connection.close()
+
+
+def _fetch_direct(url: str, timeout: float) -> dict:
+    """GET без системного прокси, с телом ответа (до ``MAX_BODY``)."""
+    started = time.perf_counter()
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    request = urllib.request.Request(url, headers={"User-Agent": UA})
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            return {"status": int(response.status), "body": _read_body(response),
+                    "ms": _ms(started), "error": ""}
+    except urllib.error.HTTPError as exc:
+        # Тело ответа 4xx/5xx тоже проверяется на подстроку: сайт мог ответить
+        # ошибкой, но с ожидаемым текстом — это по-прежнему ответ.
+        return {"status": int(exc.code), "body": _read_body(exc),
+                "ms": _ms(started), "error": ""}
+    except Exception as exc:  # noqa: BLE001
+        return {"status": 0, "body": "", "ms": _ms(started),
+                "error": _error_name(exc)}
+
+
+def _fetch_via_proxy(url: str, port: int, timeout: float) -> dict:
+    """GET через локальный прокси (CONNECT-туннель), с телом ответа."""
+    started = time.perf_counter()
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname or ""
+    secure = parts.scheme != "http"
+    target_port = parts.port or (443 if secure else 80)
+    path = parts.path or "/"
+    if parts.query:
+        path += "?" + parts.query
+    if secure:
+        connection = http.client.HTTPSConnection(
+            "127.0.0.1", port, timeout=timeout, context=_CONTEXT
+        )
+        connection.set_tunnel(host, target_port)
+    else:
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        connection.request("GET", path, headers={"User-Agent": UA})
+        response = connection.getresponse()
+        return {"status": int(response.status), "body": _read_body(response),
+                "ms": _ms(started), "error": ""}
+    except Exception as exc:  # noqa: BLE001
+        return {"status": 0, "body": "", "ms": _ms(started),
+                "error": _error_name(exc)}
     finally:
         connection.close()
 
@@ -357,6 +428,230 @@ def _check_vpn(proxy: dict, timeout: float = 10.0,
     return _item("vpn", "VPN", "bad", "сервер не отвечает", ms)
 
 
+# ---- проверки по конфигу --------------------------------------------------
+
+
+def _target_label(record: dict) -> str:
+    """Адрес для ``detail``: схема, хост и путь — без query и фрагмента.
+
+    Путь показываем: по нему видно, что именно проверяется. А query и
+    фрагмент — нет: в ``target`` бывают одноразовые токены (``?token=…``),
+    и в отчёт, историю и журнал они попадать не должны.
+    """
+    target = str(record.get("target") or "")
+    if str(record.get("kind") or "") == "https":
+        try:
+            parts = urllib.parse.urlsplit(target)
+        except ValueError:
+            return str(record.get("id") or "")
+        return (f"{parts.scheme or 'https'}://{parts.hostname or ''}"
+                f"{parts.path or ''}")
+    return target
+
+
+def _custom_state(record: dict, ok: bool) -> str:
+    """Состояние своей проверки: отказ — ``warn``, у критичной — ``bad``."""
+    if ok:
+        return "ok"
+    return "bad" if str(record.get("level") or "") == "critical" else "warn"
+
+
+def _stamp(item: dict, record: dict) -> dict:
+    """Переносит в пункт стабильные поля записи: ``id``, заголовок, уровень."""
+    item_id = str(record.get("id") or item.get("id") or "")
+    item["id"] = item_id
+    item["title"] = str(record.get("title") or item.get("title") or item_id)
+    item["level"] = str(record.get("level") or "")
+    item["kind"] = str(record.get("kind") or "builtin")
+    return item
+
+
+def _custom_item(record: dict, state: str, detail: str, ms: int = 0) -> dict:
+    item_id = str(record.get("id") or "")
+    return _stamp(_item(item_id, str(record.get("title") or item_id),
+                        state, detail, ms), record)
+
+
+def _expect_ok(expect: dict, result: dict) -> tuple[bool, str]:
+    """Совпал ли ответ с ожиданием записи; второй элемент — причина отказа."""
+    status = int(result.get("status") or 0)
+    if not status:
+        return False, f"нет ответа ({result.get('error') or 'timeout'})"
+    expect = expect or {}
+    wanted = expect.get("status", "any")
+    if wanted == "2xx":
+        if not 200 <= status < 300:
+            return False, f"HTTP {status}"
+    elif isinstance(wanted, int):
+        if status != wanted:
+            return False, f"HTTP {status}, ждали {wanted}"
+    elif status >= 500:
+        # Любой ответ младше 500 доказывает доступность (как у встроенных проб).
+        return False, f"HTTP {status}"
+    needle = str(expect.get("contains") or "")
+    if needle and needle not in str(result.get("body") or ""):
+        return False, "нет ожидаемого текста"
+    return True, ""
+
+
+def _check_https(record: dict, proxy_port: int | None, timeout: float) -> dict:
+    """Своя HTTPS-проверка: код и/или подстрока, ``via`` задаёт маршрут."""
+    url = str(record.get("target") or "")
+    label = _target_label(record)
+    expect = record.get("expect") or {}
+    via = str(record.get("via") or "auto")
+    if via == "proxy":
+        if not proxy_port:
+            return _custom_item(record, _custom_state(record, False),
+                                f"{label}: нужен VPN", 0)
+        attempts = [("через сервер", proxy_port)]
+    elif via == "direct":
+        attempts = [("напрямую", None)]
+    else:
+        attempts = [("напрямую", None)]
+        if proxy_port:
+            attempts.append(("через сервер", proxy_port))
+    result: dict = {"status": 0, "ms": 0, "error": "timeout"}
+    why = "нет ответа"
+    for where, port in attempts:
+        result = (_fetch_via_proxy(url, port, timeout) if port
+                  else _fetch_direct(url, timeout))
+        ok, why = _expect_ok(expect, result)
+        if ok:
+            seconds = max(0, int(result.get("ms") or 0)) / 1000.0
+            return _custom_item(
+                record, "ok",
+                f"{label} · {where} · HTTP {result.get('status')} · {seconds:.1f} с",
+                int(result.get("ms") or 0))
+    detail = f"{label}: {why}"
+    if len(attempts) > 1:
+        detail += " (напрямую и через сервер)"
+    return _custom_item(record, _custom_state(record, False), detail,
+                        int(result.get("ms") or 0))
+
+
+def _check_tcp(record: dict, timeout: float) -> dict:
+    """Своя TCP-проверка: открылось ли соединение с ``host:port``."""
+    target = str(record.get("target") or "")
+    host, _separator, port_text = target.rpartition(":")
+    try:
+        port = int(port_text)
+    except ValueError:
+        port = 0
+    started = time.perf_counter()
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            ms = _ms(started)
+            return _custom_item(record, "ok", f"{target} · {ms / 1000:.1f} с", ms)
+    except OSError as exc:
+        return _custom_item(record, _custom_state(record, False),
+                            f"{target}: {type(exc).__name__}", _ms(started))
+
+
+def _check_builtin(record: dict, cfg: dict, proxy: dict, proxy_port: int | None,
+                   status_state: dict, timeout: float, deadline: float | None) -> dict:
+    """Встроенная проба по имени ``probe`` — прежняя логика без переписывания."""
+    probe = str(record.get("probe") or record.get("id") or "")
+    if probe == "zapret":
+        item = _check_zapret(status_state, cfg, proxy)
+    elif probe == "youtube":
+        item = _check_youtube(cfg, proxy, timeout)
+    elif probe == "discord":
+        item = _check_discord(cfg, proxy, timeout)
+    elif probe == "deepseek":
+        item = _check_deepseek(proxy_port, timeout)
+    elif probe == "telegram":
+        item = _check_telegram(proxy_port, timeout)
+    elif probe == "tgwsproxy":
+        item = _check_tgws(status_state, cfg)
+    elif probe == "vpn":
+        item = _check_vpn(proxy, timeout, deadline)
+    else:
+        return _custom_item(record, "off", "проба не найдена", 0)
+    # ``id`` из конфига стабилен (по нему живёт история), заголовок пользователь
+    # может переименовать — его и показываем.
+    return _stamp(item, record)
+
+
+def _probe_record(record: dict, cfg: dict, proxy: dict, proxy_port: int | None,
+                  status_state: dict, timeout: float,
+                  deadline: float | None) -> dict:
+    kind = str(record.get("kind") or "builtin")
+    if kind == "https":
+        return _check_https(record, proxy_port, timeout)
+    if kind == "tcp":
+        return _check_tcp(record, timeout)
+    return _check_builtin(record, cfg, proxy, proxy_port, status_state,
+                          timeout, deadline)
+
+
+def _failure_item(record: dict, exc: BaseException) -> dict:
+    """Пункт для упавшей с исключением проверки: своя — по её уровню."""
+    detail = f"проверка не удалась: {type(exc).__name__}"
+    if str(record.get("kind") or "builtin") == "builtin":
+        return _custom_item(record, "bad", detail, 0)
+    return _custom_item(record, _custom_state(record, False), detail, 0)
+
+
+def _target_record(target: str, timeout: float) -> dict | None:
+    """Запись-однодневка для ``--check``: URL → https, иначе ``host:port``."""
+    text = str(target or "").strip()
+    if not text:
+        return None
+    base = {"id": "check", "title": text, "probe": "", "expect": {},
+            "via": "auto", "level": "minor", "check": True, "show": True,
+            "timeout": timeout}
+    if "://" in text:
+        try:
+            parts = urllib.parse.urlsplit(text)
+        except ValueError:
+            return None
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            return None
+        return dict(base, kind="https", target=text,
+                    expect={"status": "any", "contains": ""})
+    host, separator, port_text = text.rpartition(":")
+    if not separator or not host or not port_text.isdigit():
+        return None
+    if not 1 <= int(port_text) <= 65535:
+        return None
+    return dict(base, kind="tcp", target=text)
+
+
+def check_target(target: str, cfg: dict | None = None,
+                 timeout: float = 5.0) -> dict:
+    """Разовая проверка адреса тем же движком, что и ``health_items``.
+
+    ``target`` — URL (http/https) или ``host:port``. Отчёт не пишется ни в
+    ``health.json``, ни в историю: это проверка «до добавления в список».
+    Поле ``ok`` — успех проверки, по нему CLI возвращает код 0/1.
+    """
+    try:
+        limit = max(1.0, min(float(timeout), 30.0))
+    except (TypeError, ValueError):
+        limit = 5.0
+    record = _target_record(target, limit)
+    if record is None:
+        return {"id": "check", "title": str(target or ""), "kind": "",
+                "ok": False, "state": "bad", "ms": 0,
+                "detail": "адрес не распознан: нужен URL или host:port"}
+    proxy = _proxy_status()
+    try:
+        running = bool((proxy or {}).get("running"))
+        port = int((proxy or {}).get("port")
+                   or (cfg or {}).get("xray_port") or 0)
+    except (TypeError, ValueError):
+        running, port = False, 0
+    proxy_port = port if running else None
+    if record["kind"] == "https":
+        item = _check_https(record, proxy_port, limit)
+    else:
+        item = _check_tcp(record, limit)
+    result = dict(item)
+    result["ok"] = str(item.get("state") or "") == "ok"
+    return result
+
+
 # ---- сводка ---------------------------------------------------------------
 
 
@@ -383,32 +678,73 @@ CRITICAL_IDS = ("zapret", "youtube", "discord", "deepseek", "vpn")
 SECONDARY_IDS = ("telegram", "tgwsproxy")
 
 
+def _configured_severity(cfg: dict | None) -> tuple[dict[str, str], set[str]]:
+    """Уровень записей и «свои» проверки из конфига.
+
+    Возвращает ``id → critical|minor`` и множество своих (``https``/``tcp``).
+    Без ``health_items`` (старый конфиг, тесты) раскладка пустая: дальше
+    действуют встроенные ``CRITICAL_IDS``/``SECONDARY_IDS``.
+    """
+    levels: dict[str, str] = {}
+    custom: set[str] = set()
+    raw = (cfg or {}).get("health_items") if isinstance(cfg, dict) else None
+    if isinstance(raw, (list, tuple)):
+        for record in raw:
+            if not isinstance(record, dict):
+                continue
+            item_id = str(record.get("id") or "")
+            if not item_id:
+                continue
+            level = str(record.get("level") or "").strip().lower()
+            if level not in ("critical", "minor"):
+                level = "critical" if item_id in CRITICAL_IDS else "minor"
+            levels[item_id] = level
+            if str(record.get("kind") or "") in ("https", "tcp"):
+                custom.add(item_id)
+    return levels, custom
+
+
+def _severity(item_id: str, levels: dict[str, str],
+              item_levels: dict[str, str]) -> str:
+    if item_id in levels:
+        return levels[item_id]
+    if item_id in item_levels:
+        return item_levels[item_id]
+    return "critical" if item_id in CRITICAL_IDS else "minor"
+
+
 def level(items: list[dict], cfg: dict | None = None, proxy: dict | None = None,
           fresh: bool = True) -> str:
     """Трёхцветный уровень для иконки: ``ok`` | ``degraded`` | ``down``.
 
     ``down`` — отказ критичного пункта: VPN, DeepSeek, YouTube+Discord сразу
     или два критичных. ``degraded`` — любой одиночный bad критичного (иконка
-    оранжевая, а не зелёная), warn критичных, bad второстепенных или
-    устаревший отчёт. ``off`` у компонента ни на что не влияет.
-    ``cfg``/``proxy`` оставлены в подписи для единообразия с ``collect``.
+    оранжевая, а не зелёная), warn критичных, bad второстепенных, упавшая своя
+    проверка или устаревший отчёт. ``off`` у компонента ни на что не влияет.
 
-    Набор пунктов может быть частичным: функция считается по тому, что дали
-    (одиночная проба, тест), а полноту отчёта проверяют ``load_cache`` и
-    ``collect`` — только они решают, годен ли отчёт как здоровье целиком.
-    Пустой список — всё равно ``degraded``: нет данных не значит «всё в порядке».
+    Уровень записи (``critical``/``minor``) берётся из ``cfg["health_items"]``,
+    затем из самого пункта, затем из встроенной раскладки. Так один и тот же
+    код годится и для полного отчёта, и для одиночной пробы в тесте.
+    ``show`` на расчёт не влияет — только на отображение.
     """
     states: dict[str, str] = {}
+    item_levels: dict[str, str] = {}
     for item in items or []:
         if not isinstance(item, dict):
             continue
-        states[str(item.get("id") or "")] = str(item.get("state") or "off")
+        item_id = str(item.get("id") or "")
+        states[item_id] = str(item.get("state") or "off")
+        own = str(item.get("level") or "").strip().lower()
+        if own in ("critical", "minor"):
+            item_levels[item_id] = own
 
     if not states:
         return "degraded"
 
-    critical_bad = [item_id for item_id in CRITICAL_IDS
-                    if states.get(item_id) == "bad"]
+    levels, custom = _configured_severity(cfg)
+    critical_bad = [item_id for item_id, state in states.items()
+                    if state == "bad"
+                    and _severity(item_id, levels, item_levels) == "critical"]
     # DeepSeek и VPN — отдельные критичные проверки: их bad сразу красный.
     if states.get("vpn") == "bad" or states.get("deepseek") == "bad":
         return "down"
@@ -417,11 +753,22 @@ def level(items: list[dict], cfg: dict | None = None, proxy: dict | None = None,
     if len(critical_bad) >= 2:
         return "down"
 
-    if (not fresh or critical_bad
-            or any(states.get(item_id) == "warn" for item_id in CRITICAL_IDS)
-            or any(states.get(item_id) == "bad" for item_id in SECONDARY_IDS)):
+    minor_bad = [item_id for item_id, state in states.items()
+                 if state == "bad"
+                 and _severity(item_id, levels, item_levels) == "minor"]
+    critical_warn = [item_id for item_id, state in states.items()
+                     if state == "warn"
+                     and _severity(item_id, levels, item_levels) == "critical"]
+    # Своя проверка, отдавшая warn, — уже «требует внимания». У встроенных
+    # warn второстепенных значит «компонент не нужен» (Telegram без VPN) и
+    # проблемой не считается.
+    custom_trouble = [item_id for item_id, state in states.items()
+                      if item_id in custom and state in ("warn", "bad")]
+    if (not fresh or critical_bad or minor_bad or critical_warn
+            or custom_trouble):
         return "degraded"
     return "ok"
+
 
 
 def _proxy_status() -> dict:
@@ -440,12 +787,37 @@ def _save_cache(result: dict) -> None:
     )
 
 
+def _required_ids(cfg: dict | None) -> tuple[str, ...]:
+    """Включённые критичные проверки: без них отчёт неполон и «свежим» не будет."""
+    raw = (cfg or {}).get("health_items") if isinstance(cfg, dict) else None
+    if not isinstance(raw, (list, tuple)):
+        return CRITICAL_IDS
+    required: list[str] = []
+    for record in raw:
+        if not isinstance(record, dict) or not record.get("check", True):
+            continue
+        if str(record.get("level") or "").strip().lower() != "critical":
+            continue
+        item_id = str(record.get("id") or "")
+        if item_id:
+            required.append(item_id)
+    return tuple(required)
+
+
+def _health_records(cfg: dict | None) -> list[dict]:
+    """Проверки сервисов из конфига; старый конфиг без ключа — встроенные."""
+    raw = (cfg or {}).get("health_items") if isinstance(cfg, dict) else None
+    records, _problems = config.normalise_health_items(raw)
+    return records
+
+
 def load_cache(cfg: dict | None = None) -> dict | None:
     """Последний отчёт из ``health.json``, если он ещё не устарел.
 
     Свежесть та же, что у ``run_guard``: не старше 2×``health_minutes``, и
     метка не из будущего. Битый файл, чужая структура, ошибки чтения и отчёт
-    без критичных пунктов — ``None``: по неполным данным судить нельзя.
+    без включённых критичных пунктов — ``None``: по неполным данным судить
+    нельзя. Отключённая в конфиге проверка (``check=false``) не требуется.
     """
     if cfg is None:
         try:
@@ -465,7 +837,7 @@ def load_cache(cfg: dict | None = None) -> dict | None:
         return None
     present = {str(item.get("id") or "")
                for item in data["items"] if isinstance(item, dict)}
-    if any(item_id not in present for item_id in CRITICAL_IDS):
+    if any(item_id not in present for item_id in _required_ids(cfg)):
         # Отчёт без критичных пунктов (старый формат, урезанная запись) —
         # не доказательство здоровья: показывать его как свежий нельзя.
         return None
@@ -483,14 +855,17 @@ def load_cache(cfg: dict | None = None) -> dict | None:
 
 def collect(cfg: dict, status_state: dict | None = None, proxy: dict | None = None,
             timeout: float = 5.0, total_timeout: float | None = None) -> dict:
-    """Проверяет все пункты и возвращает сводку с вердиктом.
+    """Проверяет все включённые пункты ``health_items`` и сводит вердикт.
 
     ``status_state`` — результат ``status.collect``; если не передан, состояние
     собирается здесь. ``proxy`` — словарь ``xray.status``. ``timeout`` — предел
-    одной пробы (действует и на VPN, у которой раньше был свой жёсткий 10 с),
-    ``total_timeout`` — предел всего сбора (по умолчанию 3×``timeout``): пробы,
-    не уложившиеся в него, помечаются «не успела», а не держат индикатор
-    «занято» десятки секунд.
+    одной пробы по умолчанию, запись может задать свой (``timeout`` в конфиге);
+    ``total_timeout`` — предел всего сбора (по умолчанию 3×``timeout``). Пробы,
+    не уложившиеся в бюджет, помечаются «не успела», а не держат индикатор
+    десятки секунд и не объявляются сбоем.
+
+    Записи с ``check=false`` не выполняются и в отчёт не попадают; ``show``
+    влияет только на отображение и на расчёт уровня не действует.
     """
     if status_state is None:
         try:
@@ -509,59 +884,55 @@ def collect(cfg: dict, status_state: dict | None = None, proxy: dict | None = No
         proxy_running, port = False, 0
     proxy_port = port if proxy_running else None
 
+    records = _health_records(cfg)
+    enabled = [record for record in records if record.get("check", True)]
+
     try:
         budget = float(total_timeout if total_timeout is not None else timeout * 3.0)
     except (TypeError, ValueError):
         budget = 15.0
-    hard_deadline = time.monotonic() + max(1.0, budget)
+    # Запись с длинным таймаутом не должна получать «не успела» из-за бюджета,
+    # посчитанного по таймауту по умолчанию.
+    longest = max([float(record.get("timeout") or timeout)
+                   for record in enabled] or [timeout])
+    hard_deadline = time.monotonic() + max(1.0, budget, longest)
 
-    def probe(item_id: str, check):
-        return _run_probe(item_id, check, timeout, hard_deadline)
+    def probe(record: dict) -> dict:
+        limit = float(record.get("timeout") or timeout)
+        result = _run_probe(
+            str(record.get("id") or ""),
+            lambda item_timeout: _probe_record(
+                record, cfg, proxy or {}, proxy_port, status_state,
+                item_timeout, hard_deadline),
+            limit, hard_deadline)
+        return _stamp(result, record)
 
-    tasks = [
-        ("youtube", lambda: probe("youtube",
-                                  lambda t: _check_youtube(cfg, proxy or {}, t))),
-        ("discord", lambda: probe("discord",
-                                  lambda t: _check_discord(cfg, proxy or {}, t))),
-        ("deepseek", lambda: probe("deepseek",
-                                   lambda t: _check_deepseek(proxy_port, t))),
-        ("telegram", lambda: probe("telegram",
-                                   lambda t: _check_telegram(proxy_port, t))),
-        ("vpn", lambda: _check_vpn(proxy or {}, timeout, hard_deadline)),
-    ]
-    network_items: dict[str, dict] = {}
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(tasks))
-    futures = {pool.submit(task): key for key, task in tasks}
-    try:
-        done, pending = concurrent.futures.wait(
-            futures, timeout=max(0.0, _left(hard_deadline)))
-    finally:
-        # Не ждём «хвост»: его сокеты ограничены тем же дедлайном, а сбор
-        # уже отдаёт результат.
-        pool.shutdown(wait=False, cancel_futures=True)
-    for future in done:
-        key = futures[future]
+    results: dict[str, dict] = {}
+    if enabled:
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(enabled))
+        futures = {pool.submit(probe, record): record for record in enabled}
         try:
-            network_items[key] = future.result()
-        except Exception as exc:  # noqa: BLE001
-            network_items[key] = _item(
-                key, key, "bad", f"проверка не удалась: {type(exc).__name__}", 0
-            )
-    for future in pending:
-        key = futures[future]
-        # Бюджет кончился: не виним сервис (bad), но и не выдаём «ok».
-        network_items[key] = _item(
-            key, key, "warn", "проверка не успела за отведённое время", 0)
+            done, pending = concurrent.futures.wait(
+                futures, timeout=max(0.0, _left(hard_deadline)))
+        finally:
+            # Не ждём «хвост»: его сокеты ограничены тем же дедлайном, а сбор
+            # уже отдаёт результат.
+            pool.shutdown(wait=False, cancel_futures=True)
+        for future in done:
+            record = futures[future]
+            item_id = str(record.get("id") or "")
+            try:
+                results[item_id] = future.result()
+            except Exception as exc:  # noqa: BLE001
+                results[item_id] = _failure_item(record, exc)
+        for future in pending:
+            record = futures[future]
+            item_id = str(record.get("id") or "")
+            # Бюджет кончился: не виним сервис (bad), но и не выдаём «ok».
+            results[item_id] = _custom_item(
+                record, "warn", "проверка не успела за отведённое время", 0)
 
-    items = [
-        _check_zapret(status_state, cfg, proxy or {}),
-        network_items.get("youtube") or _item("youtube", "YouTube", "bad", "нет данных", 0),
-        network_items.get("discord") or _item("discord", "Discord", "bad", "нет данных", 0),
-        network_items.get("deepseek") or _item("deepseek", "DeepSeek", "bad", "нет данных", 0),
-        network_items.get("telegram") or _item("telegram", "Telegram", "off", "нет данных", 0),
-        _check_tgws(status_state, cfg),
-        network_items.get("vpn") or _item("vpn", "VPN", "warn", "нет данных", 0),
-    ]
+    items = [results[str(record.get("id") or "")] for record in enabled]
     result = {
         "checked": time.time(),
         "items": items,

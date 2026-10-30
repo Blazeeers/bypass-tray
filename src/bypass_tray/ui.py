@@ -62,6 +62,28 @@ SERVICES = (
     ("tgwsproxy", "tg-ws-proxy", "telegram"),
 )
 
+#: Кнопка действия в строке сервиса: только у тех, чем управляет приложение.
+SERVICE_BUTTONS = ("zapret", "tgwsproxy")
+
+
+def service_records(cfg: dict | None) -> list[dict]:
+    """Записи карточки «Сервисы»: ``health_items`` с ``show=true`` по порядку.
+
+    Состав и порядок задаёт конфиг: пользователь может скрыть проверку или
+    переставить строки. Старый конфиг без ключа получает встроенный набор.
+    """
+    raw = (cfg or {}).get("health_items") if isinstance(cfg, dict) else None
+    records, _problems = config.normalise_health_items(raw)
+    return [record for record in records if record.get("show", True)]
+
+
+def checked_records(cfg: dict | None) -> list[dict]:
+    """Все записи с ``check=true`` — по ним считается плитка, скрытые тоже."""
+    raw = (cfg or {}).get("health_items") if isinstance(cfg, dict) else None
+    records, _problems = config.normalise_health_items(raw)
+    return [record for record in records if record.get("check", True)]
+
+
 #: Плитки сводки над карточками: ключ → подпись. Порядок — как на макете.
 TILES = (("vpn", "VPN"), ("services", "Сервисы"), ("uptime", "Сутки"))
 
@@ -394,6 +416,10 @@ class Panel:
         self._services_grid: tk.Frame | None = None
         self._services_divider: tk.Frame | None = None
         self._service_columns_count = 0
+        #: Порядок и состав строк сервисов из ``health_items``.
+        self._services_order: list[dict] = []
+        self._services_signature: tuple | None = None
+        self._services_head: tk.Frame | None = None
         #: «проверено ЧЧ:ММ» справа от заголовка «Сервисы».
         self._services_checked: tk.Label | None = None
         self._activity_rows: list[dict] = []
@@ -863,9 +889,16 @@ class Panel:
     def _card(self) -> tk.Frame:
         return self._card_box().inner
 
-    def _card_box(self, pad: int | None = None) -> Card:
+    def _card_box(self, pad: int | None = None,
+                  before: tk.Misc | None = None) -> Card:
         card = Card(self._body.inner, self._theme, pad=pad)
-        card.pack(fill="x", padx=SPACE["xl"], pady=(0, SPACE["md"]))
+        options: dict = {"fill": "x", "padx": SPACE["xl"],
+                         "pady": (0, SPACE["md"])}
+        if before is not None:
+            # Пересборка списка сервисов не должна переносить карточку вниз:
+            # вставляем её туда же, перед журналом.
+            options["before"] = before
+        card.pack(**options)
         return card
 
     # ---- карточка «Что не так» ---------------------------------------------
@@ -1142,9 +1175,13 @@ class Panel:
 
         report = getattr(self.controller, "health_report", {}) or {}
         checked = bool(report.get("checked")) or bool(items)
-        total = len(SERVICES)
+        # Считаем только включённые проверки (``check=true``): скрытая строка
+        # из карточки ушла, но здоровье сервиса она всё ещё проверяет.
+        records = checked_records(getattr(self.controller, "cfg", {}) or {})
+        total = len(records)
         ok_count = 0
-        for key, _title, _icon_name in SERVICES:
+        for record in records:
+            key = str(record.get("id") or "")
             item = items.get(key)
             if item:
                 state = str(item.get("state") or "off")
@@ -1152,14 +1189,15 @@ class Panel:
                 state = self._service_fallback(key, status)[0]
             if state == "ok":
                 ok_count += 1
-        if checked:
+        if checked and total:
             trouble = total - ok_count
             self._set_tile(
                 "services", f"{ok_count} из {total}",
                 theme.text if not trouble else theme.warn,
                 "все отвечают" if not trouble else _services_brief(trouble))
         else:
-            self._set_tile("services", None, theme.text, "не проверено")
+            self._set_tile("services", None, theme.text,
+                           "нет проверок" if checked else "не проверено")
 
         stats = _stability_numbers(summary)
         enough = stats["reports"] >= MIN_STABILITY_REPORTS
@@ -1513,16 +1551,29 @@ class Panel:
         available = width - SPACE["md"]
         return 2 if available / 2 >= SERVICE_COL_MIN_W else 1
 
-    def _build_services(self) -> None:
+    def _build_services(self, before: tk.Misc | None = None) -> None:
         """Заголовок с временем проверки и список сервисов в две колонки.
 
-        Заголовок стоит над карточкой, как на макете: внутри он отнимал бы
-        строку у тесного списка. Ряды — ячейки одной сетки, поэтому пересчёт
-        колонок не пересоздаёт виджеты и не теряет обработчики.
+        Состав берётся из ``health_items`` (``show=true``), порядок — порядок
+        списка. Заголовок стоит над карточкой, как на макете: внутри он
+        отнимал бы строку у тесного списка. Ряды — ячейки одной сетки,
+        поэтому пересчёт колонок не пересоздаёт виджеты.
         """
         theme = self._theme
+        records = service_records(getattr(self.controller, "cfg", {}) or {})
+        self._services_order = records
+        self._services_signature = self._services_key(records)
+        if not records:
+            # Все проверки скрыты — ни заголовка, ни карточки: пустая рамка
+            # только отнимала бы высоту у панели.
+            return
+        options: dict = {"fill": "x", "padx": SPACE["xl"],
+                         "pady": (0, SPACE["xs"])}
+        if before is not None:
+            options["before"] = before
         head = tk.Frame(self._body.inner, bg=theme.bg)
-        head.pack(fill="x", padx=SPACE["xl"], pady=(0, SPACE["xs"]))
+        head.pack(**options)
+        self._services_head = head
         tk.Label(head, text="Сервисы", bg=theme.bg, fg=theme.text,
                  font=theme.title(), anchor="w").pack(side="left")
         self._services_checked = tk.Label(
@@ -1530,7 +1581,7 @@ class Panel:
             font=theme.caption(), anchor="e")
         self._services_checked.pack(side="right")
 
-        card = self._card_box(pad=SPACE["md"])
+        card = self._card_box(pad=SPACE["md"], before=before)
         self._services_card = card
         grid = tk.Frame(card.inner, bg=theme.card)
         grid.pack(fill="x")
@@ -1540,7 +1591,9 @@ class Panel:
         # Граница карточки, а не hairline: в светлой теме hairline на белом
         # не читался вовсе, а ярче делать нельзя — линия должна быть тонкой.
         self._services_divider = tk.Frame(grid, bg=theme.card_border, width=1)
-        for key, title, _icon_name in SERVICES:
+        for record in records:
+            key = str(record.get("id") or "")
+            title = str(record.get("title") or key)
             cell = HoverRow(grid, theme)
             grid_frame = tk.Frame(cell, bg=theme.card)
             grid_frame.pack(fill="x")
@@ -1563,7 +1616,7 @@ class Panel:
             state.grid(row=0, column=2, rowspan=2, sticky="e")
 
             button = None
-            if key in ("zapret", "tgwsproxy"):
+            if key in SERVICE_BUTTONS:
                 button = PillButton(grid_frame, theme, "Запустить", None,
                                     kind="ghost", height=ROW_CONTROL_HEIGHT,
                                     pad_x=SPACE["sm"], min_width=104)
@@ -1579,6 +1632,43 @@ class Panel:
         grid.bind("<Configure>", self._sync_service_columns)
         self._sync_service_columns()
 
+    @staticmethod
+    def _services_key(records: list[dict]) -> tuple:
+        """Подпись видимого списка: по ней видно, нужна ли пересборка."""
+        return tuple((str(record.get("id") or ""),
+                      str(record.get("title") or "")) for record in records)
+
+    def _ensure_services(self) -> None:
+        """Пересобирает карточку сервисов, если ``health_items`` изменились."""
+        records = service_records(getattr(self.controller, "cfg", {}) or {})
+        if self._services_key(records) == self._services_signature:
+            return
+        for attribute in ("_services_head", "_services_card"):
+            widget = getattr(self, attribute, None)
+            if widget is not None:
+                try:
+                    widget.destroy()
+                except tk.TclError:
+                    pass
+                setattr(self, attribute, None)
+        self._services = {}
+        self._services_grid = None
+        self._services_divider = None
+        self._services_checked = None
+        self._service_columns_count = 0
+        before = self._activity_card
+        if before is not None and not before.winfo_ismapped():
+            before = None
+        self._build_services(before=before)
+        if self._body is not None:
+            self._body.bind_tree()
+            self._render_services(
+                {str(item.get("id") or ""): item
+                 for item in (getattr(self.controller, "health_report", {}) or {}
+                              ).get("items", []) if isinstance(item, dict)},
+                getattr(self.controller, "status", {}) or {},
+                getattr(self.controller, "busy", {}) or {})
+
     def _sync_service_columns(self, event=None) -> None:
         """Раскладывает сервисы по фактической ширине карточки."""
         grid = self._services_grid
@@ -1591,13 +1681,18 @@ class Panel:
         if columns == self._service_columns_count:
             return
         self._service_columns_count = columns
-        per_column = (len(SERVICES) + 1) // 2 if columns == 2 else len(SERVICES)
+        count = len(self._services_order)
+        per_column = (count + 1) // 2 if columns == 2 else count
         half = SPACE["md"] // 2
-        for index, (key, _title, _icon_name) in enumerate(SERVICES):
+        for index, record in enumerate(self._services_order):
+            key = str(record.get("id") or "")
+            row_data = self._services.get(key)
+            if row_data is None:
+                continue
             column = 0 if index < per_column else 2
             row = index if column == 0 else index - per_column
             padx = (0, half) if column == 0 else (half, 0)
-            self._services[key]["cell"].grid(
+            row_data["cell"].grid(
                 row=row, column=column, sticky="nsew",
                 pady=(0 if row == 0 else SPACE["md"], 0),
                 padx=padx if columns == 2 else (0, 0))
@@ -1932,9 +2027,11 @@ class Panel:
         return "off", "нет данных"
 
     def _render_services(self, items: dict, status: dict, busy: dict) -> None:
+        self._ensure_services()
         theme = self._theme
         zapret_status = status.get("zapret") or {}
-        for key, _title, _icon_name in SERVICES:
+        for record in self._services_order:
+            key = str(record.get("id") or "")
             row = self._services.get(key)
             if not row:
                 continue
