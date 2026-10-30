@@ -19,7 +19,7 @@ from tkinter import messagebox
 
 from PIL import ImageTk
 
-from . import history, icons, routes
+from . import diagnose, history, icons, routes
 from .secrets import redact_text
 from .settings_ui import SettingsPage
 from .theme import SPACE, Theme, resolve_dark
@@ -273,6 +273,11 @@ class Panel:
 
         self._vpn: dict = {}
         self._services: dict[str, dict] = {}
+        #: Карточка «Что не так»: показывается только при не-ok уровне.
+        self._diagnose_card: Card | None = None
+        self._diagnose_visible = False
+        self._diagnose_key: tuple | None = None
+        self._vpn_card: Card | None = None
         self._activity_rows: list[dict] = []
         self._activity_empty: tk.Label | None = None
         self._buttons: dict[str, PillButton] = {}
@@ -574,7 +579,11 @@ class Panel:
 
         # Верхний отступ первой карточки: карточки дают зазор только снизу.
         tk.Frame(self._body.inner, bg=theme.bg, height=SPACE["md"]).pack(fill="x")
-        self._build_vpn(self._card())
+        # Диагноз — самая верхняя карточка: она отвечает на «что не так»,
+        # поэтому должна попадаться первой. Пустая не занимает высоту.
+        self._build_diagnose()
+        self._vpn_card = self._card_box()
+        self._build_vpn(self._vpn_card.inner)
         self._build_services(self._card())
         self._build_stability(self._card())
         self._build_activity(self._card())
@@ -602,10 +611,102 @@ class Panel:
         _apply_titlebar(root, theme)
 
     def _card(self) -> tk.Frame:
-        theme = self._theme
-        card = Card(self._body.inner, theme)
+        return self._card_box().inner
+
+    def _card_box(self) -> Card:
+        card = Card(self._body.inner, self._theme)
         card.pack(fill="x", padx=SPACE["lg"], pady=(0, SPACE["md"]))
-        return card.inner
+        return card
+
+    # ---- карточка «Что не так» ---------------------------------------------
+    def _build_diagnose(self) -> None:
+        """Карточка диагноза: заголовок, одна строка фактов, кнопка действия.
+
+        Собирается всегда, но показывается только при не-ok уровне: пустая
+        карточка занимала бы высоту, а панель и так упирается в экран.
+        """
+        theme = self._theme
+        card = self._card_box()
+        inner = card.inner
+        top = tk.Frame(inner, bg=theme.card)
+        top.pack(fill="x")
+        self._diagnose_title = tk.Label(
+            top, text="", bg=theme.card, fg=theme.text,
+            font=theme.title(), anchor="w")
+        self._diagnose_title.pack(side="left", fill="x", expand=True)
+        self._diagnose_button = PillButton(
+            top, theme, "", None, kind="primary", min_width=140,
+            height=ROW_CONTROL_HEIGHT)
+        self._diagnose_button.pack(side="right", padx=(SPACE["md"], 0))
+        self._diagnose_facts = tk.Label(
+            inner, text="", bg=theme.card, fg=theme.text_dim,
+            font=theme.caption(), anchor="w", justify="left",
+            wraplength=CARD_TEXT_WIDTH)
+        self._diagnose_facts.pack(fill="x", pady=(SPACE["xs"], 0))
+        self._diagnose_card = card
+        # ``_card_box`` уже упаковал карточку — значит, она считается видимой:
+        # первый же рендер при ``ok`` уберёт её, а не оставит пустую полосу.
+        self._diagnose_visible = True
+
+    def _diagnose_command(self, kind: str):
+        """Кнопка карточки — существующее действие контроллера, без новой логики."""
+        controller = self.controller
+        if kind == "check_all":
+            return getattr(controller, "run_health", None)
+        if kind == "vpn_on":
+            return lambda: self._call(controller.set_proxy, True)
+        if kind == "switch_server":
+            return lambda: self._call(controller.pick_best_server)
+        if kind == "zapret_start":
+            return lambda: self._call(controller.start_zapret)
+        if kind == "strategy_pick":
+            return lambda: self._call(controller.start_sweep)
+        if kind == "tgws_restart":
+            return lambda: self._call(controller.restart_tgws)
+        return None
+
+    def _render_diagnose(self, summary: dict) -> None:
+        card = getattr(self, "_diagnose_card", None)
+        if card is None:
+            return
+        theme = self._theme
+        data = diagnose.diagnose(
+            getattr(self.controller, "health_report", {}) or {},
+            getattr(self.controller, "proxy", {}) or {},
+            getattr(self.controller, "cfg", {}) or {},
+            summary,
+        )
+        level = str(data.get("level") or "ok")
+        if level == "ok":
+            if self._diagnose_visible:
+                card.pack_forget()
+                self._diagnose_visible = False
+            self._diagnose_key = None
+            return
+        if not self._diagnose_visible:
+            # Показ на прежнее место — над карточкой VPN, а не последней.
+            card.pack(fill="x", padx=SPACE["lg"], pady=(0, SPACE["md"]),
+                      before=self._vpn_card)
+            self._diagnose_visible = True
+        color = theme.bad if level == "down" else theme.warn
+        facts = " · ".join(str(fact) for fact in (data.get("facts") or []))
+        action = data.get("action") or {}
+        kind = str(action.get("kind") or "")
+        key = (str(data.get("title") or ""), facts, kind, color)
+        if key == self._diagnose_key:
+            return
+        self._diagnose_key = key
+        self._diagnose_title.configure(text=str(data.get("title") or ""), fg=color)
+        self._diagnose_facts.configure(text=facts)
+        button = self._diagnose_button
+        command = self._diagnose_command(kind) if action else None
+        if command is None:
+            button.pack_forget()
+            return
+        button.set_text(str(action.get("label") or ""))
+        button.set_command(command)
+        if not button.winfo_ismapped():
+            button.pack(side="right", padx=(SPACE["md"], 0))
 
     # ---- шапка -------------------------------------------------------------
     def _build_header(self, root: tk.Tk, theme: Theme) -> None:
@@ -918,15 +1019,15 @@ class Panel:
             wraplength=CARD_TEXT_WIDTH)
         self._stability_line.pack(fill="x")
 
-    def _render_stability(self) -> None:
+    def _render_stability(self, summary: dict | None = None) -> None:
         line = getattr(self, "_stability_line", None)
         if line is None:
             return
-        line.configure(text=self._stability_text())
+        line.configure(text=self._stability_text(summary))
 
-    def _stability_text(self) -> str:
+    def _stability_text(self, summary: dict | None = None) -> str:
         """Одна строка о сутках: доля «в сети», сбои, смены сервера, лечение."""
-        data = history.summary()
+        data = history.summary() if summary is None else summary
         reports = int(data.get("reports") or 0)
         if not reports:
             return "пока нет данных за сутки"
@@ -1015,9 +1116,12 @@ class Panel:
 
         if self._page_visible != "settings":
             self._render_subtitle(running, level, busy, health_running)
+        # Сводка за сутки читается один раз: её просят и диагноз, и стабильность.
+        summary = history.summary()
+        self._render_diagnose(summary)
         self._render_vpn(proxy, busy)
         self._render_services(items, status, busy)
-        self._render_stability()
+        self._render_stability(summary)
         self._render_activity()
         self._render_header_update()
         self._render_footer(status, busy)

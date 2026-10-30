@@ -171,6 +171,8 @@ def main() -> int:
                         help="при --setup не прописывать автозапуск")
     parser.add_argument("--health", action="store_true",
                         help="напечатать JSON проверки сервисов и выйти")
+    parser.add_argument("--diagnose", action="store_true",
+                        help="напечатать диагноз по последнему отчёту проверки и выйти")
     parser.add_argument("--history", action="store_true",
                         help="напечатать стабильность за сутки из истории здоровья и выйти")
     parser.add_argument("--route-audit", action="store_true",
@@ -199,6 +201,22 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             result = {"checked": time.time(), "items": [], "verdict": "warn",
                       "error": f"{type(exc).__name__}: {exc}"}
+        _print_json(result)
+        return 0
+
+    if args.diagnose:
+        # Без сети: диагноз строится по последнему отчёту, как в панели и трее.
+        from . import diagnose, health, history, xray
+
+        cfg = config.load_config()
+        try:
+            result = diagnose.diagnose(
+                health.load_cache(cfg) or {}, xray.status(), cfg,
+                history.summary())
+        except Exception as exc:  # noqa: BLE001
+            result = {"code": "error", "level": "warn",
+                      "title": "Диагноз не удался", "action": None,
+                      "facts": [f"error: {type(exc).__name__}"]}
         _print_json(result)
         return 0
 

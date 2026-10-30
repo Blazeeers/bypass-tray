@@ -14,8 +14,8 @@ except ImportError:  # pragma: no cover
     pystray = None
 
 from . import (
-    actions, activity, autostart, config, guard, health, icons, networks, routes,
-    secrets, status, strategy, updates, xray,
+    actions, activity, autostart, config, diagnose, guard, health, history, icons,
+    networks, routes, secrets, status, strategy, updates, xray,
 )
 from .theme import STATE_COLORS
 from .ui import Panel, clean_server_name, report_level
@@ -105,6 +105,8 @@ class TrayApp:
         self._level_candidate: str = ""
         self._level_hits = 0
         self._level_at = 0.0
+        #: Строка диагноза для подсказки: (время расчёта, текст).
+        self._diagnose_cache: tuple[float, str] = (0.0, "")
         self._user_off = False
         cached = health.load_cache(self.cfg)
         if cached:
@@ -746,6 +748,30 @@ class TrayApp:
             names.append(_LEVEL_LABELS[item_id])
         return ", ".join(names[:3])
 
+    def _diagnose_note(self) -> str:
+        """Строка диагноза для подсказки иконки: коротко и без секретов.
+
+        Считается не чаще раза в 30 с: ``tray_state`` зовётся на каждом
+        ``refresh``, а сводка истории читает файл. При ``ok`` строки нет —
+        подсказка не должна повторять «всё работает».
+        """
+        now = time.time()
+        cached_at, cached_text = self._diagnose_cache
+        if cached_at and now - cached_at < 30:
+            return cached_text
+        try:
+            data = diagnose.diagnose(
+                self.health_report, dict(self.proxy or {}), self.cfg,
+                history.summary(), now=now)
+        except Exception:  # noqa: BLE001
+            # Диагноз — украшение подсказки: его сбой не должен ломать трей.
+            data = {}
+        text = ""
+        if str(data.get("level") or "ok") != "ok":
+            text = str(data.get("title") or "")
+        self._diagnose_cache = (now, text)
+        return text
+
     def _level_title(self, level: str) -> str:
         """Подсказка уровня: причина и время последней проверки."""
         title = self._LEVEL_WORDS.get(level, "всё работает")
@@ -1346,6 +1372,14 @@ class TrayApp:
                 "degraded": ("degraded", STATE_COLORS["warn"]),
             }.get(level, ("ok", STATE_COLORS["ok"]))
             title = self._level_title(level)
+            # Строка диагноза — только при уже показанном не-ok уровне: так она
+            # не спорит со сглаживанием (зелёная иконка не получает «есть сбой»).
+            # Базовый текст режем заранее, чтобы обрезка [:110] не съела её.
+            if level != "ok" and not busy:
+                note = self._diagnose_note()
+                if note and note.casefold() not in title.casefold():
+                    room = 110 - len(note) - 3
+                    title = f"{title[:max(20, room)]} · {note}"
         if busy:
             if key == "idle":
                 key, color = "busy", STATE_COLORS["busy"]
