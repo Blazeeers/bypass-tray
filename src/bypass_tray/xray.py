@@ -13,11 +13,13 @@ from __future__ import annotations
 import base64
 import ctypes
 import hashlib
+import http.client
 import json
 import os
 import re
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -33,6 +35,19 @@ from . import actions, activity, config
 #: нет намеренно: это персональный ключ доступа.
 DEFAULT_SUBSCRIPTION = ""
 DEFAULT_PORT = 10818
+
+#: DNS в генерируемом конфиге. DoH по IP не требует системного резолвера,
+#: поэтому работает и в сети с фильтрацией DNS; 77.88.8.8 — российский
+#: резолвер для direct-доменов (РФ и private остаются напрямую).
+DNS_DOH_SERVERS = ("https://1.1.1.1/dns-query", "https://dns.google/dns-query")
+DNS_RU_SERVER = "77.88.8.8"
+#: Bootstrap-резолв подписки и домена сервера до старта туннеля. Это обычный
+#: JSON-ответ Cloudflare (``/dns-query`` + ``Accept: application/dns-json``).
+DOH_BOOTSTRAP_URL = "https://1.1.1.1/dns-query"
+#: IP DoH-серверов: их трафик в конфиге уводится в proxy, то есть DoH идёт
+#: внутри туннеля. Домен сервера при этом берётся из ``dns.hosts`` (bootstrap),
+#: иначе получился бы цикл «резолвим сервер через туннель к серверу».
+DOH_IPS = ("1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4")
 
 #: Протоколы, которые умеем разбирать в outbound Xray. Подписка и свои
 #: ссылки проходят через один разбор: маршрутизации протокол безразличен.
@@ -328,6 +343,110 @@ def collect_links(cfg: dict | None = None) -> list[str]:
     return result
 
 
+def _doh_lookup(host: str, timeout: float) -> dict:
+    """JSON-ответ DoH (Cloudflare); пустой словарь при любой ошибке."""
+    query = urllib.parse.urlencode({"name": host, "type": "A"})
+    request = urllib.request.Request(
+        f"{DOH_BOOTSTRAP_URL}?{query}",
+        headers={"Accept": "application/dns-json",
+                 "User-Agent": "bypass-tray"},
+    )
+    # Bootstrap идёт мимо системного прокси и мимо системного DNS: иначе при
+    # фильтрации DNS мы бы снова зависели от того, что как раз сломано.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(request, timeout=max(1.0, float(timeout))) as response:
+        raw = response.read(64 * 1024)
+    try:
+        data = json.loads(raw.decode("utf-8", "replace"))
+    except (ValueError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def doh_resolve(host: str, timeout: float = 4.0) -> list[str]:
+    """A-записи имени через DoH, без системного резолвера.
+
+    Используется как bootstrap до старта туннеля: подписка и адрес сервера
+    должны резолвиться даже там, где системный DNS фильтруется.
+    """
+    host = str(host or "").strip()
+    if not host:
+        return []
+    if _is_ip_like(host):
+        return [host]
+    try:
+        data = _doh_lookup(host, timeout)
+    except Exception:  # noqa: BLE001
+        return []
+    result: list[str] = []
+    for answer in data.get("Answer") or []:
+        if not isinstance(answer, dict):
+            continue
+        try:
+            answer_type = int(answer.get("type") or 0)
+        except (TypeError, ValueError):
+            continue
+        if answer_type != 1:
+            continue
+        value = str(answer.get("data") or "").strip()
+        if value and value not in result:
+            result.append(value)
+    return result
+
+
+def _bootstrap_get(url: str, timeout: float) -> tuple[int, bytes] | None:
+    """GET через IP из DoH, сохраняя SNI и ``Host`` исходного имени.
+
+    ``None`` — bootstrap не применим (не https/имя уже IP) или не удался:
+    вызывающий откатывается на обычный запрос.
+    """
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname or ""
+    if parts.scheme != "https" or not host or _is_ip_like(host):
+        return None
+    ips = doh_resolve(host, timeout=min(float(timeout), 5.0))
+    if not ips:
+        return None
+    port = parts.port or 443
+    path = parts.path or "/"
+    if parts.query:
+        path += "?" + parts.query
+    context = ssl.create_default_context()
+    for ip in ips[:2]:
+        raw = None
+        connection = None
+        response = None
+        try:
+            raw = socket.create_connection((ip, port), timeout=timeout)
+            sock = context.wrap_socket(raw, server_hostname=host)
+            connection = http.client.HTTPSConnection(
+                host, port, timeout=timeout, context=context)
+            connection.sock = sock
+            connection.request("GET", path, headers={
+                "User-Agent": "v2rayNG/1.8", "Host": host})
+            response = connection.getresponse()
+            return int(response.status), response.read(4 * 1024 * 1024)
+        except Exception:  # noqa: BLE001
+            continue
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except OSError:
+                    pass
+            if connection is not None:
+                try:
+                    connection.close()
+                except OSError:
+                    pass
+            elif raw is not None:
+                try:
+                    raw.close()
+                except OSError:
+                    pass
+    return None
+
+
 def fetch_subscription(url: str | None = None, timeout: int = 25) -> list[str]:
     """Возвращает ссылки vless/vmess/trojan/ss из подписки.
 
@@ -340,6 +459,15 @@ def fetch_subscription(url: str | None = None, timeout: int = 25) -> list[str]:
         raise ValueError(
             "не задана подписка: укажите xray_subscription в config.json"
         )
+    # Сначала пробуем bootstrap через DoH: в сети с фильтрацией DNS обычный
+    # urlopen упал бы на резолве домена подписки. Не вышло — обычный путь.
+    bootstrapped = _bootstrap_get(url, timeout)
+    if bootstrapped is not None:
+        status, raw = bootstrapped
+        if 200 <= status < 300:
+            return links_from_text(raw.decode("utf-8", "replace"))
+        # Не-2xx через bootstrap — не приговор: пробуем обычный путь, чтобы
+        # подписка за CDN/редиректом не отваливалась из-за особенностей DoH.
     request = urllib.request.Request(url, headers={"User-Agent": "v2rayNG/1.8"})
     with urllib.request.urlopen(request, timeout=timeout) as response:
         text = response.read().decode("utf-8", "replace")
@@ -811,6 +939,47 @@ def _warn_once(key: str, text: str) -> None:
         pass
 
 
+def _dns_section(server_host: str = "", hosts: dict | None = None,
+                 direct_domains: list[str] | None = None) -> dict:
+    """DNS-секция Xray: DoH для внешнего мира, direct — через 77.88.8.8.
+
+    ``hosts`` — bootstrap-IP сервера (``{имя: [ip]}``), полученные до старта
+    туннеля. Без них Xray резолвил бы адрес прокси через DoH, который сам
+    уходит в прокси, — цикл. Если bootstrap не удался, домен сервера всё
+    равно добавляется к российскому (прямому) резолверу.
+
+    ``direct_domains`` — домены, которые маршрутизируются напрямую. Их DNS
+    тоже идёт к прямому 77.88.8.8, а не в туннельный DoH: при мёртвом сервере
+    иначе перестали бы резолвиться прямые сайты (и DNS утекал бы в туннель).
+    """
+    hosts_map: dict[str, list[str]] = {}
+    for host, values in (hosts or {}).items():
+        name = str(host or "").strip()
+        ips = [str(ip).strip() for ip in (values or []) if str(ip).strip()]
+        if name and ips:
+            hosts_map[name] = ips
+    ru_domains = ["geosite:category-ru", "geosite:private"]
+    for domain in _normalise_domains(direct_domains):
+        # DNS-секция понимает domain/full/geosite; ext/regexp — нет.
+        if domain.startswith(("ext:", "regexp:", "keyword:")):
+            continue
+        rule = _domain_rule(domain)
+        if rule and rule not in ru_domains:
+            ru_domains.append(rule)
+    server_host = str(server_host or "").strip()
+    if (server_host and not _is_ip_like(server_host)
+            and server_host not in hosts_map):
+        ru_domains.append(f"domain:{server_host}")
+    section: dict = {
+        "servers": [{"address": DNS_RU_SERVER, "domains": ru_domains}]
+        + [{"address": address} for address in DNS_DOH_SERVERS],
+        "queryStrategy": "UseIPv4",
+    }
+    if hosts_map:
+        section["hosts"] = hosts_map
+    return section
+
+
 def build_config(server: dict, port: int, extra_domains: list[str] | None = None,
                  stream_via_proxy: bool = False,
                  direct_domains: list[str] | None = None,
@@ -818,7 +987,9 @@ def build_config(server: dict, port: int, extra_domains: list[str] | None = None
                  blocked_rule: str | None = None,
                  routing_mode: str = "blocked",
                  servers: list[dict] | None = None,
-                 current_server: dict | None = None) -> dict:
+                 current_server: dict | None = None,
+                 dns_hosts: dict | None = None,
+                 priority_proxy_domains: list[str] | None = None) -> dict:
     """Конфиг Xray: локальный прокси + маршрутизация.
 
     Маршрут по умолчанию задаёт **первый outbound** — catch-all правила в
@@ -831,11 +1002,10 @@ def build_config(server: dict, port: int, extra_domains: list[str] | None = None
 
     Порядок правил:
     1) пользовательские direct, 2) пользовательские proxy, 3) audit direct
-    (только вне ``all``)
-    4) YouTube/Discord напрямую (если не резервный режим и не ``all``),
-    5) встроенный список заблокированных ``blocked_rule`` через прокси,
-    6) РФ/private напрямую, 7) встроенные прокси-домены + stream (в резервном
-    режиме) + audit proxy.
+    (только вне ``all``), 4) proxy-оверрайды сервисов и аудита,
+    5) YouTube/Discord напрямую (если не резервный режим и не ``all``),
+    6) встроенный список заблокированных ``blocked_rule`` через прокси,
+    7) РФ/private напрямую.
 
     Preset перебивает РФ-direct (среди заблокированных есть российские
     домены), но пользовательские правила и YouTube/Discord остаются выше.
@@ -846,6 +1016,8 @@ def build_config(server: dict, port: int, extra_domains: list[str] | None = None
     текущим сервером и с неизвестным сервером идут через ``proxy`` — как
     раньше. ``servers`` — список серверов (по умолчанию ``cached_servers()``),
     ``current_server`` — поднятый сейчас (по умолчанию ``server``).
+    ``dns_hosts`` — bootstrap-IP домена сервера для ``dns.hosts``: так адрес
+    прокси известен без запроса через сам туннель.
     Неизвестный сервер попадает в ``BuiltConfig.warnings``, а не в журнал:
     писать их — дело вызывающего.
     """
@@ -894,6 +1066,18 @@ def build_config(server: dict, port: int, extra_domains: list[str] | None = None
         if d not in user_direct_set and d not in user_proxy_set
         and d not in audit_direct_set
     ]
+    # Оверрайды аудита/эскалации (routes.proxy_domains) должны срабатывать
+    # раньше stream_direct, иначе youtube→proxy — no-op. Но их нельзя ставить
+    # выше РФ-правил как весь proxy-список: российские сайты обязаны остаться
+    # напрямую. Поэтому приоритетное подмножество вынимается из proxy_keys.
+    priority_keys = [
+        d for d in _normalise_domains(priority_proxy_domains or [])
+        if d not in user_direct_set and d not in user_proxy_set
+        and d not in audit_direct_set
+    ]
+    priority_set = set(priority_keys)
+    if priority_set:
+        proxy_keys = [d for d in proxy_keys if d not in priority_set]
     rules = []
     if user_direct:
         rules.append({
@@ -915,6 +1099,14 @@ def build_config(server: dict, port: int, extra_domains: list[str] | None = None
             "type": "field", "outboundTag": "direct",
             "domain": [_domain_rule(d) for d in audit_direct],
         })
+    # Оверрайды «через VPN» — выше stream_direct: иначе запись
+    # youtube→proxy была бы no-op, потому что direct-правило с
+    # geosite:youtube/domain:youtube.com сработало бы первым.
+    if priority_keys:
+        rules.append({
+            "type": "field", "outboundTag": "proxy",
+            "domain": [_domain_rule(d) for d in priority_keys],
+        })
     if stream_direct:
         # YouTube и Discord закрывает zapret — мимо VPN.
         rules.append({
@@ -935,13 +1127,35 @@ def build_config(server: dict, port: int, extra_domains: list[str] | None = None
         {"type": "field", "outboundTag": "direct",
          "ip": ["geoip:ru", "geoip:private"]},
     ]
-    # Заблокированное — через сервер.
+    # Общий proxy-список: встроенные домены, доп. домены и аудит. Стоит после
+    # РФ-правил (как и раньше), приоритетные оверрайды уже ушли выше.
     rules.append({
         "type": "field", "outboundTag": "proxy",
         "domain": [_domain_rule(d) for d in proxy_keys],
     })
+    # DoH-серверы по IP — в туннель. Правило последнее: доменные правила выше
+    # его не задевают, а bootstrap-IP сервера лежит в ``dns.hosts``.
+    if DOH_IPS:
+        rules.append({
+            "type": "field", "outboundTag": "proxy",
+            "ip": list(DOH_IPS),
+        })
+    # Если сервис уже уведён через VPN приоритетным оверрайдом, его DNS тоже
+    # должен идти через DoH, а не к прямому 77.88.8.8. Иначе direct-DNS
+    # остаётся в списке из stream_direct и противоречит маршруту.
+    dns_excluded = set(priority_set)
+    if priority_set:
+        for service, domains in routes.SERVICE_DOMAINS.items():
+            if any(domain in priority_set for domain in domains):
+                dns_excluded.add(f"geosite:{service}")
+    dns_direct = [
+        d for d in (user_direct + audit_direct + stream_direct)
+        if d not in dns_excluded
+    ]
     built = {
         "log": {"loglevel": "warning", "access": "none"},
+        "dns": _dns_section(str(server.get("host") or ""), dns_hosts,
+                            dns_direct),
         "inbounds": [{
             "tag": "in",
             "listen": "127.0.0.1",
@@ -1368,8 +1582,10 @@ def _start(cfg: dict | None = None, extra_domains: list[str] | None = None,
     # Оверрайды аудита маршрутов: что проверки требуют вести через прокси.
     from . import routes
 
+    priority_proxy: list[str] = []
     try:
-        extra += routes.proxy_domains()
+        priority_proxy = routes.proxy_domains()
+        extra += priority_proxy
         if direct_domains is None:
             direct_domains = routes.direct_domains()
     except Exception:  # noqa: BLE001
@@ -1382,9 +1598,19 @@ def _start(cfg: dict | None = None, extra_domains: list[str] | None = None,
     blocked_rule, blocked_ok = _blocked_preset(cfg)
     mode = config.normalise_routing_mode(cfg.get("routing_mode"))
     config_path = config.config_dir() / "xray-config.json"
+    # Bootstrap адреса сервера до старта туннеля: DNS внутри конфига — DoH,
+    # а его трафик уходит в proxy. Без заранее известного IP сервера ядро
+    # резолвило бы адрес сервера через туннель к этому же серверу.
+    dns_hosts: dict[str, list[str]] = {}
+    server_host = str(server.get("host") or "")
+    if server_host and not _is_ip_like(server_host):
+        resolved = doh_resolve(server_host, timeout=2.5)
+        if resolved:
+            dns_hosts[server_host] = resolved[:2]
     built = build_config(server, port, extra, stream, direct_all, user_map,
                          blocked_rule, mode, servers=cached_servers(),
-                         current_server=server)
+                         current_server=server, dns_hosts=dns_hosts,
+                         priority_proxy_domains=priority_proxy)
     for warning in built.warnings:
         _warn_once(warning, warning)
     payload = json.dumps(built, ensure_ascii=False, indent=2)
@@ -1650,7 +1876,10 @@ def _switch_server(exclude: set[str] | None = None, cfg: dict | None = None) -> 
     rows = cached_servers()
     if not rows:
         rows = scan_servers()
-    candidates = [r for r in rows if r["host"] not in exclude]
+    # Исключение может прийти и как имя, и как хост: guard пишет оба.
+    candidates = [r for r in rows
+                  if not ({str(r.get("host") or ""),
+                           str(r.get("name") or "")} & exclude)]
     if not candidates:
         candidates = rows
     if not candidates:

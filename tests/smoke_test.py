@@ -1699,6 +1699,7 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
 
     real_http = health._http
     real_tcp = health._tcp
+    real_video = health._youtube_video
     http_calls: list[tuple] = []
     tcp_calls: list[str] = []
 
@@ -1712,6 +1713,10 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
 
     health._http = fake_http
     health._tcp = fake_tcp
+    # Видео-проба теперь ходит в Innertube/googlevideo: в офлайн-наборе её
+    # подменяем, иначе страница+картинки дают «видео не проверено».
+    health._youtube_video = lambda *args, **kwargs: {
+        "ok": True, "checked": True, "ms": 100, "bytes": health.VIDEO_MIN_BYTES}
     try:
         http_calls.clear()
         yt_vpn = health._check_youtube(
@@ -1733,6 +1738,7 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
     finally:
         health._http = real_http
         health._tcp = real_tcp
+        health._youtube_video = real_video
     check("youtube через VPN: ok и порт прокси",
           yt_vpn["state"] == "ok" and "через VPN" in yt_vpn["detail"]
           and bool(vpn_calls) and all(port == 10818 for _url, port in vpn_calls),

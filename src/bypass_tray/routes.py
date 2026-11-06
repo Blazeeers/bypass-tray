@@ -40,6 +40,18 @@ DEFAULT_DOMAINS = [
     "yandex.ru",
 ]
 
+#: Домены сервисов для эскалации надзирателя: когда серверы кончились,
+#: YouTube/Discord/Telegram уводятся через VPN оверрайдом маршрута.
+SERVICE_DOMAINS: dict[str, tuple[str, ...]] = {
+    "youtube": ("youtube.com", "youtu.be", "ytimg.com", "googlevideo.com",
+                "youtube-nocookie.com", "youtube.googleapis.com"),
+    "discord": ("discord.com", "discord.gg", "discordapp.com", "discordapp.net",
+                "discord.media", "discordcdn.com", "gateway.discord.gg"),
+    "telegram": ("telegram.org", "telegram.me", "telegram.dog", "t.me",
+                 "tdesktop.com", "telesco.pe", "api.telegram.org",
+                 "web.telegram.org"),
+}
+
 #: Префиксы правил Xray, которые нельзя превращать в имя хоста.
 _KEEP_PREFIXES = ("geosite:", "geoip:", "full:", "regexp:", "keyword:", "ext:")
 
@@ -630,6 +642,11 @@ def _compute_overrides(result: dict, cfg: dict, overrides: dict,
             overrides.pop(domain, None)
             continue
         previous = overrides.get(domain) or {}
+        # Оверрайд эскалации (fallback) — не решение аудита: полный аудит не
+        # должен его перезаписывать или стирать. Снять его может только
+        # пользователь (xray_routes выше) или отдельное восстановление.
+        if str(previous.get("source") or "") == "escalation":
+            continue
         if route == "broken" and previous.get("route") in ("direct", "proxy"):
             # Один сбой не должен ломать последний рабочий маршрут.
             continue
@@ -659,6 +676,11 @@ def _compute_overrides(result: dict, cfg: dict, overrides: dict,
             if prune_set is not None and domain not in prune_set:
                 continue
             if domain not in audited:
+                info = overrides.get(domain) or {}
+                if str((info or {}).get("source") or "") == "escalation":
+                    # Эскалация живёт вне области аудита: YouTube/Discord
+                    # аудит не проверяет и не должен вычищать их маршрут.
+                    continue
                 overrides.pop(domain, None)
     return overrides
 
@@ -750,11 +772,13 @@ def _snapshot_files() -> list[Path]:
         return []
 
 
-def _snapshot_save(reason: str) -> bool:
+def _snapshot_save(reason: str) -> Path | None:
     """Сохраняет прежнее состояние маршрутов перед записью нового.
 
     Формат ``route_overrides.json`` не меняется: снимок лежит рядом, в своём
     каталоге, и содержит прежние ``{"at", "routes"}`` целиком плюс причину.
+    Возвращает путь снимка (``None`` — не сохранился): вызывающий может
+    убрать осиротевший снимок, если запись маршрутов потом не удалась.
     """
     _snapshot_cache_reset()
     previous = _load_file()
@@ -763,7 +787,7 @@ def _snapshot_save(reason: str) -> bool:
     try:
         directory.mkdir(parents=True, exist_ok=True)
     except OSError:
-        return False
+        return None
     # Имя с нулями: сортировка по имени совпадает с порядком времени.
     target = directory / f"{int(stamp * 1_000_000):016d}.json"
     while target.exists():
@@ -776,13 +800,13 @@ def _snapshot_save(reason: str) -> bool:
         "snapshot": {"at": previous["at"], "routes": previous["routes"]},
     }
     if not atomic_write(target, json.dumps(payload, ensure_ascii=False, indent=2)):
-        return False
+        return None
     for old in _snapshot_files()[:-SNAPSHOT_LIMIT]:
         try:
             old.unlink()
         except OSError:
             pass
-    return True
+    return target
 
 
 def has_snapshot() -> bool:
@@ -1023,6 +1047,99 @@ def proxy_domains() -> list[str]:
 def direct_domains() -> list[str]:
     """Домены, которые аудит требует вести напрямую."""
     return _domains_by_route("direct")
+
+
+def _manual_covers(service: str, domain: str, manual: set[str]) -> bool:
+    """Перекрыт ли домен ручным правилом пользователя из ``xray_routes``.
+
+    Ручное правило сильнее автоподбора: если человек явно направил домен
+    (или весь ``geosite:youtube``), эскалация его не перебивает.
+    ``domain:``/``full:``/``geosite:`` понимаются; ``keyword:``/``regexp:``
+    не вычисляются (это потребовало бы повторить движок Xray) — такие
+    правила считаются не покрывающими домен, но эскалация их и не создаёт.
+    """
+    prefixes = ("domain:", "full:", "geosite:")
+    if domain in manual or f"geosite:{service}" in manual:
+        return True
+    for entry in manual:
+        if entry.startswith(("keyword:", "regexp:", "ext:")):
+            continue
+        base = entry.split(":", 1)[-1] if entry.startswith(prefixes) else entry
+        if base == domain:
+            return True
+        if base.startswith("*.") and domain.endswith(base[1:]):
+            return True
+    return False
+
+
+def enable_service_proxy(services, cfg: dict | None = None,
+                         reason: str = "override") -> dict:
+    """Пишет proxy-оверрайды для сломанных сервисов.
+
+    Возвращает ``{"ok", "changed", "status", "error"}``. ``status`` различает
+    ``changed`` / ``unchanged`` / ``broken`` / ``snapshot`` / ``write``: молча
+    пустой список скрывал бы сбой записи и заставлял guard врать «уже идут
+    через VPN».
+
+    Ручные правила ``xray_routes`` и подтверждённые аудитом ``direct``-
+    оверрайды не трогаются. Новые записи помечаются ``source: "escalation"``:
+    полный аудит маршрутов их не вычищает, пока маршрут не снят явно.
+    Повреждённый файл не перезаписывается, байты уходят в ``.broken-`` копию.
+    Перед записью делается снимок для ``rollback_last``; если запись не
+    удалась, осиротевший снимок удаляется. Время аудита (``at``) сохраняется.
+    """
+    manual = set(normalise_routes((cfg or {}).get("xray_routes")))
+    current_file, read_error = _read_state()
+    if read_error:
+        copy = _preserve_broken()
+        return {"ok": False, "changed": [], "status": "broken",
+                "error": read_error, "broken_copy": copy}
+    overrides = dict(current_file["routes"])
+    now = time.time()
+    changed: list[str] = []
+    manual_hits: list[str] = []
+    direct_hits: list[str] = []
+    proxy_hits: list[str] = []
+    for service in services or ():
+        name = str(service or "").strip().lower()
+        for domain in SERVICE_DOMAINS.get(name, ()):
+            if _manual_covers(name, domain, manual):
+                manual_hits.append(domain)
+                continue
+            current = overrides.get(domain) or {}
+            route = str((current or {}).get("route") or "")
+            if route == "proxy":
+                proxy_hits.append(domain)
+                continue
+            # direct — подтверждённое ручное/аудит-решение: без явного
+            # согласия пользователя не переводим его в proxy.
+            if route == "direct":
+                direct_hits.append(domain)
+                continue
+            overrides[domain] = {
+                "route": "proxy", "since": now, "checked": now,
+                # Метка источника: аудит не должен вычищать эскалацию.
+                "source": "escalation",
+            }
+            changed.append(domain)
+    if not changed:
+        return {"ok": True, "changed": [], "status": "unchanged",
+                "manual": manual_hits, "direct": direct_hits,
+                "already": proxy_hits}
+    snapshot = _snapshot_save(reason)
+    if snapshot is None:
+        return {"ok": False, "changed": [], "status": "snapshot",
+                "error": last_write_error() or "снимок не сохранился"}
+    if not save_overrides(overrides, at=float(current_file.get("at") or 0)):
+        # Снимок уже занял слот в цепочке откатов, хотя изменения не записались.
+        try:
+            snapshot.unlink()
+        except OSError:
+            pass
+        _snapshot_cache_reset()
+        return {"ok": False, "changed": [], "status": "write",
+                "error": last_write_error() or "маршруты не записались"}
+    return {"ok": True, "changed": changed, "status": "changed"}
 
 
 def due(minutes: int) -> bool:

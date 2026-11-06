@@ -22,18 +22,23 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from . import actions, activity, routes, status
+from . import actions, activity, networks, routes, status
 
 ZAPRET_WARN = "zapret остановлен — запустите вручную"
 #: Одно и то же предупреждение — не чаще раза в час.
 _REPEAT_SECONDS = 3600
 #: Сколько ждать открытия порта после запуска tg-ws-proxy.
 _TGWS_PORT_WAIT = 3.0
-#: Переключение сервера из-за мёртвого VPN — не чаще раза в 30 минут: проход
-#: надзирателя идёт каждые ``guard_minutes``, а живой сервер может просто не
-#: ответить на одну пробу. Гонять серверы по кругу нельзя.
-_VPN_SWITCH_SECONDS = 1800
-_VPN_SWITCH_AT = 0.0
+#: Эскалация: до пяти разных серверов. После каждого провала пауза растёт
+#: 15 → 30 → 60 минут: живой сервер может не ответить один раз, а гонять
+#: серверы по кругу нельзя — это рвёт уже установленные соединения.
+VPN_MAX_SERVERS = 5
+VPN_BACKOFFS = (15 * 60, 30 * 60, 60 * 60)
+_VPN_SWITCH_AT = 0.0          # время последней попытки переключения
+_VPN_ATTEMPTS = 0             # сколько серверов уже перепробовано
+_VPN_FAILED: list[str] = []   # имена серверов, с которых ушли
+_VPN_NETWORK = ""             # сеть, для которой считается эскалация
+_VPN_OVERRIDE: set[str] = set()  # сервисы, уже уведённые через VPN
 _VPN_HEAL_DELAY = "VPN не отвечает — переключение сервера отложено"
 
 
@@ -127,41 +132,181 @@ def _heal_zapret(status_state: dict) -> list[dict]:
     return [_action("warn", ZAPRET_WARN)]
 
 
+def _vpn_backoff() -> float:
+    """Пауза перед следующей попыткой по числу уже перепробованных серверов."""
+    index = min(max(_VPN_ATTEMPTS - 1, 0), len(VPN_BACKOFFS) - 1)
+    return float(VPN_BACKOFFS[index])
+
+
 def _vpn_switch_allowed() -> bool:
-    """Прошло ли достаточно времени с прошлой попытки переключить сервер."""
-    return time.time() - _VPN_SWITCH_AT >= _VPN_SWITCH_SECONDS
+    """Прошла ли пауза с прошлой попытки переключить сервер."""
+    return time.time() - _VPN_SWITCH_AT >= _vpn_backoff()
+
+
+def reset_escalation() -> None:
+    """Счётчик серверов и бэкофф — заново (успех или смена сети)."""
+    global _VPN_ATTEMPTS, _VPN_FAILED, _VPN_SWITCH_AT, _VPN_OVERRIDE
+    _VPN_ATTEMPTS = 0
+    _VPN_FAILED = []
+    _VPN_SWITCH_AT = 0.0
+    _VPN_OVERRIDE = set()
+
+
+def escalation_state() -> dict:
+    """Срез эскалации — для панели и тестов."""
+    return {
+        "attempts": _VPN_ATTEMPTS,
+        "max": VPN_MAX_SERVERS,
+        "backoff": int(_vpn_backoff()),
+        "next_at": _VPN_SWITCH_AT + _vpn_backoff(),
+        "failed": list(_VPN_FAILED),
+        "network": _VPN_NETWORK,
+        "overridden": sorted(_VPN_OVERRIDE),
+    }
+
+
+def _sync_network() -> bool:
+    """Сбрасывает эскалацию при смене сети. ``True`` — сеть сменилась.
+
+    Сеть определяется ``networks.current`` (MAC/шлюз/SSID); ошибка получения
+    ключа не сбрасывает счётчик — иначе каждый сбой ipconfig обнулял бы
+    бэкофф.
+    """
+    global _VPN_NETWORK
+    try:
+        key = str((networks.current() or {}).get("key") or "")
+    except Exception:  # noqa: BLE001
+        return False
+    if not key:
+        return False
+    changed = bool(_VPN_NETWORK) and key != _VPN_NETWORK
+    if changed:
+        reset_escalation()
+    _VPN_NETWORK = key
+    return changed
+
+
+def _server_ids(row: dict | None) -> set[str]:
+    """Опознание сервера для исключения: и ``host``, и ``name``.
+
+    ``xray._switch_server`` раньше фильтровал только по ``host``, поэтому
+    список имён в guard не работал. Держим оба поля и там, и там.
+    """
+    row = row or {}
+    return {str(row.get(key) or "").strip()
+            for key in ("host", "name")} - {""}
+
+
+def _broken_services(health: dict | None) -> list[str]:
+    """Сломанные сервисы из отчёта: их и уводим через VPN после эскалации."""
+    states = {}
+    for item in (health or {}).get("items") or []:
+        if isinstance(item, dict):
+            states[str(item.get("id") or "")] = str(item.get("state") or "")
+    return [name for name in ("youtube", "discord", "telegram")
+            if states.get(name) == "bad"]
+
+
+def _escalate_override(cfg: dict, health: dict | None) -> list[dict]:
+    """Серверы кончились: проблемные сервисы — через VPN (маршруты в файле).
+
+    Xray надзиратель не перезапускает, поэтому оверрайд применится при
+    следующем подключении — как и решения аудита маршрутов.
+    """
+    broken = _broken_services(health)
+    if not broken:
+        return [_action("warn", f"VPN: перебраны {VPN_MAX_SERVERS} серверов, "
+                                "сломанных сервисов в отчёте нет")]
+    key = ",".join(broken)
+    if key in _VPN_OVERRIDE:
+        return []
+    try:
+        result = routes.enable_service_proxy(broken, cfg)
+    except Exception as exc:  # noqa: BLE001
+        return [_action("warn", f"VPN: оверрайд маршрута не записан: {exc}")]
+    if not isinstance(result, dict):
+        # Совместимость с прежним контрактом (список изменённых доменов).
+        result = {"ok": True, "changed": list(result or []),
+                  "status": "changed" if result else "unchanged"}
+    if not result.get("ok"):
+        # Сбой записи/снимка/битый файл — не «уже настроено»: не закрепляем
+        # _VPN_OVERRIDE и не врём в журнале, чтобы следующая попытка была.
+        text = (f"VPN: оверрайд маршрута не записан "
+                f"({result.get('status') or 'error'}): "
+                f"{result.get('error') or 'неизвестная причина'}")
+        activity.log(text, kind="warn")
+        return [_action("warn", text)]
+    _VPN_OVERRIDE.add(key)
+    if result.get("changed"):
+        text = (f"VPN: перебраны {VPN_MAX_SERVERS} серверов — "
+                f"{key} переведены через VPN (маршруты)")
+        kind = "ok"
+    elif result.get("manual") or result.get("direct"):
+        text = (f"VPN: перебраны {VPN_MAX_SERVERS} серверов — "
+                f"{key}: маршрут уже задан вручную, не перебиваю")
+        kind = "info"
+    else:
+        text = (f"VPN: перебраны {VPN_MAX_SERVERS} серверов — "
+                f"{key} уже идут через VPN")
+        kind = "info"
+    activity.log(text, kind=kind)
+    return [_action(kind, text)]
 
 
 def _heal_vpn(cfg: dict, proxy: dict, health: dict | None) -> list[dict]:
-    """Переключает сервер, если проба через туннель провалилась.
+    """Лечит мёртвый VPN: меняет серверы, затем уводит сервисы через VPN.
 
     Вызывается из ``heal`` с теми же данными, что уже собрал ``health.collect``:
-    лишних сетевых проверок не делает. Между попытками не меньше
-    ``_VPN_SWITCH_SECONDS`` — иначе десятиминутный проход гонял бы серверы
-    из-за одной медленной пробы.
+    лишних сетевых проверок не делает. Между попытками — бэкофф 15/30/60 минут.
+    После пяти серверов эскалация переходит на оверрайд маршрута. VPN сам не
+    выключается: намерение пользователя (подключённый туннель) сохраняется.
     """
-    global _VPN_SWITCH_AT
+    global _VPN_SWITCH_AT, _VPN_ATTEMPTS
     if not (proxy or {}).get("running") or not health:
         return []
+    _sync_network()
     vpn = next((i for i in (health.get("items") or []) if i.get("id") == "vpn"), None)
-    if not vpn or vpn.get("state") != "bad":
+    if not vpn:
         return []
+    if vpn.get("state") == "ok":
+        # Сервер ответил — эскалация больше не нужна.
+        if _VPN_ATTEMPTS:
+            reset_escalation()
+        return []
+    if vpn.get("state") != "bad":
+        return []
+    if _VPN_ATTEMPTS >= VPN_MAX_SERVERS:
+        return _escalate_override(cfg, health)
     if not _vpn_switch_allowed():
         _log_throttled(_VPN_HEAL_DELAY)
         return []
+
+    current_ids = _server_ids({
+        "host": (proxy or {}).get("host"),
+        "name": (proxy or {}).get("server"),
+    })
+    for ident in sorted(current_ids):
+        if ident not in _VPN_FAILED:
+            _VPN_FAILED.append(ident)
     _VPN_SWITCH_AT = time.time()
     try:
         from . import xray
 
-        result = xray.switch_server(cfg=cfg)
+        result = xray.switch_server(exclude=set(_VPN_FAILED), cfg=cfg)
     except Exception as exc:  # noqa: BLE001
+        _VPN_ATTEMPTS += 1
         return [_action("warn", f"переключение сервера не удалось: {exc}")]
     if not result.get("ok"):
+        _VPN_ATTEMPTS += 1
         return [_action("warn", "не удалось переключить сервер: "
                         + str(result.get("error") or "?"))]
+    _VPN_ATTEMPTS += 1
     server = result.get("server") or {}
     name = server.get("name") or server.get("host") or "другой"
-    text = f"переключил сервер: {name}"
+    for ident in sorted(_server_ids(server)):
+        if ident not in _VPN_FAILED:
+            _VPN_FAILED.append(ident)
+    text = f"переключил сервер ({_VPN_ATTEMPTS}/{VPN_MAX_SERVERS}): {name}"
     activity.log(text, kind="ok")
     return [_action("ok", text)]
 
@@ -193,6 +338,16 @@ def heal(cfg: dict, status_state: dict, proxy: dict,
     """Лечит то, что можно вылечить без UAC. Возвращает список действий."""
     if not (cfg or {}).get("guard_enabled", True):
         return []
+    try:
+        from . import strategy
+
+        if strategy.trial_active():
+            # Перебор сам гасит winws и меняет серверы: лечить нечего.
+            return []
+    except Exception:  # noqa: BLE001
+        pass
+    # Смена сети обнуляет эскалацию даже раньше, чем снова понадобится VPN.
+    _sync_network()
     status_state = status_state or {}
     proxy = proxy or {}
     done: list[dict] = []

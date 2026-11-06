@@ -29,6 +29,71 @@ from . import actions, config, status
 PROBE_MARKER = "ZAPRET_CMD"
 PROBE_PREFIX = "_bypass_probe_"
 
+#: Признак идущего перебора: файл рядом с ``config.json``. Health и guard
+#: читают его и пропускают прогон — во время перебора winws гасится и
+#: поднимается, и любые сетевые сбои относятся к перебору, а не к обходу.
+TRIAL_FILE = "strategy_trial.json"
+#: Маркер без heartbeat дольше этого срока считается протухшим (упавший
+#: процесс не должен глушить проверки навсегда). Перебор обновляет heartbeat
+#: перед каждой стратегией, поэтому TTL с запасом покрывает одну медленную.
+TRIAL_TTL = 600.0
+
+
+def trial_path() -> Path:
+    return config.config_dir() / TRIAL_FILE
+
+
+def _write_trial(payload: dict) -> bool:
+    return config.atomic_write(
+        trial_path(), json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def start_trial() -> bool:
+    """Ставит маркер перебора; pid нужен, чтобы чужой процесс его не снял."""
+    now = time.time()
+    return _write_trial({"pid": os.getpid(), "started": now, "heartbeat": now})
+
+
+def heartbeat_trial() -> bool:
+    """Обновляет heartbeat; пропавший маркер создаётся заново."""
+    info = trial_info()
+    if info.get("pid") != os.getpid():
+        return start_trial()
+    now = time.time()
+    return _write_trial({**info, "heartbeat": now})
+
+
+def finish_trial() -> None:
+    """Снимает маркер, поставленный этим процессом."""
+    info = trial_info()
+    if info.get("pid") not in (None, os.getpid()):
+        return
+    try:
+        trial_path().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def trial_info() -> dict:
+    try:
+        data = json.loads(trial_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def trial_active(now: float | None = None) -> bool:
+    """Идёт ли перебор: маркер есть и его heartbeat не старше TTL."""
+    info = trial_info()
+    try:
+        heartbeat = float(info.get("heartbeat") or info.get("started") or 0)
+    except (TypeError, ValueError):
+        return False
+    if heartbeat <= 0:
+        return False
+    current = time.time() if now is None else float(now)
+    return 0 <= current - heartbeat <= TRIAL_TTL
+
 #: Что считаем признаком рабочего обхода. Контрольный адрес должен открываться
 #: всегда — если он не открывается, сеть недоступна и замер недействителен.
 TARGETS: tuple[tuple[str, str], ...] = (
@@ -402,6 +467,9 @@ def sweep(
 
     total = len(bats)
     restored = False
+    # Маркер ставится до первого гашения winws: health и guard должны знать
+    # о переборе уже с этого момента, а не после первого замера.
+    start_trial()
     try:
         emit("Останавливаю службу zapret…")
         try:
@@ -411,6 +479,7 @@ def sweep(
         _kill_winws()
 
         emit("Замер без обхода (базовая линия)…")
+        heartbeat_trial()
         report["baseline"] = measure(timeout)
         base = report["baseline"]
         emit(
@@ -422,6 +491,8 @@ def sweep(
 
         for index, name in enumerate(bats, start=1):
             advance(index, total, name)
+            # Долгий extract/замер не должны дать маркеру протухнуть.
+            heartbeat_trial()
             command = extract_command(zapret_dir / name)
             if not command:
                 emit(f"[{index}/{total}] {name}: не удалось получить команду")
@@ -432,6 +503,7 @@ def sweep(
             time.sleep(wait)
             result = measure(timeout)
             _kill_winws()
+            heartbeat_trial()
             target_values = list(result["targets"].values())
             entry = {
                 "name": name,
@@ -490,6 +562,8 @@ def sweep(
                 cfg, original, (report["best"] if report["installed"] else bat) or None,
                 emit, installed=bool(report["installed"]))
         report["finished"] = time.time()
+        # Снимаем всегда: после перебора обход снова рабочий и проверки нужны.
+        finish_trial()
     return report
 
 

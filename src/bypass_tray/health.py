@@ -30,6 +30,18 @@ _CONTEXT = ssl.create_default_context()
 #: нужна, а гигабайтная загрузка съела бы и время, и память.
 MAX_BODY = 64 * 1024
 
+#: Реальная видео-проба: Innertube отдаёт ссылку на ``*.googlevideo.com``, затем
+#: качается начало файла. Это ловит случай «страница открылась, видео мёртвое»,
+#: который прежняя проверка страницы и картинок не видела.
+INNERTUBE_PLAYER = ("https://www.youtube.com/youtubei/v1/player"
+                    "?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8")
+YOUTUBE_VIDEO_ID = "dQw4w9WgXcQ"
+#: Порог мягче Linux-виджета (100 КиБ): 64 КиБ за бюджет ~1.5×timeout уже
+#: доказывают, что VIDEO-поток идёт, а не отдаётся заглушка.
+VIDEO_MIN_BYTES = 64 * 1024
+VIDEO_READ_LIMIT = 256 * 1024
+PLAYER_BODY_LIMIT = 1024 * 1024
+
 
 # ---- сетевые примитивы ----------------------------------------------------
 
@@ -268,28 +280,178 @@ def _stream_context(cfg: dict, proxy: dict) -> tuple[bool, int | None]:
     return True, (port or None)
 
 
+def _post_json(url: str, payload: dict, proxy_port: int | None,
+               timeout: float) -> dict:
+    """POST JSON напрямую или через локальный прокси (для Innertube)."""
+    started = time.perf_counter()
+    if proxy_port:
+        proxy = f"http://127.0.0.1:{int(proxy_port)}"
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    else:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={"User-Agent": UA, "Content-Type": "application/json",
+                 "Accept": "application/json"})
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            raw = response.read(PLAYER_BODY_LIMIT)
+            return {"ok": 200 <= int(response.status) < 400,
+                    "status": int(response.status),
+                    "body": raw.decode("utf-8", "replace"),
+                    "ms": _ms(started), "error": ""}
+    except urllib.error.HTTPError as exc:
+        return {"ok": False, "status": int(exc.code), "body": "",
+                "ms": _ms(started), "error": f"HTTP {exc.code}"}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "status": 0, "body": "",
+                "ms": _ms(started), "error": _error_name(exc)}
+
+
+def _player_stream_url(payload: dict) -> str:
+    """Первая ссылка ``*.googlevideo.com`` из ответа ``player``."""
+    data = (payload or {}).get("streamingData") or {}
+    for group in ("formats", "adaptiveFormats"):
+        for row in data.get(group) or []:
+            url = str((row or {}).get("url") or "")
+            if "googlevideo.com" in url:
+                return url
+    return ""
+
+
+def _fetch_range(url: str, proxy_port: int | None, timeout: float) -> dict:
+    """Скачивает начало видео range-запросом и считает, что поток реально идёт.
+
+    Бюджет общий на весь запрос (как у ``strategy.probe_url``): при троттлинге
+    сокет-таймаут на каждом байте не спасает, а проверка не должна держать
+    весь ``collect``.
+    """
+    started = time.perf_counter()
+    expire = started + max(float(timeout) * 1.5, 3.0)
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname or ""
+    secure = parts.scheme != "http"
+    port = parts.port or (443 if secure else 80)
+    path = parts.path or "/"
+    if parts.query:
+        path += "?" + parts.query
+    connection = None
+    data = 0
+    status = 0
+    expired = False
+    try:
+        if proxy_port:
+            if secure:
+                connection = http.client.HTTPSConnection(
+                    "127.0.0.1", int(proxy_port), timeout=timeout,
+                    context=_CONTEXT)
+                connection.set_tunnel(host, port)
+            else:
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1", int(proxy_port), timeout=timeout)
+        elif secure:
+            connection = http.client.HTTPSConnection(
+                host, port, timeout=timeout, context=_CONTEXT)
+        else:
+            connection = http.client.HTTPConnection(host, port, timeout=timeout)
+        connection.request("GET", path, headers={
+            "User-Agent": UA, "Range": f"bytes=0-{VIDEO_READ_LIMIT - 1}"})
+        response = connection.getresponse()
+        status = int(response.status)
+        while data < VIDEO_MIN_BYTES:
+            left = expire - time.perf_counter()
+            if left <= 0:
+                expired = True
+                break
+            sock = getattr(connection, "sock", None)
+            if sock is not None:
+                try:
+                    sock.settimeout(max(0.05, min(left, timeout)))
+                except OSError:
+                    pass
+            try:
+                chunk = response.read1(min(16384, VIDEO_MIN_BYTES - data))
+            except TimeoutError:
+                expired = True
+                break
+            if not chunk:
+                break
+            data += len(chunk)
+        ok = status in (200, 206) and not expired and data >= VIDEO_MIN_BYTES
+        return {"ok": ok, "checked": True, "status": status, "bytes": data,
+                "ms": _ms(started),
+                "error": "timeout" if expired else ("" if ok else f"HTTP {status}")}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "checked": True, "status": status, "bytes": data,
+                "ms": _ms(started), "error": _error_name(exc)}
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except OSError:
+                pass
+
+
+def _youtube_video(proxy_port: int | None, timeout: float) -> dict:
+    """Проверяет реальный видео-путь через Innertube и ``googlevideo.com``.
+
+    ``checked=False`` — до видео-пути не добрались (youtubei недоступен или
+    не отдал ссылку). Это не «видео сломано», поэтому наружу отдаётся
+    отдельный статус: страницу проверили, видео — нет.
+    """
+    player = _post_json(INNERTUBE_PLAYER, {
+        "context": {"client": {
+            "clientName": "WEB",
+            "clientVersion": "2.20240101.00.00",
+            "hl": "en",
+        }},
+        "videoId": YOUTUBE_VIDEO_ID,
+    }, proxy_port, timeout)
+    if not player["ok"]:
+        return {"ok": False, "checked": False, "ms": player["ms"],
+                "error": player["error"] or f"HTTP {player['status']}"}
+    try:
+        payload = json.loads(player["body"])
+    except (ValueError, TypeError):
+        return {"ok": False, "checked": False, "ms": player["ms"],
+                "error": "player не JSON"}
+    url = _player_stream_url(payload if isinstance(payload, dict) else {})
+    if not url:
+        return {"ok": False, "checked": False, "ms": player["ms"],
+                "error": "нет ссылки на видео"}
+    return _fetch_range(url, proxy_port, timeout)
+
+
 def _check_youtube(cfg: dict, proxy: dict, timeout: float) -> dict:
     proxied, port = _stream_context(cfg, proxy)
-    if proxied:
-        if port is None:
-            return _item("youtube", "YouTube", "off", "нужен VPN", 0)
-        page = _http_retry("https://www.youtube.com/", port, timeout)
-        cdn = _http_retry("https://i.ytimg.com/generate_204", port, timeout)
-        if page["ok"] and cdn["ok"]:
-            return _item("youtube", "YouTube", "ok",
-                         f"через VPN · {cdn['ms'] / 1000:.1f} с", cdn["ms"])
-        if page["ok"]:
-            return _item("youtube", "YouTube", "warn",
-                         "через VPN: страница есть, видео нет", cdn["ms"])
-        return _item("youtube", "YouTube", "bad", "через VPN: " + _why(page), page["ms"])
-    page = _http("https://www.youtube.com/", None, timeout)
-    cdn = _http("https://i.ytimg.com/generate_204", None, timeout)
-    if page["ok"] and cdn["ok"]:
+    if proxied and port is None:
+        return _item("youtube", "YouTube", "off", "нужен VPN", 0)
+    where = "через VPN: " if proxied else ""
+    page = _http_retry("https://www.youtube.com/", port if proxied else None,
+                       timeout)
+    if not page["ok"]:
+        return _item("youtube", "YouTube", "bad", where + _why(page), page["ms"])
+    # Страница открылась — проверяем то, ради чего она нужна: реальный поток.
+    video = _youtube_video(port if proxied else None, timeout)
+    if video.get("ok"):
+        prefix = "через VPN · " if proxied else ""
         return _item("youtube", "YouTube", "ok",
-                     f"страница и видео · {cdn['ms'] / 1000:.1f} с", cdn["ms"])
-    if page["ok"]:
-        return _item("youtube", "YouTube", "warn", "страница есть, видео нет", cdn["ms"])
-    return _item("youtube", "YouTube", "bad", _why(page), page["ms"])
+                     f"{prefix}страница и видео · {video['ms'] / 1000:.1f} с",
+                     video["ms"])
+    if video.get("checked"):
+        # Видео-путь проверен и не поехал: это уже сбой сервиса, а не
+        # неопределённость. Именно bad (а не warn) даёт право health-триггеру
+        # уводить маршрут через VPN.
+        return _item("youtube", "YouTube", "bad", where + "страница есть, видео нет",
+                     video["ms"])
+    # До видео-пути не добрались. Картинки — лишь дополнительный признак:
+    # даже если CDN лежит, честный статус — «видео не проверено», warn.
+    _http_retry("https://i.ytimg.com/generate_204",
+                port if proxied else None, timeout)
+    return _item("youtube", "YouTube", "warn",
+                 where + "страница есть, видео не проверено", video.get("ms", 0))
 
 
 def _check_discord(cfg: dict, proxy: dict, timeout: float) -> dict:
@@ -868,6 +1030,24 @@ def collect(cfg: dict, status_state: dict | None = None, proxy: dict | None = No
     Записи с ``show=false`` (он же ``check``) не выполняются и в отчёт
     не попадают: один тумблер «Показывать» управляет и показом, и проверкой.
     """
+    try:
+        from . import strategy
+
+        if strategy.trial_active():
+            # Идёт перебор: winws намеренно гасится, и любой сбой сети —
+            # свойство перебора, а не обхода. Отчёт не пишем и в историю
+            # не кладём: иначе «ложный сбой» останется в статистике.
+            return {
+                "checked": time.time(),
+                "items": [_item("strategy_trial", "Перебор стратегий", "warn",
+                                "идёт перебор стратегий — проверки приостановлены")],
+                "verdict": "warn",
+                "level": "degraded",
+                "skipped": "strategy_trial",
+            }
+    except Exception:  # noqa: BLE001
+        # Отсутствие/поломка маркера не должна отменять проверки.
+        pass
     if status_state is None:
         try:
             from . import status as status_module

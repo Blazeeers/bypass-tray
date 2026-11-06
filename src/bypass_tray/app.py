@@ -30,6 +30,10 @@ AUTO_SWITCH_COOLDOWN = 600.0
 #: порт до 4 с, а частые перезапуски только мешают.
 TGWS_RESTART_COOLDOWN = 60.0
 
+#: Резервный маршрут по health-проверке (zapret запущен, но видео мёртвое):
+#: перезапуск Xray рвёт соединения, поэтому не чаще раза в 15 минут.
+FALLBACK_HEALTH_COOLDOWN = 900.0
+
 #: Подписи пунктов для подсказки иконки (как в панели).
 _LEVEL_LABELS = {
     "zapret": "zapret",
@@ -62,6 +66,7 @@ class TrayApp:
         self.sweep: dict = {"running": False, "message": ""}
         self.proxy: dict = {"running": False, "server": "", "port": xray.DEFAULT_PORT}
         self._stream_since: float | None = None
+        self._health_fallback_at: float = 0.0
         self.servers: list = xray.cached_servers()
         self.server_selected: str = ""
         self._servers_loading = False
@@ -554,6 +559,13 @@ class TrayApp:
         """Проверяет сервисы в фоне; ``heal`` — заодно дать надзирателю поработать."""
         if self.health_running:
             return False
+        try:
+            if strategy.trial_active():
+                # Идёт перебор стратегий: winws намеренно гасится, проверки
+                # записали бы ложные сбои. Следующий тик попробует снова.
+                return False
+        except Exception:  # noqa: BLE001
+            pass
         # Надзирателя занимаем синхронно, до старта потока: иначе плановый
         # проход и heal могли пойти параллельно и дважды запустить tgws/zapret.
         if heal and self.guard_running:
@@ -609,6 +621,12 @@ class TrayApp:
         """Даёт надзирателю один проход (только в фоне)."""
         if self.guard_running or not self.cfg.get("guard_enabled", True):
             return False
+        try:
+            if strategy.trial_active():
+                # Во время перебора надзиратель не должен трогать winws/Xray.
+                return False
+        except Exception:  # noqa: BLE001
+            pass
         self.guard_running = True
         self.busy["guard"] = "надзиратель…"
         snapshot_status = self.status
@@ -1430,13 +1448,47 @@ class TrayApp:
         self.refresh_activity()
         self.select_server(name)
 
+    def _broken_stream_services(self) -> set[str]:
+        """Сломанные YouTube/Discord по свежему отчёту проверок."""
+        report = self.health_report or {}
+        if not report:
+            return set()
+        try:
+            minutes = max(1, int(self.cfg.get("health_minutes") or 10))
+        except (TypeError, ValueError):
+            minutes = 10
+        if not self.health_at or time.time() - self.health_at > 2 * minutes * 60:
+            return set()
+        states = {
+            str(item.get("id") or ""): str(item.get("state") or "")
+            for item in report.get("items") or [] if isinstance(item, dict)
+        }
+        # Только явный bad: warn («не проверено»/неопределённость) не повод
+        # перезапускать Xray и менять маршрут — риск ложного переключения.
+        # «Видео сорвано» health отдаёт именно как bad.
+        return {name for name in ("youtube", "discord")
+                if states.get(name) == "bad"}
+
     def check_stream_fallback(self) -> None:
         """Уводит YouTube/Discord в прокси, если zapret не работает.
 
         Обычно их закрывает zapret, и через сервер они не идут. Но когда
         ``winws.exe`` не запущен, напрямую они уже не откроются — тогда
         включается резервный режим, а после восстановления zapret выключается.
+
+        Второй случай — формально работающий winws, который не обходит
+        (``health`` показывает ``youtube``/``discord`` как bad; ``warn`` —
+        неопределённость, он триггером не считается): тогда проблемный сервис
+        уводится через VPN оверрайдом маршрута, а не всем потоком. Ручные
+        правила ``xray_routes`` не перебиваются.
         """
+        try:
+            if strategy.trial_active():
+                # Перебор гасит winws сам: резервный режим ему только помешает.
+                self._stream_since = None
+                return
+        except Exception:  # noqa: BLE001
+            pass
         if not self.cfg.get("xray_stream_fallback", True):
             return
         if self.cfg.get("youtube_via_vpn"):
@@ -1445,10 +1497,55 @@ class TrayApp:
             self._stream_since = None
             return
         if self.proxy.get("busy") or not self.proxy.get("running"):
+            # Туннеля нет — fallback некуда включать.
             self._stream_since = None
             return
 
         zapret_ok = bool(((self.status or {}).get("zapret") or {}).get("running"))
+        broken = self._broken_stream_services() if zapret_ok else set()
+        if broken and not self.proxy.get("stream"):
+            # zapret запущен, но сервис не работает — уже не «после
+            # восстановления», а честный повод увести только проблемные
+            # домены. Перезапуск Xray — не чаще кулдауна.
+            self._stream_since = None
+            now = time.time()
+            if now - self._health_fallback_at < FALLBACK_HEALTH_COOLDOWN:
+                return
+            self._health_fallback_at = now
+            applied = routes.enable_service_proxy(sorted(broken), self.cfg)
+            if not applied.get("ok"):
+                # Сбой записи/снимка/битый файл — ядро не перезапускаем.
+                activity.log(
+                    "резервный маршрут не записан: "
+                    + str(applied.get("error") or applied.get("status") or "?"),
+                    kind="warn")
+                return
+            if not applied.get("changed"):
+                # Ручные правила уже ведут эти домены — не перебиваем и не
+                # перезапускаем ядро.
+                return
+            result = xray.restart(self.cfg)
+            if result.get("ok"):
+                self.proxy = {**self.proxy, **xray.status()}
+                says = "YouTube/Discord: через VPN (проверка показала сбой)"
+                activity.log(says, kind="ok")
+                self.refresh_activity()
+                self._notify_throttled("stream-health", says, hours=1.0)
+            else:
+                # Ядро не поднялось: оставлять оверрайды «в воздухе» нельзя —
+                # откатываем к снимку, сделанному перед записью.
+                rolled = False
+                try:
+                    rolled = bool(routes.rollback_last(self.cfg).get("ok"))
+                except Exception:  # noqa: BLE001
+                    rolled = False
+                activity.log(
+                    "резервный маршрут не применился: "
+                    + str(result.get("error") or "?")
+                    + (" (маршруты откатаны)" if rolled else ""), kind="warn")
+            self._signature = None
+            return
+
         need = not zapret_ok
         if need == bool(self.proxy.get("stream")):
             self._stream_since = None
