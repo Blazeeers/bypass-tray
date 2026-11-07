@@ -13,9 +13,11 @@ from __future__ import annotations
 import concurrent.futures
 import http.client
 import json
+import re
 import socket
 import ssl
 import time
+import zlib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -30,17 +32,31 @@ _CONTEXT = ssl.create_default_context()
 #: нужна, а гигабайтная загрузка съела бы и время, и память.
 MAX_BODY = 64 * 1024
 
-#: Реальная видео-проба: Innertube отдаёт ссылку на ``*.googlevideo.com``, затем
-#: качается начало файла. Это ловит случай «страница открылась, видео мёртвое»,
-#: который прежняя проверка страницы и картинок не видела.
-INNERTUBE_PLAYER = ("https://www.youtube.com/youtubei/v1/player"
-                    "?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8")
-YOUTUBE_VIDEO_ID = "dQw4w9WgXcQ"
+#: Реальная видео-проба: watch-страница отдаёт playabilityStatus и ссылку на
+#: ``*.googlevideo.com``, затем качается начало файла. Это ловит случай
+#: «страница открылась, видео мёртвое», который прежняя проверка картинок
+#: не видела. Innertube не используется: у него устаревший WEB-клиент.
+YOUTUBE_VIDEO_ID = "jNQXAC9IVRw"
+YOUTUBE_WATCH_URL = "https://www.youtube.com/watch?v={video_id}&hl=en"
+#: Страница watch ~1.3 МБ; 2 МБ хватает с запасом, но не тянет гигабайты.
+WATCH_BODY_LIMIT = 2 * 1024 * 1024
+#: Современный YouTube отдаёт googlevideo 4xx без PO-token — это подпись CDN,
+#: а не блокировка. Такие коды не считаем сбоем.
+SIGNATURE_ERRORS = (400, 401, 403, 410)
 #: Порог мягче Linux-виджета (100 КиБ): 64 КиБ за бюджет ~1.5×timeout уже
 #: доказывают, что VIDEO-поток идёт, а не отдаётся заглушка.
 VIDEO_MIN_BYTES = 64 * 1024
 VIDEO_READ_LIMIT = 256 * 1024
-PLAYER_BODY_LIMIT = 1024 * 1024
+#: Браузерный UA: без него watch-страница отдаёт упрощённый/консентный HTML.
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+_JS_ESCAPES = (
+    ("\\u0026", "&"), ("\\u002F", "/"), ("\\u002f", "/"), ("\\/", "/"),
+    ("\\u003D", "="), ("\\u003d", "="), ("\\u003F", "?"), ("\\u003f", "?"),
+    ("\\u0025", "%"), ("&amp;", "&"),
+)
 
 
 # ---- сетевые примитивы ----------------------------------------------------
@@ -280,49 +296,117 @@ def _stream_context(cfg: dict, proxy: dict) -> tuple[bool, int | None]:
     return True, (port or None)
 
 
-def _post_json(url: str, payload: dict, proxy_port: int | None,
-               timeout: float) -> dict:
-    """POST JSON напрямую или через локальный прокси (для Innertube)."""
+def _decode_js_url(value: str) -> str:
+    """Раскодирует JS/JSON-экранирование в ссылке YouTube."""
+    text = str(value or "")
+    for source, target in _JS_ESCAPES:
+        text = text.replace(source, target)
+    return text
+
+
+def _gunzip(raw: bytes, limit: int) -> bytes:
+    """Распаковка gzip с жёстким пределом распакованного тела."""
+    try:
+        # decompressobj с wbits=31 (gzip) и max_length не даёт распакуются
+        # бомбе больше ``limit``; неполный хвост просто игнорируется.
+        return zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(raw, limit)
+    except zlib.error:
+        return b""
+
+
+def _content_encoding(headers) -> str:
+    try:
+        return str(headers.get("Content-Encoding") or "").lower()
+    except AttributeError:
+        return ""
+
+
+def _fetch_page(url: str, proxy_port: int | None, timeout: float,
+                limit: int) -> dict:
+    """GET страницы с браузерным UA, gzip и ограничением тела/бюджета."""
     started = time.perf_counter()
+    expire = started + max(float(timeout) * 1.5, 3.0)
     if proxy_port:
         proxy = f"http://127.0.0.1:{int(proxy_port)}"
         opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
     else:
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    body = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(
-        url, data=body, method="POST",
-        headers={"User-Agent": UA, "Content-Type": "application/json",
-                 "Accept": "application/json"})
+    request = urllib.request.Request(url, headers={
+        "User-Agent": BROWSER_UA,
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip",
+    })
     try:
         with opener.open(request, timeout=timeout) as response:
-            raw = response.read(PLAYER_BODY_LIMIT)
-            return {"ok": 200 <= int(response.status) < 400,
-                    "status": int(response.status),
-                    "body": raw.decode("utf-8", "replace"),
-                    "ms": _ms(started), "error": ""}
+            status = int(response.status)
+            # Сжатые байты тоже капнуты ``limit``: распаковка ограничена им же.
+            encoding = _content_encoding(getattr(response, "headers", {}))
+            # urllib-ответ не всегда отдаёт read1; read(n) дождётся n байт
+            # или EOF, но для страницы это допустимо.
+            reader = getattr(response, "read1", None) or response.read
+            chunks: list[bytes] = []
+            size = 0
+            truncated = False
+            while size < limit:
+                left = expire - time.perf_counter()
+                if left <= 0:
+                    truncated = True
+                    break
+                try:
+                    chunk = reader(min(65536, limit - size))
+                except TimeoutError:
+                    truncated = True
+                    break
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+            raw = b"".join(chunks)
+            if "gzip" in encoding:
+                raw = _gunzip(raw, limit)
+            return {"status": status, "body": raw.decode("utf-8", "replace"),
+                    "ms": _ms(started), "truncated": truncated, "error": ""}
     except urllib.error.HTTPError as exc:
-        return {"ok": False, "status": int(exc.code), "body": "",
-                "ms": _ms(started), "error": f"HTTP {exc.code}"}
+        try:
+            raw = exc.read(limit)
+            if "gzip" in _content_encoding(getattr(exc, "headers", {})):
+                raw = _gunzip(raw, limit)
+            body = raw.decode("utf-8", "replace")
+        except (OSError, ValueError):
+            body = ""
+        return {"status": int(exc.code), "body": body, "ms": _ms(started),
+                "truncated": False, "error": f"HTTP {exc.code}"}
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "status": 0, "body": "",
-                "ms": _ms(started), "error": _error_name(exc)}
+        return {"status": 0, "body": "", "ms": _ms(started),
+                "truncated": False, "error": _error_name(exc)}
 
 
-def _player_stream_url(payload: dict) -> str:
-    """Первая ссылка ``*.googlevideo.com`` из ответа ``player``."""
-    data = (payload or {}).get("streamingData") or {}
-    for group in ("formats", "adaptiveFormats"):
-        for row in data.get(group) or []:
-            url = str((row or {}).get("url") or "")
-            if "googlevideo.com" in url:
-                return url
-    return ""
+def _playability(body: str) -> tuple[str, str]:
+    """``playabilityStatus.status`` и ``reason`` из HTML watch-страницы."""
+    index = body.find('"playabilityStatus"')
+    if index < 0:
+        return "", ""
+    chunk = body[index:index + 5000]
+    status_match = re.search(r'"status"\s*:\s*"([A-Z_]+)"', chunk)
+    reason_match = re.search(r'"reason"\s*:\s*"((?:[^"\\]|\\.)*)"', chunk)
+    status = status_match.group(1) if status_match else ""
+    reason = _decode_js_url(reason_match.group(1)) if reason_match else ""
+    return status, reason
+
+
+def _video_url(body: str) -> str:
+    """Первая ссылка ``googlevideo.com/videoplayback`` из HTML страницы."""
+    match = re.search(
+        r'https:[^"\s]+?googlevideo\.com[^"\s]+?videoplayback[^"\s]*', body)
+    if not match:
+        return ""
+    return _decode_js_url(match.group(0))
 
 
 def _fetch_range(url: str, proxy_port: int | None, timeout: float) -> dict:
-    """Скачивает начало видео range-запросом и считает, что поток реально идёт.
+    """Range-GET к googlevideo; возвращает диагностику, а не вердикт.
 
     Бюджет общий на весь запрос (как у ``strategy.probe_url``): при троттлинге
     сокет-таймаут на каждом байте не спасает, а проверка не должна держать
@@ -357,7 +441,11 @@ def _fetch_range(url: str, proxy_port: int | None, timeout: float) -> dict:
         else:
             connection = http.client.HTTPConnection(host, port, timeout=timeout)
         connection.request("GET", path, headers={
-            "User-Agent": UA, "Range": f"bytes=0-{VIDEO_READ_LIMIT - 1}"})
+            "User-Agent": BROWSER_UA,
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.youtube.com/",
+            "Range": f"bytes=0-{VIDEO_READ_LIMIT - 1}",
+        })
         response = connection.getresponse()
         status = int(response.status)
         while data < VIDEO_MIN_BYTES:
@@ -379,13 +467,12 @@ def _fetch_range(url: str, proxy_port: int | None, timeout: float) -> dict:
             if not chunk:
                 break
             data += len(chunk)
-        ok = status in (200, 206) and not expired and data >= VIDEO_MIN_BYTES
-        return {"ok": ok, "checked": True, "status": status, "bytes": data,
-                "ms": _ms(started),
-                "error": "timeout" if expired else ("" if ok else f"HTTP {status}")}
+        return {"status": status, "bytes": data, "ms": _ms(started),
+                "expired": expired,
+                "error": "timeout" if expired else ""}
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "checked": True, "status": status, "bytes": data,
-                "ms": _ms(started), "error": _error_name(exc)}
+        return {"status": status, "bytes": data, "ms": _ms(started),
+                "expired": False, "error": _error_name(exc)}
     finally:
         if connection is not None:
             try:
@@ -395,33 +482,64 @@ def _fetch_range(url: str, proxy_port: int | None, timeout: float) -> dict:
 
 
 def _youtube_video(proxy_port: int | None, timeout: float) -> dict:
-    """Проверяет реальный видео-путь через Innertube и ``googlevideo.com``.
+    """Проверяет видео-путь: watch-страница, playability и googlevideo.
 
-    ``checked=False`` — до видео-пути не добрались (youtubei недоступен или
-    не отдал ссылку). Это не «видео сломано», поэтому наружу отдаётся
-    отдельный статус: страницу проверили, видео — нет.
+    Возвращает диагностику с ``ok``/``checked``:
+    * ``stream=True`` — поток реально качается;
+    * ``ok=True, stream=False, signature=True`` — googlevideo ответил 4xx
+      (нет PO-token): это штатно, страница и плеер работают;
+    * ``ok=True, stream=None`` — playability OK, ссылки на поток нет;
+    * ``ok=False, checked=True`` — страница/поток недоступны;
+    * ``checked=False`` — не удалось извлечь ни playability, ни поток.
     """
-    player = _post_json(INNERTUBE_PLAYER, {
-        "context": {"client": {
-            "clientName": "WEB",
-            "clientVersion": "2.20240101.00.00",
-            "hl": "en",
-        }},
-        "videoId": YOUTUBE_VIDEO_ID,
-    }, proxy_port, timeout)
-    if not player["ok"]:
-        return {"ok": False, "checked": False, "ms": player["ms"],
-                "error": player["error"] or f"HTTP {player['status']}"}
-    try:
-        payload = json.loads(player["body"])
-    except (ValueError, TypeError):
-        return {"ok": False, "checked": False, "ms": player["ms"],
-                "error": "player не JSON"}
-    url = _player_stream_url(payload if isinstance(payload, dict) else {})
-    if not url:
-        return {"ok": False, "checked": False, "ms": player["ms"],
-                "error": "нет ссылки на видео"}
-    return _fetch_range(url, proxy_port, timeout)
+    page_url = YOUTUBE_WATCH_URL.format(video_id=YOUTUBE_VIDEO_ID)
+    page = _fetch_page(page_url, proxy_port, timeout, WATCH_BODY_LIMIT)
+    if int(page.get("status") or 0) == 0:
+        # Один повтор, как у лёгкой проверки: обрыв/tail-таймаут не приговор.
+        page = _fetch_page(page_url, proxy_port, timeout, WATCH_BODY_LIMIT)
+    status = int(page.get("status") or 0)
+    if not 200 <= status < 300:
+        if 400 <= status < 500:
+            # 404/410/429/451 — не повод уводить YouTube в VPN и рвать Xray:
+            # это отказ конкретной страницы, а не блокировка обхода.
+            detail = f"страница недоступна ({status})"
+            return {"ok": False, "checked": True, "warn": True,
+                    "page": False, "status": status, "reason": detail,
+                    "ms": page["ms"], "error": detail}
+        return {"ok": False, "checked": True, "page": False,
+                "status": status, "ms": page["ms"],
+                "error": page["error"] or f"HTTP {status}"}
+    body = page["body"]
+    playability, reason = _playability(body)
+    if playability in ("ERROR", "UNPLAYABLE") and reason:
+        return {"ok": False, "checked": True, "page": True,
+                "playability": playability, "reason": reason,
+                "ms": page["ms"], "error": reason}
+    url = _video_url(body)
+    if url:
+        stream = _fetch_range(url, proxy_port, timeout)
+        status = int(stream.get("status") or 0)
+        if (status in (200, 206) and not stream.get("expired")
+                and int(stream.get("bytes") or 0) >= VIDEO_MIN_BYTES):
+            return {"ok": True, "checked": True, "page": True, "stream": True,
+                    "playability": playability, "status": status,
+                    "ms": stream["ms"]}
+        if status in SIGNATURE_ERRORS:
+            # 4xx без PO-token — не блокировка: плеер и страница живы.
+            return {"ok": True, "checked": True, "page": True, "stream": False,
+                    "signature": True, "playability": playability,
+                    "status": status, "ms": stream["ms"]}
+        return {"ok": False, "checked": True, "page": True, "stream": False,
+                "playability": playability, "status": status,
+                "ms": stream["ms"],
+                "error": stream.get("error") or f"HTTP {status}"}
+    if playability in ("OK", "PLAYING"):
+        # Плеер жив, но ссылку из HTML не достали — это не сбой.
+        return {"ok": True, "checked": True, "page": True, "stream": None,
+                "playability": playability, "ms": page["ms"]}
+    return {"ok": False, "checked": False, "page": True,
+            "playability": playability, "ms": page["ms"],
+            "error": "playability и поток не найдены"}
 
 
 def _check_youtube(cfg: dict, proxy: dict, timeout: float) -> dict:
@@ -435,21 +553,27 @@ def _check_youtube(cfg: dict, proxy: dict, timeout: float) -> dict:
         return _item("youtube", "YouTube", "bad", where + _why(page), page["ms"])
     # Страница открылась — проверяем то, ради чего она нужна: реальный поток.
     video = _youtube_video(port if proxied else None, timeout)
+    if video.get("warn"):
+        # 4xx watch-страницы: не деградируем и не запускаем fallback.
+        return _item("youtube", "YouTube", "warn",
+                     where + str(video.get("reason")
+                                 or f"страница недоступна ({video.get('status')})"),
+                     video.get("ms", 0))
     if video.get("ok"):
         prefix = "через VPN · " if proxied else ""
+        if video.get("stream"):
+            detail = f"{prefix}страница и видео"
+        else:
+            # playability ок или googlevideo 4xx без PO-token: это штатно,
+            # не повод красить панель в degraded.
+            detail = f"{prefix}страница и плеер ок"
         return _item("youtube", "YouTube", "ok",
-                     f"{prefix}страница и видео · {video['ms'] / 1000:.1f} с",
-                     video["ms"])
+                     f"{detail} · {video['ms'] / 1000:.1f} с", video["ms"])
     if video.get("checked"):
-        # Видео-путь проверен и не поехал: это уже сбой сервиса, а не
-        # неопределённость. Именно bad (а не warn) даёт право health-триггеру
-        # уводить маршрут через VPN.
-        return _item("youtube", "YouTube", "bad", where + "страница есть, видео нет",
-                     video["ms"])
-    # До видео-пути не добрались. Картинки — лишь дополнительный признак:
-    # даже если CDN лежит, честный статус — «видео не проверено», warn.
-    _http_retry("https://i.ytimg.com/generate_204",
-                port if proxied else None, timeout)
+        # Реально не удалось ни открыть watch-страницу, ни получить поток.
+        return _item("youtube", "YouTube", "bad",
+                     where + "страница есть, видео не идёт", video["ms"])
+    # Ни playability, ни ссылки на поток: ничего не проверили.
     return _item("youtube", "YouTube", "warn",
                  where + "страница есть, видео не проверено", video.get("ms", 0))
 
@@ -506,17 +630,20 @@ def _check_telegram(proxy_port: int | None, timeout: float) -> dict:
 
 
 def _check_zapret(status_state: dict, cfg: dict | None = None,
-                  proxy: dict | None = None) -> dict:
+                  proxy: dict | None = None, user_off: bool = False) -> dict:
     """Состояние zapret. Без работающего zapret при VPN-резерве — warn.
 
     В резервном режиме и в режиме ``all`` YouTube/Discord идут через туннель,
     поэтому ни остановленный, ни вовсе не найденный ``winws.exe`` не означают
-    сбой обхода, пока прокси жив.
+    сбой обхода, пока прокси жив. ``user_off`` — пользователь выключил zapret
+    тумблером: это не авария, поэтому статус мягкий.
     """
     zapret = (status_state or {}).get("zapret") or {}
     if zapret.get("running"):
         detail = str(zapret.get("strategy") or "стратегия не определена")
         return _item("zapret", "zapret", "ok", detail, 0)
+    if user_off:
+        return _item("zapret", "zapret", "off", "выключен вручную", 0)
     cfg = cfg or {}
     proxy = proxy or {}
     mode = str(proxy.get("routing_mode") or cfg.get("routing_mode") or "")
@@ -711,11 +838,12 @@ def _check_tcp(record: dict, timeout: float) -> dict:
 
 
 def _check_builtin(record: dict, cfg: dict, proxy: dict, proxy_port: int | None,
-                   status_state: dict, timeout: float, deadline: float | None) -> dict:
+                   status_state: dict, timeout: float, deadline: float | None,
+                   zapret_off: bool = False) -> dict:
     """Встроенная проба по имени ``probe`` — прежняя логика без переписывания."""
     probe = str(record.get("probe") or record.get("id") or "")
     if probe == "zapret":
-        item = _check_zapret(status_state, cfg, proxy)
+        item = _check_zapret(status_state, cfg, proxy, user_off=zapret_off)
     elif probe == "youtube":
         item = _check_youtube(cfg, proxy, timeout)
     elif probe == "discord":
@@ -737,14 +865,14 @@ def _check_builtin(record: dict, cfg: dict, proxy: dict, proxy_port: int | None,
 
 def _probe_record(record: dict, cfg: dict, proxy: dict, proxy_port: int | None,
                   status_state: dict, timeout: float,
-                  deadline: float | None) -> dict:
+                  deadline: float | None, zapret_off: bool = False) -> dict:
     kind = str(record.get("kind") or "builtin")
     if kind == "https":
         return _check_https(record, proxy_port, timeout)
     if kind == "tcp":
         return _check_tcp(record, timeout)
     return _check_builtin(record, cfg, proxy, proxy_port, status_state,
-                          timeout, deadline)
+                          timeout, deadline, zapret_off=zapret_off)
 
 
 def _failure_item(record: dict, exc: BaseException) -> dict:
@@ -1017,7 +1145,8 @@ def load_cache(cfg: dict | None = None) -> dict | None:
 
 
 def collect(cfg: dict, status_state: dict | None = None, proxy: dict | None = None,
-            timeout: float = 5.0, total_timeout: float | None = None) -> dict:
+            timeout: float = 5.0, total_timeout: float | None = None,
+            zapret_off: bool = False) -> dict:
     """Проверяет все включённые пункты ``health_items`` и сводит вердикт.
 
     ``status_state`` — результат ``status.collect``; если не передан, состояние
@@ -1084,7 +1213,7 @@ def collect(cfg: dict, status_state: dict | None = None, proxy: dict | None = No
             str(record.get("id") or ""),
             lambda item_timeout: _probe_record(
                 record, cfg, proxy or {}, proxy_port, status_state,
-                item_timeout, hard_deadline),
+                item_timeout, hard_deadline, zapret_off=zapret_off),
             limit, hard_deadline)
         return _stamp(result, record)
 

@@ -222,6 +222,10 @@ class FakeController:
     def restart_zapret(self):
         self._record("restart_zapret")
 
+    def set_zapret(self, value):
+        self._record(f"set_zapret:{bool(value)}")
+        return True
+
     def start_tgws(self):
         self._record("start_tgws")
 
@@ -442,6 +446,24 @@ def main() -> int:
               bool(panel._services_divider.winfo_ismapped()) and right_x > left_x,
               f"x={left_x}/{right_x}, разделитель "
               f"{panel._services_divider.winfo_ismapped()}")
+
+        # Тумблер zapret: состояние берётся из статуса, клик — у контроллера.
+        toggle = panel._services["zapret"].get("switch")
+        check("zapret: тумблер на дашборде", isinstance(toggle, ToggleSwitch))
+        if toggle is not None:
+            check("тумблер zapret показывает запущенное состояние", toggle.get())
+            check("подсказка тумблера", "Zapret: вкл/выкл" in toggle._tooltip.text)
+            toggle._flip()
+            deadline = time.time() + 1.0
+            while not fake.calls.get("set_zapret:False") and time.time() < deadline:
+                time.sleep(0.02)
+            check("выключение с тумблера → controller.set_zapret(False)",
+                  bool(fake.calls.get("set_zapret:False")))
+            fake.status["zapret"]["running"] = False
+            panel._render()
+            check("тумблер вернулся к факту (zapret остановлен)", not toggle.get())
+            fake.status["zapret"]["running"] = True
+            panel._render()
 
         origin = (panel._origin_x, panel._origin_y)
         main_height = panel._last_height
@@ -1713,10 +1735,11 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
 
     health._http = fake_http
     health._tcp = fake_tcp
-    # Видео-проба теперь ходит в Innertube/googlevideo: в офлайн-наборе её
+    # Видео-проба ходит на watch-страницу и googlevideo: в офлайн-наборе её
     # подменяем, иначе страница+картинки дают «видео не проверено».
     health._youtube_video = lambda *args, **kwargs: {
-        "ok": True, "checked": True, "ms": 100, "bytes": health.VIDEO_MIN_BYTES}
+        "ok": True, "checked": True, "stream": True,
+        "ms": 100, "bytes": health.VIDEO_MIN_BYTES}
     try:
         http_calls.clear()
         yt_vpn = health._check_youtube(
