@@ -239,8 +239,11 @@ def main() -> int:
         from . import health, xray
 
         cfg = config.load_config()
+        state = config.load_state()
         try:
-            result = health.collect(cfg, status.collect(cfg), xray.status())
+            result = health.collect(
+                cfg, status.collect(cfg), xray.status(),
+                zapret_off=bool((state or {}).get("zapret_user_off")))
         except Exception as exc:  # noqa: BLE001
             result = {"checked": time.time(), "items": [], "verdict": "warn",
                       "error": f"{type(exc).__name__}: {exc}"}

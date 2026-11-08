@@ -280,9 +280,9 @@ def _stream_context(cfg: dict, proxy: dict,
     Если режим выбран, а прокси не запущен — второй элемент ``None``, проверка
     вернёт «нужен VPN».
 
-    ``service`` учитывает оверрайды ``source="zapret_off"``: после ручного
-    выключения zapret сервис уже идёт через VPN, и health должен проверять его
-    через прокси, а не показывать прямой сбой.
+    ``service`` учитывает любые proxy-оверрайды сервиса (``zapret_off``,
+    ``escalation``, ручные): если домен уже ведётся через VPN, health должен
+    проверять его через прокси, а не показывать прямой сбой.
     """
     cfg = cfg or {}
     proxy = proxy or {}
@@ -298,8 +298,6 @@ def _stream_context(cfg: dict, proxy: dict,
             domains = routes.SERVICE_DOMAINS.get(str(service), ())
             requested = any(
                 str((overrides.get(domain) or {}).get("route") or "") == "proxy"
-                and str((overrides.get(domain) or {}).get("source") or "")
-                == "zapret_off"
                 for domain in domains
             )
         except Exception:  # noqa: BLE001

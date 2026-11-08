@@ -127,7 +127,10 @@ class YouTubeStatusTests(unittest.TestCase):
     def check(self, *, page: bool, video: dict) -> dict:
         with mock.patch.object(health, "_http_retry",
                                return_value=_http(page)), \
-                mock.patch.object(health, "_youtube_video", return_value=video):
+                mock.patch.object(health, "_youtube_video",
+                                  return_value=video), \
+                mock.patch.object(health, "_stream_context",
+                                  return_value=(False, None)):
             return health._check_youtube({}, {}, 3.0)
 
     def test_page_and_video_ok(self) -> None:
