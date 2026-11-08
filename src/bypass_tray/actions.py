@@ -7,9 +7,12 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
+
+from . import runtime
 
 try:
     import psutil
@@ -147,22 +150,108 @@ def _run_capture(args: list[str], timeout: int = 10) -> str:
 # ---- запуск с повышением прав --------------------------------------------
 
 
-def run_elevated(args: list[str], cwd: str | None = None) -> bool:
-    """Запускает команду через UAC. Возвращает False, если пользователь отказал."""
+def _shell_execute(args: list[str], cwd: str | None = None) -> int:
+    """Один вызов ShellExecuteW; возвращает код Win32."""
     if not sys.platform.startswith("win"):
         try:
             _popen(args, cwd)
-            return True
+            return 42
         except OSError:
-            return False
+            return 2
     params = subprocess.list2cmdline(args[1:])
     try:
-        result = ctypes.windll.shell32.ShellExecuteW(
+        return int(ctypes.windll.shell32.ShellExecuteW(
             None, "runas", args[0], params, cwd, 1
-        )
+        ))
     except Exception:  # noqa: BLE001
-        return False
-    return int(result) > 32
+        return 0
+
+
+def _elevate(args: list[str], cwd: str | None = None, attempts: int = 3,
+             delay: float = 0.8) -> tuple[bool, int]:
+    """UAC-запуск с повтором: код 5 (SE_ERR_ACCESSDENIED) бывает транзиентным.
+
+    Возвращает ``(ok, last_code)``. Успех — только код > 32, но вызывающий
+    обязан проверить фактическое состояние: команда могла отработать даже
+    при «неудачном» коде.
+    """
+    last = 0
+    rounds = max(1, int(attempts))
+    for attempt in range(rounds):
+        last = _shell_execute(args, cwd)
+        if last > 32:
+            return True, last
+        if attempt < rounds - 1:
+            time.sleep(max(0.0, float(delay)))
+    return False, last
+
+
+def run_elevated(args: list[str], cwd: str | None = None) -> bool:
+    """Совместимость: True, если UAC-запуск принят (код > 32)."""
+    return _elevate(args, cwd)[0]
+
+
+def _batch_dir() -> Path:
+    """Папка для временных .bat: data_dir, иначе %TEMP%."""
+    try:
+        directory = runtime.data_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+    except OSError:
+        return Path(tempfile.gettempdir())
+
+
+#: Сколько живёт временный .bat, пока его не заберёт elevated-процесс.
+BATCH_STALE_SECONDS = 120
+
+
+def _cleanup_stale_batches(directory: Path) -> None:
+    """Удаляет старые ``bypass-tray-elev-*.bat``; ошибки игнорируются."""
+    now = time.time()
+    try:
+        files = list(Path(directory).glob("bypass-tray-elev-*.bat"))
+    except OSError:
+        return
+    for path in files:
+        try:
+            if now - path.stat().st_mtime <= BATCH_STALE_SECONDS:
+                continue
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _elevate_batch(lines: list[str], attempts: int = 3,
+                   delay: float = 0.8) -> tuple[bool, int]:
+    """Элевирует временный .bat со списком команд (по одной в строке).
+
+    ``ShellExecuteW`` с длинной ``cmd /c "…&…"`` на этой машине иногда
+    возвращает 5 и ничего не делает; элевация самого .bat надёжна.
+    Файл НЕ удаляем сразу: ShellExecute асинхронный и elevated-cmd ещё не
+    прочитал его. Старые файлы вычищаются при следующем вызове.
+    """
+    path: Path | None = None
+    try:
+        directory = _batch_dir()
+        _cleanup_stale_batches(directory)
+        fd, name = tempfile.mkstemp(prefix="bypass-tray-elev-", suffix=".bat",
+                                    dir=str(directory))
+        path = Path(name)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write("@echo off\r\n")
+            for line in lines:
+                handle.write(str(line).replace("\r", " ").replace("\n", " ")
+                             + "\r\n")
+        return _elevate([str(path)], cwd=str(path.parent),
+                        attempts=attempts, delay=delay)
+    except (OSError, ValueError):
+        # Запись не удалась — файл ещё не запускался, его можно убрать.
+        if path is not None:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return False, 0
 
 
 # ---- zapret ---------------------------------------------------------------
@@ -182,6 +271,23 @@ def service_state(name: str = ZAPRET_SERVICE) -> str:
     return "absent"
 
 
+def _service_start_lines(name: str, action: str, drivers: list[str],
+                         start_types: dict[str, str]) -> list[str]:
+    """Команды .bat для запуска/перезапуска службы и драйверов."""
+    parts: list[str] = []
+    for item in drivers:
+        if start_types.get(item) == "4":
+            parts.append(f"sc.exe config {item} start= demand")
+        parts.append(f"sc.exe start {item}")
+    if action == "restart":
+        parts.append(f"sc.exe stop {name}")
+    parts.append(f"sc.exe start {name}")
+    for item in drivers:
+        if start_types.get(item) == "4":
+            parts.append(f"sc.exe config {item} start= disabled")
+    return parts
+
+
 def control_service(action: str, name: str = ZAPRET_SERVICE) -> str:
     """Останавливает/запускает службу zapret (с UAC при необходимости).
 
@@ -199,34 +305,37 @@ def control_service(action: str, name: str = ZAPRET_SERVICE) -> str:
             pending = [item for item, state in states.items()
                        if state != "running"]
             originals = {item: _service_start_type(item) for item in pending}
-            parts: list[str] = []
-            for item in pending:
-                if originals.get(item) == "4":
-                    parts.append(f"sc.exe config {item} start= demand")
-                parts.append(f"sc.exe start {item}")
-            if action == "restart":
-                parts.append(f"sc.exe stop {name}")
-            parts.append(f"sc.exe start {name}")
-            for item in pending:
-                if originals.get(item) == "4":
-                    parts.append(f"sc.exe config {item} start= disabled")
-            if not run_elevated(["cmd", "/c", " & ".join(parts)]):
-                raise PermissionError(
-                    "Нужны права администратора: подтвердите запрос UAC, чтобы "
-                    f"запустить службу {name} и драйвер WinDivert."
-                )
-            return _wait_service_state(name, "running", 8.0)
+            parts = _service_start_lines(name, action, pending, originals)
+            code = 0
+            # Код ShellExecute бывает транзиентным; решает фактическое состояние.
+            for _attempt in range(2):
+                _ok, code = _elevate_batch(parts)
+                if _wait_service_state(name, "running", 8.0) == "running":
+                    return "running"
+            raise PermissionError(
+                "Нужны права администратора: подтвердите запрос UAC, чтобы "
+                f"запустить службу {name} и драйвер WinDivert (код {code}).")
         # Служба zapret не стартует без загруженного WinDivert (может быть
         # DISABLED после ручной остановки) — поднимаем драйвер заранее.
         _ensure_windivert()
     for step in steps:
         if is_admin():
             _run_capture(["sc.exe", step, name], timeout=30)
-        elif not run_elevated(["sc.exe", step, name]):
+            continue
+        target = "stopped" if step == "stop" else "running"
+        code = 0
+        for _attempt in range(2):
+            _ok, code = _elevate_batch([f"sc.exe {step} {name}"])
+            if target == "stopped":
+                state = _wait_services_stopped([name], 8.0).get(name, "")
+                if state in ("stopped", "absent"):
+                    break
+            elif _wait_service_state(name, "running", 8.0) == "running":
+                break
+        else:
             raise PermissionError(
                 "Нужны права администратора: подтвердите запрос UAC, чтобы "
-                f"выполнить «sc {step} {name}»."
-            )
+                f"выполнить «sc {step} {name}» (код {code}).")
     return service_state(name)
 
 
@@ -378,20 +487,28 @@ def stop_windivert() -> dict:
     if is_admin():
         for name in running:
             _run_capture(["sc.exe", "stop", name], timeout=15)
+        states = _wait_services_stopped(running, WINDIVERT_WAIT)
     else:
         # Без кавычек: list2cmdline экранирует внутренние " как \", и cmd.exe
         # получает имя службы вместе с кавычками (ошибка 1060). Имена
         # WinDivert безопасны — они пришли из ^windivert.
-        command = " & ".join(f"sc.exe stop {name}" for name in running)
-        if not run_elevated(["cmd", "/c", command]):
-            return {"state": "denied", "services": states}
-    states = _wait_services_stopped(running, WINDIVERT_WAIT)
+        commands = [f"sc.exe stop {name}" for name in running]
+        code = 0
+        for _attempt in range(2):
+            _ok, code = _elevate_batch(commands)
+            states = _wait_services_stopped(running, WINDIVERT_WAIT)
+            if all(state in ("stopped", "absent")
+                   for state in states.values()):
+                return {"state": "stopped", "services": states}
+        raise PermissionError(
+            "Нужны права администратора: подтвердите запрос UAC, чтобы "
+            f"остановить драйверы WinDivert (код {code}).")
     ok = all(state in ("stopped", "absent") for state in states.values())
     return {"state": "stopped" if ok else "failed", "services": states}
 
 
-def _stop_all_command(stop_service: bool, drivers: list[str]) -> str:
-    """Одна команда для elevated ``cmd /c``: служба → winws → драйверы."""
+def _stop_all_lines(stop_service: bool, drivers: list[str]) -> list[str]:
+    """Команды для .bat: служба → winws → драйверы, по одной в строке."""
     parts: list[str] = []
     if stop_service:
         parts.append(f"sc.exe stop {ZAPRET_SERVICE}")
@@ -399,10 +516,13 @@ def _stop_all_command(stop_service: bool, drivers: list[str]) -> str:
     if drivers:
         # Дать winws завершиться и отпустить драйвер до его остановки.
         parts.append("ping -n 2 127.0.0.1 >nul")
-        # Кавычки здесь ломаются MSVC-экранированием list2cmdline (\" для
-        # cmd.exe) — имена WinDivert идут без них.
         parts.extend(f"sc.exe stop {name}" for name in drivers)
-    return " & ".join(parts)
+    return parts
+
+
+def _stop_all_command(stop_service: bool, drivers: list[str]) -> str:
+    """Совместимость: те же команды одной строкой через ``&``."""
+    return " & ".join(_stop_all_lines(stop_service, drivers))
 
 
 #: Коды ``START_TYPE`` из ``sc qc`` и имена для ``sc config start=``.
@@ -453,9 +573,7 @@ def _ensure_windivert(timeout: float = 3.0) -> str:
         if originals.get(name) == "4":
             commands.append(["sc.exe", "config", name, "start=", "disabled"])
     if not is_admin():
-        command = " & ".join(subprocess.list2cmdline(args)
-                             for args in commands)
-        run_elevated(["cmd", "/c", command])
+        _elevate_batch([subprocess.list2cmdline(args) for args in commands])
     else:
         for args in commands:
             _run_capture(args, timeout=10)
@@ -514,21 +632,35 @@ def stop_zapret(cfg: dict | None = None) -> dict:
                        if service_state(name) == "running"]
 
     if not is_admin():
-        command = _stop_all_command(service == "running", running_drivers)
-        if not run_elevated(["cmd", "/c", command]):
+        commands = _stop_all_lines(service == "running", running_drivers)
+        code = 0
+        states: dict[str, str] = {}
+        stopped = False
+        for _attempt in range(2):
+            _ok, code = _elevate_batch(commands)
+            # Код ShellExecute бывает 5/1223, но команда могла выполниться:
+            # успех определяем только по фактическому состоянию.
+            _wait_services_stopped([ZAPRET_SERVICE], 3.0)
+            _wait_process_gone("winws", 2.0)
+            if running_drivers:
+                states = _wait_services_stopped(running_drivers, WINDIVERT_WAIT)
+            else:
+                states = {name: service_state(name) for name in drivers}
+            stopped = (
+                service_state(ZAPRET_SERVICE) in ("stopped", "absent")
+                and not _pids("winws")
+                and all(state in ("stopped", "absent")
+                        for state in states.values())
+            )
+            if stopped:
+                break
+        if not stopped:
             raise PermissionError(
                 "Нужны права администратора: подтвердите запрос UAC, чтобы "
-                "остановить zapret и драйверы WinDivert."
-            )
-        _wait_services_stopped([ZAPRET_SERVICE], 3.0)
-        _wait_process_gone("winws", 2.0)
+                f"остановить zapret и драйверы WinDivert (код {code}).")
         if running_drivers:
-            states = _wait_services_stopped(running_drivers, WINDIVERT_WAIT)
-            windivert = "stopped" if all(
-                state in ("stopped", "absent") for state in states.values()
-            ) else "failed"
+            windivert = "stopped"
         else:
-            states = {name: service_state(name) for name in drivers}
             windivert = "not_running" if any(
                 state == "stopped" for state in states.values()) else "absent"
         return {"service": service_exists, **kill_process("winws"),
