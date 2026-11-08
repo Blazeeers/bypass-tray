@@ -424,6 +424,9 @@ DEFAULTS: dict = {
     "autoconnect": False,
     # Принудительно вести YouTube/Discord через VPN (если видео застревает).
     "youtube_via_vpn": False,
+    # Перезапускать клиент Discord через прокси при выключении zapret и
+    # возвращать напрямую при включении (Discord игнорирует системный прокси).
+    "discord_switch_on_zapret": True,
     # Сколько часов журнала показывать в панели.
     "activity_hours": 3,
     # Встроенный список заблокированных доменов Re:filter (data/geosite-refilter.dat).

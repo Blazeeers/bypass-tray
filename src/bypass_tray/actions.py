@@ -147,6 +147,143 @@ def _run_capture(args: list[str], timeout: int = 10) -> str:
     return _decode(completed.stdout)
 
 
+# ---- Discord ---------------------------------------------------------------
+
+
+def discord_base() -> Path | None:
+    """Каталог установки Discord с ``Update.exe`` или ``None``."""
+    if not sys.platform.startswith("win"):
+        return None
+    root = os.environ.get("LOCALAPPDATA")
+    base = Path(root) if root else Path.home() / "AppData" / "Local"
+    directory = base / "Discord"
+    return directory if (directory / "Update.exe").is_file() else None
+
+
+def discord_pids() -> list[int]:
+    """PID основных процессов Discord (без DiscordSystemHelper)."""
+    if psutil is None:
+        return []
+    found: list[int] = []
+    try:
+        for proc in psutil.process_iter(["name"]):
+            name = str((proc.info or {}).get("name") or "").lower()
+            if name in ("discord", "discord.exe"):
+                found.append(int(proc.pid))
+    except Exception:  # noqa: BLE001
+        return found
+    return found
+
+
+def discord_uses_proxy(port: int) -> bool:
+    """Есть ли у Discord established-соединение с ``127.0.0.1:<port>``."""
+    if psutil is None:
+        return False
+    pids = set(discord_pids())
+    if not pids:
+        return False
+    try:
+        connections = psutil.net_connections(kind="tcp")
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        wanted = int(port)
+    except (TypeError, ValueError):
+        return False
+    for conn in connections or []:
+        try:
+            if conn.pid not in pids:
+                continue
+            if conn.status != psutil.CONN_ESTABLISHED:
+                continue
+            for addr in (conn.raddr, conn.laddr):
+                if addr and str(addr[0]) == "127.0.0.1" and int(addr[1]) == wanted:
+                    return True
+        except (AttributeError, TypeError, ValueError, IndexError):
+            continue
+    return False
+
+
+def discord_forced_proxy() -> bool:
+    """Запущен ли главный Discord с ``--proxy-server=...``.
+
+    Обычный Discord без флага тоже держит одно соединение с локальным
+    прокси (системный прокси), поэтому наличие соединения на 10818 — не
+    признак принудительного прокси. Смотрим командную строку главного
+    процесса: у helper/renderer есть ``--type=``, их пропускаем.
+    """
+    if psutil is None:
+        return False
+    try:
+        processes = psutil.process_iter(["name", "cmdline"])
+    except Exception:  # noqa: BLE001
+        return False
+    for proc in processes:
+        try:
+            name = str((proc.info or {}).get("name") or "").lower()
+            if name not in ("discord", "discord.exe"):
+                continue
+            command = proc.cmdline() or []
+        except Exception:  # noqa: BLE001
+            continue
+        args = [str(arg) for arg in command]
+        if any(arg.startswith("--type=") for arg in args):
+            continue
+        if any(arg.startswith("--proxy-server=") for arg in args):
+            return True
+    return False
+
+
+def restart_discord(via_proxy: bool, port: int) -> dict:
+    """Перезапускает Discord, при необходимости через локальный прокси."""
+    if not sys.platform.startswith("win"):
+        return {"ok": False, "action": "unsupported"}
+    base = discord_base()
+    if base is None:
+        return {"ok": False, "action": "absent"}
+    pids = discord_pids()
+    alive: list = []
+    for pid in pids:
+        try:
+            process = psutil.Process(pid)
+            process.terminate()
+            alive.append(process)
+        except Exception:  # noqa: BLE001
+            continue
+    deadline = time.time() + 8.0
+    while alive and time.time() < deadline:
+        pending = []
+        for process in alive:
+            try:
+                if process.is_running() and process.status() != "zombie":
+                    pending.append(process)
+            except Exception:  # noqa: BLE001
+                continue
+        alive = pending
+        if alive:
+            time.sleep(0.2)
+    for process in alive:
+        try:
+            process.kill()
+        except Exception:  # noqa: BLE001
+            pass
+    command = [str(base / "Update.exe"), "--processStart", "Discord.exe"]
+    if via_proxy:
+        command += [
+            "--process-start-args",
+            f"--proxy-server=http://127.0.0.1:{int(port)}",
+        ]
+    try:
+        subprocess.Popen(
+            command, cwd=str(base), stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except OSError as exc:
+        return {"ok": False, "action": f"error:{exc}"}
+    return {"ok": True, "action": "restarted", "via_proxy": bool(via_proxy)}
+
+
 # ---- запуск с повышением прав --------------------------------------------
 
 
