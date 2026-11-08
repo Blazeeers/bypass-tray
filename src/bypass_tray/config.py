@@ -427,6 +427,9 @@ DEFAULTS: dict = {
     # Перезапускать клиент Discord с --proxy-server (устарело: теперь Droute
     # ходит через отдельный SOCKS-inbound Xray). По умолчанию выключено.
     "discord_switch_on_zapret": False,
+    # Встроенная поддержка Droute (SOCKS5-проксификатор Discord, TCP+UDP).
+    "droute_enabled": False,
+    "droute_branch": "stable",
     # Локальный SOCKS5-inbound для Droute (Discord, TCP+UDP).
     "droute_socks_port": 10819,
     # Сколько часов журнала показывать в панели.

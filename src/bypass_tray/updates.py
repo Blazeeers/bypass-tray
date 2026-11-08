@@ -12,7 +12,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-from . import actions, activity, blocked, components, config, status, xray
+from . import actions, activity, blocked, components, config, droute, status, xray
 
 REPOS = {
     "zapret": "Flowseal/zapret-discord-youtube",
@@ -30,6 +30,7 @@ LABELS = {
     "tgwsproxy": "tg-ws-proxy",
     "xray": "ядро Xray",
     "refilter": "Re:filter",
+    "droute": "Droute",
 }
 
 #: Строка ``xray -version``: «Xray 25.6.8 (Xray, Penetration Test Build)».
@@ -349,6 +350,27 @@ def check_all(cfg: dict, state: dict) -> dict:
             missing.append(name)
     if not present.get("refilter"):
         missing.append("refilter")
+    if cfg.get("droute_enabled"):
+        branch = str(cfg.get("droute_branch") or "stable").lower()
+        base = next((item for item in droute.discord_bases()
+                     if droute.discord_branch(item) == branch), None)
+        have = droute.installed_version(base) if base is not None else ""
+        tag = droute.available_version() if base is not None else ""
+        present_droute = bool(base is not None and droute.installed(base))
+        needs_install = bool(base is not None and not present_droute)
+        is_outdated = bool(
+            needs_install
+            or (present_droute and _needs_update(have, tag, True)))
+        info = {"latest": tag, "installed": have,
+                "outdated": bool(is_outdated),
+                "needs_install": needs_install}
+        if base is None:
+            info["error"] = "discord_absent"
+        found["droute"] = info
+        if tag:
+            seen["droute"] = tag
+        if is_outdated:
+            outdated.append("droute")
     # Версии, прочитанные с диска (tgws из ресурсов exe), фиксируем сразу:
     # иначе «неизвестная» версия снова приведёт к лишней переустановке.
     known = state.get("installed")
@@ -581,6 +603,44 @@ def update_all(cfg: dict, state: dict, progress=None) -> dict:
         message = str(refilter.get("error") or "не обновился")
         result["components"]["refilter"] = {"ok": False, "version": "", "error": message}
         result["errors"].append("Re:filter: " + message)
+
+    if cfg.get("droute_enabled"):
+        branch = str(cfg.get("droute_branch") or "stable").lower()
+        base = next((item for item in droute.discord_bases()
+                     if droute.discord_branch(item) == branch), None)
+        if base is None:
+            result["warnings"].append("Droute: Discord не установлен")
+        else:
+            have = droute.installed_version(base)
+            latest = droute.available_version()
+            was_installed = droute.installed(base)
+            if not was_installed or _needs_update(have, latest, True):
+                say("droute", "обновляю Droute…", 0)
+                try:
+                    port = int(cfg.get("droute_socks_port") or 10819)
+                except (TypeError, ValueError):
+                    port = 10819
+                installed_droute = droute.install(
+                    branch, port,
+                    close_discord_cb=lambda: actions.stop_discord(),
+                    reopen_cb=lambda: actions.restart_discord(False, port))
+                if installed_droute.get("ok"):
+                    (result["updated"] if was_installed
+                     else result["installed"]).append("droute")
+                    result["components"]["droute"] = {
+                        "ok": True,
+                        "version": str(installed_droute.get("version") or ""),
+                        "error": ""}
+                else:
+                    message = str(installed_droute.get("error")
+                                  or installed_droute.get("action")
+                                  or "не установился")
+                    result["components"]["droute"] = {
+                        "ok": False, "version": "", "error": message}
+                    result["errors"].append("Droute: " + message)
+            else:
+                result["components"]["droute"] = {
+                    "ok": True, "version": have, "error": ""}
 
     if versions:
         known.update(versions)

@@ -17,8 +17,8 @@ from pathlib import Path
 from tkinter import filedialog, messagebox
 
 from . import (
-    activity, blocked, components, config, health, presets, routes, status,
-    transfer, xray,
+    activity, blocked, components, config, droute, health, presets, routes,
+    status, transfer, xray,
 )
 from .theme import SPACE, Theme
 from .widgets import (
@@ -851,6 +851,8 @@ class SettingsPage(tk.Frame):
         self.progress_label.pack(side="left", padx=(SPACE["sm"], 0),
                                  fill="x", expand=True)
 
+        self._build_droute(pad)
+
         # --- пути ---
         paths = self._section(pad, "Пути")
         self._label(paths, "Заполняется автоматически: папка zapret "
@@ -913,6 +915,103 @@ class SettingsPage(tk.Frame):
         """
         font = self.theme.caption()
         return max(HEALTH_SWITCH_COLUMN, font.measure("Показывать"))
+
+    # ---- Droute ------------------------------------------------------------
+    def _build_droute(self, parent: tk.Misc) -> None:
+        section = self._section(parent, "Discord: голос через VPN (Droute)")
+        cfg = dict(self.controller.cfg or {})
+        self._label(
+            section,
+            "Голос и демонстрация Discord пойдут через VPN, когда zapret "
+            "выключен; при включённом zapret — напрямую.", caption=True)
+        row = tk.Frame(section, bg=self.theme.card)
+        row.pack(fill="x", pady=(SPACE["sm"], 0))
+        row.columnconfigure(0, weight=1)
+        tk.Label(row, text="Включить", bg=self.theme.card, fg=self.theme.text,
+                 font=self.theme.body(), anchor="w").grid(
+            row=0, column=0, sticky="w")
+        self.droute_toggle = ToggleSwitch(
+            row, self.theme, bool(cfg.get("droute_enabled", False)),
+            command=self._set_droute)
+        self.droute_toggle.grid(row=0, column=1, sticky="e",
+                                padx=(SPACE["md"], 0))
+        self.droute_status = tk.Label(
+            section, text="", bg=self.theme.card, fg=self.theme.text_dim,
+            font=self.theme.caption(), anchor="w", justify="left",
+            wraplength=self.WIDTH - 160)
+        self.droute_status.pack(fill="x", pady=(SPACE["xs"], 0))
+        buttons = tk.Frame(section, bg=self.theme.card)
+        buttons.pack(fill="x", pady=(SPACE["sm"], 0))
+        self.droute_install_button = PillButton(
+            buttons, self.theme, "Установить/Переустановить",
+            self._install_droute, kind="secondary", height=CONTROL_HEIGHT,
+            tooltip="Скачать Droute и прописать его в Discord")
+        self.droute_install_button.pack(side="left")
+        self.droute_remove_button = PillButton(
+            buttons, self.theme, "Удалить", self._remove_droute,
+            kind="secondary", height=CONTROL_HEIGHT,
+            tooltip="Удалить Droute из Discord")
+        self.droute_remove_button.pack(side="left", padx=(SPACE["sm"], 0))
+        self._refresh_droute_status()
+
+    def _refresh_droute_status(self) -> None:
+        label = getattr(self, "droute_status", None)
+        if label is None:
+            return
+        cfg = dict(self.controller.cfg or {})
+        branch = str(cfg.get("droute_branch") or "stable").lower()
+        port = cfg.get("droute_socks_port") or 10819
+        try:
+            bases = droute.discord_bases()
+            base = next((item for item in bases
+                         if droute.discord_branch(item) == branch), None)
+        except Exception:  # noqa: BLE001
+            bases, base = [], None
+        if not bases:
+            text, color = "Discord не установлен", self.theme.warn
+        elif base is None:
+            text, color = f"Discord ({branch}) не найден", self.theme.warn
+        elif droute.installed(base):
+            version = droute.installed_version(base) or "версия неизвестна"
+            configured = droute.configured_port() or port
+            text = f"Установлен · {version} · порт {configured}"
+            color = self.theme.ok
+        else:
+            text, color = "Не установлен", self.theme.text_dim
+        label.configure(text=text, fg=color)
+
+    def _set_droute(self, value: bool) -> None:
+        apply = getattr(self.controller, "set_droute_enabled", None)
+        if callable(apply):
+            try:
+                apply(bool(value))
+                if getattr(self, "droute_status", None) is not None:
+                    self.droute_status.configure(
+                        text="Выполняется…", fg=self.theme.text_dim)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _install_droute(self) -> None:
+        apply = getattr(self.controller, "install_droute", None)
+        if callable(apply):
+            try:
+                apply()
+                if getattr(self, "droute_status", None) is not None:
+                    self.droute_status.configure(
+                        text="Установка запущена…", fg=self.theme.text_dim)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _remove_droute(self) -> None:
+        apply = getattr(self.controller, "remove_droute", None)
+        if callable(apply):
+            try:
+                apply()
+                if getattr(self, "droute_status", None) is not None:
+                    self.droute_status.configure(
+                        text="Удаление запущено…", fg=self.theme.text_dim)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _build_dashboard(self, parent: tk.Misc) -> None:
         """Секция «Дашборд»: состав проверок, порядок строк и видимость."""

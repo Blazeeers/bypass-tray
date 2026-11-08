@@ -234,13 +234,10 @@ def discord_forced_proxy() -> bool:
     return False
 
 
-def restart_discord(via_proxy: bool, port: int) -> dict:
-    """Перезапускает Discord, при необходимости через локальный прокси."""
-    if not sys.platform.startswith("win"):
+def stop_discord(timeout: float = 8.0) -> dict:
+    """Завершает все процессы Discord (без запуска обратно)."""
+    if not sys.platform.startswith("win") or psutil is None:
         return {"ok": False, "action": "unsupported"}
-    base = discord_base()
-    if base is None:
-        return {"ok": False, "action": "absent"}
     pids = discord_pids()
     alive: list = []
     for pid in pids:
@@ -250,7 +247,7 @@ def restart_discord(via_proxy: bool, port: int) -> dict:
             alive.append(process)
         except Exception:  # noqa: BLE001
             continue
-    deadline = time.time() + 8.0
+    deadline = time.time() + max(0.0, float(timeout))
     while alive and time.time() < deadline:
         pending = []
         for process in alive:
@@ -267,6 +264,17 @@ def restart_discord(via_proxy: bool, port: int) -> dict:
             process.kill()
         except Exception:  # noqa: BLE001
             pass
+    return {"ok": True, "action": "stopped", "stopped": len(pids)}
+
+
+def restart_discord(via_proxy: bool, port: int) -> dict:
+    """Перезапускает Discord, при необходимости через локальный прокси."""
+    if not sys.platform.startswith("win"):
+        return {"ok": False, "action": "unsupported"}
+    base = discord_base()
+    if base is None:
+        return {"ok": False, "action": "absent"}
+    stop_discord()
     command = [str(base / "Update.exe"), "--processStart", "Discord.exe"]
     if via_proxy:
         command += [

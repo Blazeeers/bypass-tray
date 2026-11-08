@@ -14,8 +14,8 @@ except ImportError:  # pragma: no cover
     pystray = None
 
 from . import (
-    actions, activity, autostart, config, diagnose, guard, health, history, icons,
-    networks, routes, secrets, status, strategy, updates, xray,
+    actions, activity, autostart, config, diagnose, droute, guard, health, history,
+    icons, networks, routes, secrets, status, strategy, updates, xray,
 )
 from .theme import STATE_COLORS
 from .ui import Panel, clean_server_name, report_level
@@ -83,6 +83,8 @@ class TrayApp:
         # Флаг переживает перезапуск приложения (state.json).
         self._zapret_user_off = bool((self.state or {}).get("zapret_user_off"))
         self._zapret_off_pending = self._zapret_user_off
+        self._droute_checked = False
+        self._droute_warned = False
         # Мы уже сказали «упал»: вернуть ok, когда процесс снова слушает.
         self._tgws_down = False
         self.panel = Panel(self)
@@ -1300,6 +1302,170 @@ class TrayApp:
         self.notify(message)
         self._signature = None
 
+    # ---- Droute ------------------------------------------------------------
+    def _droute_port(self) -> int:
+        try:
+            return int(self.cfg.get("droute_socks_port") or 10819)
+        except (TypeError, ValueError):
+            return 10819
+
+    def _droute_branch(self) -> str:
+        value = str(self.cfg.get("droute_branch") or "stable").lower()
+        return value if value in ("stable", "canary", "ptb") else "stable"
+
+    def _droute_base(self) -> Path | None:
+        branch = self._droute_branch()
+        try:
+            for base in droute.discord_bases():
+                if droute.discord_branch(base) == branch:
+                    return base
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    def _droute_report(self, result: dict, *, enabling: bool = True) -> None:
+        result = result or {}
+        action = str(result.get("action") or "")
+        if result.get("ok"):
+            if action == "present":
+                text = "Droute: уже установлен"
+            elif action == "uninstalled":
+                text = "Droute: удалён"
+            else:
+                version = str(result.get("version") or "")
+                text = "Droute: установлен" + (f" ({version})" if version else "")
+            activity.log(text, kind="ok")
+        elif action == "discord_absent":
+            activity.log("Droute: Discord не установлен", kind="warn")
+        else:
+            activity.log(
+                f"Droute: {action or 'ошибка'} — "
+                f"{result.get('error') or 'неизвестная причина'}", kind="warn")
+        self.refresh_activity()
+        self._signature = None
+
+    def set_droute_enabled(self, value: bool) -> bool:
+        """Тумблер Droute: установить/удалить и сохранить намерение."""
+        value = bool(value)
+        self._signature = None
+        port = self._droute_port()
+        branch = self._droute_branch()
+        if not value:
+            # Выключение — намерение пользователя фиксируем сразу.
+            self.cfg["droute_enabled"] = False
+            config.save_config(self.cfg)
+
+        def close() -> None:
+            actions.stop_discord()
+
+        def reopen() -> None:
+            actions.restart_discord(False, port)
+
+        def action() -> dict:
+            if value:
+                result = droute.ensure(
+                    port, branch, close_discord_cb=close, reopen_cb=reopen)
+            else:
+                result = droute.uninstall(
+                    branch, close_discord_cb=close, reopen_cb=reopen)
+            if value:
+                # Флаг включаем только по факту успешной установки.
+                self.cfg["droute_enabled"] = bool(result.get("ok"))
+                config.save_config(self.cfg)
+            self._droute_report(result, enabling=value)
+            return result
+
+        text = "включаю Droute…" if value else "выключаю Droute…"
+        return self._run_action_busy("droute", text, action)
+
+    def install_droute(self) -> bool:
+        """Ручная установка/переустановка Droute."""
+        port = self._droute_port()
+        branch = self._droute_branch()
+
+        def close() -> None:
+            actions.stop_discord()
+
+        def reopen() -> None:
+            actions.restart_discord(False, port)
+
+        def action() -> dict:
+            result = droute.install(
+                branch, port, close_discord_cb=close, reopen_cb=reopen)
+            self._droute_report(result)
+            return result
+
+        return self._run_action_busy("droute", "устанавливаю Droute…", action)
+
+    def remove_droute(self) -> bool:
+        """Ручное удаление Droute."""
+        port = self._droute_port()
+        branch = self._droute_branch()
+
+        def close() -> None:
+            actions.stop_discord()
+
+        def reopen() -> None:
+            actions.restart_discord(False, port)
+
+        def action() -> dict:
+            result = droute.uninstall(
+                branch, close_discord_cb=close, reopen_cb=reopen)
+            if result.get("ok"):
+                self.cfg["droute_enabled"] = False
+                config.save_config(self.cfg)
+            self._droute_report(result)
+            return result
+
+        return self._run_action_busy("droute", "удаляю Droute…", action)
+
+    def _droute_startup_check(self) -> None:
+        """Тихая проверка установки Droute при старте (без повторов ошибок)."""
+        if not (self.cfg or {}).get("droute_enabled"):
+            return
+        if self.busy.get("droute"):
+            return
+        base = self._droute_base()
+        if base is None:
+            return
+        port = self._droute_port()
+        try:
+            if (droute.installed(base)
+                    and droute.configured_port() == port):
+                return
+            result = droute.ensure(
+                port, self._droute_branch(),
+                close_discord_cb=lambda: actions.stop_discord(),
+                reopen_cb=lambda: actions.restart_discord(False, port))
+        except Exception as exc:  # noqa: BLE001
+            if not self._droute_warned:
+                self._droute_warned = True
+                activity.log(f"Droute: стартовая проверка не удалась: {exc}",
+                             kind="warn")
+            return
+        if result.get("ok"):
+            activity.log("Droute: установлен при старте", kind="info")
+            self.refresh_activity()
+            self._signature = None
+        elif not self._droute_warned:
+            self._droute_warned = True
+            activity.log(
+                f"Droute: не установлен — "
+                f"{result.get('error') or result.get('action') or '?'}",
+                kind="warn")
+
+    def _maybe_droute_startup(self) -> None:
+        if self._droute_checked:
+            return
+        if self.busy.get("droute"):
+            # Не запускаем второй ensure параллельно ручному действию.
+            return
+        self._droute_checked = True
+        if not (self.cfg or {}).get("droute_enabled"):
+            return
+        threading.Thread(target=self._droute_startup_check, daemon=True,
+                         name="droute-startup").start()
+
     def is_autostart(self) -> bool:
         try:
             return autostart.is_enabled()
@@ -2264,6 +2430,7 @@ class TrayApp:
         while not self._shutting_down:
             try:
                 self.refresh()
+                self._maybe_droute_startup()
                 self.check_proxy_health()
                 # Во время обновления/лечения не трогаем режим потока и не
                 # лечим повторно: иначе можно оборвать чужой перезапуск Xray.
