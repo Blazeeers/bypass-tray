@@ -52,6 +52,20 @@
   - Где используется: `bin/geosite-refilter.dat` (категория `REFILTER`),
     обновляется с релизов 1andrevich/Re-filter-lists.
 
+## Голос Discord (Droute, по желанию)
+
+- **Droute** — прокси-поддержка Discord Desktop (TCP+UDP: чат, медиа, голос и
+  демонстрация экрана).
+  - Автор: **snowluwu** — [snowluwu/droute](https://github.com/snowluwu/droute).
+  - Лицензия: **GPL-3.0**.
+  - Где используется: `version.dll` и `droute.dll` в папке `app-*` Discord.
+    Droute **не встраивается** в исходники bypass-tray: пользователь включает
+    его по желанию в настройках, приложение скачивает `droute.zip` с
+    GitHub-релиза и запускает установщик.
+  - Использует [MinHook](https://github.com/TsudaKageyu/minhook) (MIT);
+    вдохновлён [force-proxy](https://github.com/runetfreedom/force-proxy).
+  - Droute — сторонний компонент со своей лицензией, а не часть bypass-tray.
+
 ## Библиотеки Python
 
 Приложение собрано на Python и использует:

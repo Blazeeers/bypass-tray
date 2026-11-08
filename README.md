@@ -16,11 +16,23 @@ Xray, обходит DPI для YouTube и Discord и ускоряет Telegram.
 - **Обход DPI для YouTube и Discord** через zapret: они открываются
   **напрямую**, без VPN, поэтому скорость не падает.
 - **Telegram без тормозов** через локальный MTProto-прокси tg-ws-proxy.
-- **Проверяет, что всё действительно работает:** настоящие запросы к YouTube,
-  Discord, DeepSeek, Telegram и проверку туннеля через ваш сервер — раз в
-  10 минут и по кнопке «Проверить всё».
+- **Тумблер zapret** в панели: выключение гасит службу zapret и драйверы ядра
+  WinDivert/windivert — нужно для игр с античитом (Call of Duty с Ricochet),
+  которые конфликтуют с WinDivert. Включение поднимает обход обратно.
+- **Голос Discord через VPN** благодаря встроенной поддержке Droute (SOCKS5,
+  TCP+UDP). Работает автоматически только при выключенном zapret; при
+  включённом zapret Discord идёт напрямую. Droute ставится по желанию из
+  настроек.
+- **Проверяет, что всё действительно работает:** настоящие запросы к YouTube
+  (страница и видеопоток), Discord, DeepSeek, Telegram и проверку туннеля через
+  ваш сервер — раз в 10 минут и по кнопке «Проверить всё».
+- **DoH-бутстрап** домена подписки Xray — страховка в сетях с фильтрацией DNS.
 - **Само лечится:** поднимает упавший прокси, переключает мёртвый сервер,
   перепроверяет маршруты. Всё, что сделало, пишет в журнал в панели.
+
+**Режим «Игра».** Для античит-игр (например, Call of Duty с Ricochet) выключите
+zapret тумблером: WinDivert выгружается, игра запускается. Discord-голос при
+этом идёт через VPN (Droute), а не напрямую.
 
 [Тёмная тема](docs/img/panel-dark.png) · [Список серверов](docs/img/panel-servers.png) ·
 [Настройки](docs/img/settings-light.png)
@@ -113,6 +125,19 @@ Xray, обходит DPI для YouTube и Discord и ускоряет Telegram.
 - **Список заблокированных сайтов.** Очищенный список Re:filter (81 тыс.
   доменов, MIT): заблокированное идёт через VPN, YouTube и Discord остаются под
   zapret.
+- **Тумблер zapret и режим «Игра».** Выключение гасит службу zapret, `winws` и
+  драйверы WinDivert/windivert; включение возвращает обход. Это нужно для
+  античит-игр: Ricochet не запускается, пока загружен WinDivert.
+- **Голос Discord через VPN (Droute).** Droute ставит DLL в папку Discord и
+  направляет TCP+UDP в SOCKS5 Xray на `127.0.0.1:10819`. Управление — в
+  настройках, установка по желанию; при включённом zapret трафик Discord идёт
+  напрямую.
+- **Правдивые проверки сервисов.** YouTube проверяется не только страницей, но
+  и реальным видеопотоком; сервис, уведённый через VPN, проверяется через
+  прокси, поэтому не показывает ложный сбой. `--health` учитывает ручное
+  выключение zapret.
+- **DoH-бутстрап.** Домен подписки Xray резолвится через DoH до старта туннеля,
+  direct-домены — через `77.88.8.8`.
 - **Автозапуск, автоподключение, тихий режим.** Тумблеры в настройках; тихий
   режим убирает всплывающие уведомления, но значок всегда показывает настоящее
   состояние.
@@ -133,6 +158,12 @@ Xray, обходит DPI для YouTube и Discord и ускоряет Telegram.
 | [zapret-discord-youtube](https://github.com/Flowseal/zapret-discord-youtube) | Windows-сборка zapret и стратегии | Flowseal | MIT |
 | [tg-ws-proxy](https://github.com/Flowseal/tg-ws-proxy) | прокси для Telegram | Flowseal | MIT |
 | [Re:filter-lists](https://github.com/1andrevich/Re-filter-lists) | список заблокированных доменов | Andrevich | MIT |
+| [Droute](https://github.com/snowluwu/droute) | голос и демонстрация Discord через SOCKS5 (TCP+UDP) | snowluwu | GPL-3.0 |
+
+**Droute** ставится по желанию из настроек: приложение скачивает его с
+GitHub-релиза и кладёт DLL в папку Discord; в исходники bypass-tray Droute не
+встраивается. Droute вдохновлён [force-proxy](https://github.com/runetfreedom/force-proxy)
+и использует [MinHook](https://github.com/TsudaKageyu/minhook) (MIT).
 
 Тексты лицензий лежат в [data/licenses/](data/licenses/) и входят в релизный
 архив; подробности — в [THIRD_PARTY.md](THIRD_PARTY.md).
