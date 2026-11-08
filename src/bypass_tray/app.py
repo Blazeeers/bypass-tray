@@ -1410,7 +1410,7 @@ class TrayApp:
 
     def _switch_discord(self, via_proxy: bool) -> None:
         """Перезапускает Discord с прокси (или без) при переключении zapret."""
-        if not (self.cfg or {}).get("discord_switch_on_zapret", True):
+        if not (self.cfg or {}).get("discord_switch_on_zapret", False):
             return
         port = self._discord_proxy_port()
         try:
@@ -1434,6 +1434,22 @@ class TrayApp:
                 kind="warn")
         self.refresh_activity()
 
+    def _rebuild_xray_for_discord(self, via_proxy: bool) -> bool:
+        """Пересобирает конфиг Xray ради правила droute (proxy/direct)."""
+        if self.proxy.get("busy") or not self.proxy.get("running"):
+            return False
+        try:
+            result = xray.restart(self.cfg, discord_via_proxy=via_proxy)
+        except Exception as exc:  # noqa: BLE001
+            activity.log(f"Xray не пересобрался для Droute: {exc}", kind="warn")
+            return False
+        if not result.get("ok"):
+            activity.log(
+                "Xray не пересобрался для Droute: "
+                + str(result.get("error") or "?"), kind="warn")
+            return False
+        return True
+
     def _after_zapret_stopped(self) -> None:
         """B: после ручного выключения zapret уводит сломанные сервисы в VPN."""
         if not isinstance(getattr(self, "proxy", None), dict):
@@ -1454,6 +1470,7 @@ class TrayApp:
         if not broken:
             activity.log("zapret остановлен: YouTube и Discord работают напрямую",
                          kind="info")
+            self._rebuild_xray_for_discord(True)
             self._switch_discord(True)
             self._refresh_after_route_change()
             return
@@ -1464,6 +1481,7 @@ class TrayApp:
                 "zapret остановлен, маршрут через VPN не записан: "
                 + str(applied.get("error") or applied.get("status") or "?"),
                 kind="warn")
+            self._rebuild_xray_for_discord(True)
             self._switch_discord(True)
             self._refresh_after_route_change()
             return
@@ -1471,10 +1489,11 @@ class TrayApp:
             activity.log(
                 f"zapret остановлен: {', '.join(broken)} уже настроены вручную",
                 kind="info")
+            self._rebuild_xray_for_discord(True)
             self._switch_discord(True)
             self._refresh_after_route_change()
             return
-        result = xray.restart(self.cfg)
+        result = xray.restart(self.cfg, discord_via_proxy=True)
         if result.get("ok"):
             activity.log(
                 f"zapret остановлен: {', '.join(broken)} через VPN", kind="ok")
@@ -1518,10 +1537,12 @@ class TrayApp:
                 "zapret включён, но снять маршруты zapret_off не удалось: "
                 + str(removed.get("error") or removed.get("status") or "?"),
                 kind="warn")
+            self._rebuild_xray_for_discord(False)
             self._switch_discord(False)
             self._refresh_after_route_change()
             return
         if not removed.get("removed"):
+            self._rebuild_xray_for_discord(False)
             self._switch_discord(False)
             return
         if self.proxy.get("busy") or not self.proxy.get("running"):
@@ -1531,7 +1552,7 @@ class TrayApp:
             self._switch_discord(False)
             self._refresh_after_route_change()
             return
-        result = xray.restart(self.cfg)
+        result = xray.restart(self.cfg, discord_via_proxy=False)
         if result.get("ok"):
             activity.log("zapret включён: YouTube/Discord снова напрямую",
                          kind="ok")

@@ -989,7 +989,9 @@ def build_config(server: dict, port: int, extra_domains: list[str] | None = None
                  servers: list[dict] | None = None,
                  current_server: dict | None = None,
                  dns_hosts: dict | None = None,
-                 priority_proxy_domains: list[str] | None = None) -> dict:
+                 priority_proxy_domains: list[str] | None = None,
+                 droute_port: int = 10819,
+                 discord_via_proxy: bool = False) -> dict:
     """Конфиг Xray: локальный прокси + маршрутизация.
 
     Маршрут по умолчанию задаёт **первый outbound** — catch-all правила в
@@ -1078,7 +1080,12 @@ def build_config(server: dict, port: int, extra_domains: list[str] | None = None
     priority_set = set(priority_keys)
     if priority_set:
         proxy_keys = [d for d in proxy_keys if d not in priority_set]
-    rules = []
+    rules = [{
+        # Droute (Discord) — отдельный SOCKS-inbound. При выключенном
+        # пользователем zapret его TCP+UDP идут в туннель, иначе напрямую.
+        "type": "field", "inboundTag": ["droute"],
+        "outboundTag": "proxy" if discord_via_proxy else "direct",
+    }]
     if user_direct:
         rules.append({
             "type": "field", "outboundTag": "direct",
@@ -1163,6 +1170,13 @@ def build_config(server: dict, port: int, extra_domains: list[str] | None = None
             "protocol": "mixed",          # SOCKS и HTTP на одном порту
             "settings": {"udp": True, "auth": "noauth"},
             "sniffing": {"enabled": True, "destOverride": ["http", "tls"]},
+        }, {
+            # Отдельный SOCKS для Droute: только локально, TCP+UDP.
+            "tag": "droute",
+            "listen": "127.0.0.1",
+            "port": int(droute_port),
+            "protocol": "socks",
+            "settings": {"auth": "noauth", "udp": True},
         }],
         # ВАЖНО: первый outbound — маршрут по умолчанию. В "blocked" это
         # `direct`, в "all" — сервер: явные правила выше в списке всё равно
@@ -1471,7 +1485,8 @@ def _restart_with_stream(enable: bool, cfg: dict | None = None) -> dict:
 
 def start(cfg: dict | None = None, extra_domains: list[str] | None = None,
           server: dict | None = None, stream_via_proxy: bool = False,
-          direct_domains: list[str] | None = None) -> dict:
+          direct_domains: list[str] | None = None,
+          discord_via_proxy: bool | None = None) -> dict:
     """Поднимает Xray на выбранном сервере и включает системный прокси.
 
     ``direct_domains=None`` — взять оверрайды из ``routes``. Домены прокси из
@@ -1479,7 +1494,8 @@ def start(cfg: dict | None = None, extra_domains: list[str] | None = None,
     поднять два ядра одновременно.
     """
     with _LOCK:
-        return _start(cfg, extra_domains, server, stream_via_proxy, direct_domains)
+        return _start(cfg, extra_domains, server, stream_via_proxy,
+                      direct_domains, discord_via_proxy)
 
 
 def _effective_stream(cfg: dict, stream_via_proxy: bool = False) -> bool:
@@ -1529,10 +1545,21 @@ def _blocked_preset(cfg: dict) -> tuple[str | None, bool]:
 
 def _start(cfg: dict | None = None, extra_domains: list[str] | None = None,
            server: dict | None = None, stream_via_proxy: bool = False,
-           direct_domains: list[str] | None = None) -> dict:
+           direct_domains: list[str] | None = None,
+           discord_via_proxy: bool | None = None) -> dict:
     """Тело ``start`` — вызывается под замком."""
     cfg = cfg or config.load_config()
     stream = _effective_stream(cfg, stream_via_proxy)
+    if discord_via_proxy is None:
+        try:
+            discord_via_proxy = bool(
+                config.load_state().get("zapret_user_off"))
+        except Exception:  # noqa: BLE001
+            discord_via_proxy = False
+    try:
+        droute_port = int(cfg.get("droute_socks_port") or 10819)
+    except (TypeError, ValueError):
+        droute_port = 10819
     if is_running():
         info = status()
         try:
@@ -1610,7 +1637,9 @@ def _start(cfg: dict | None = None, extra_domains: list[str] | None = None,
     built = build_config(server, port, extra, stream, direct_all, user_map,
                          blocked_rule, mode, servers=cached_servers(),
                          current_server=server, dns_hosts=dns_hosts,
-                         priority_proxy_domains=priority_proxy)
+                         priority_proxy_domains=priority_proxy,
+                         droute_port=droute_port,
+                         discord_via_proxy=bool(discord_via_proxy))
     for warning in built.warnings:
         _warn_once(warning, warning)
     payload = json.dumps(built, ensure_ascii=False, indent=2)
@@ -1700,16 +1729,18 @@ def _stop(restore_proxy: bool = True, port: int | None = None) -> dict:
     return {"ok": True, "port": actual_port}
 
 
-def restart(cfg: dict | None = None, server: dict | None = None) -> dict:
+def restart(cfg: dict | None = None, server: dict | None = None,
+            discord_via_proxy: bool | None = None) -> dict:
     with _LOCK:
-        return _restart(cfg, server)
+        return _restart(cfg, server, discord_via_proxy)
 
 
-def _restart(cfg: dict | None = None, server: dict | None = None) -> dict:
+def _restart(cfg: dict | None = None, server: dict | None = None,
+             discord_via_proxy: bool | None = None) -> dict:
     """Тело ``restart`` — вызывается под замком."""
     stop()
     time.sleep(0.5)
-    return start(cfg, server=server)
+    return start(cfg, server=server, discord_via_proxy=discord_via_proxy)
 
 
 def _port_open(port: int) -> bool:

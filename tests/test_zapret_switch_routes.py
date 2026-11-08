@@ -29,6 +29,7 @@ class ZapretSwitchRoutesTests(unittest.TestCase):
         routes.save_overrides({})
         self.logs: list[tuple[str, str]] = []
         self.restarts: list[dict] = []
+        self.restart_kwargs: list[dict] = []
         self.patches = [
             mock.patch.object(app.activity, "log",
                               side_effect=lambda text, kind="info":
@@ -55,8 +56,9 @@ class ZapretSwitchRoutesTests(unittest.TestCase):
             item.start()
             self.addCleanup(item.stop)
 
-    def _restart(self, cfg=None):
+    def _restart(self, cfg=None, **kwargs):
         self.restarts.append(dict(cfg or {}))
+        self.restart_kwargs.append(dict(kwargs))
         return {"ok": True}
 
     def controller(self, *, vpn: bool = True) -> object:
@@ -92,7 +94,7 @@ class ZapretSwitchRoutesTests(unittest.TestCase):
         self.discord = "ok"
         self.controller()._after_zapret_stopped()
         self.assertEqual(routes.load_overrides(), {})
-        self.assertEqual(self.restarts, [])
+        self.assertEqual(len(self.restarts), 1)
 
     def test_stop_without_vpn_does_not_route(self) -> None:
         self.youtube = "bad"
@@ -119,13 +121,13 @@ class ZapretSwitchRoutesTests(unittest.TestCase):
         self.assertEqual(overrides["direct.example"]["route"], "direct")
         self.assertEqual(len(self.restarts), 1)
 
-    def test_start_without_changes_does_not_restart(self) -> None:
+    def test_start_without_route_changes_still_rebuilds(self) -> None:
         routes.save_overrides({
             "googlevideo.com": {"route": "proxy", "source": "escalation",
                                 "since": 1.0, "checked": 1.0},
         })
         self.controller()._after_zapret_started()
-        self.assertEqual(self.restarts, [])
+        self.assertEqual(len(self.restarts), 1)
         self.assertIn("googlevideo.com", routes.load_overrides())
 
     def test_zapret_off_survives_full_audit(self) -> None:
@@ -158,7 +160,7 @@ class ZapretSwitchRoutesTests(unittest.TestCase):
         tray.cfg = {"xray_routes": {"geosite:youtube": "direct"}}
         tray._after_zapret_stopped()
         self.assertEqual(routes.load_overrides(), {})
-        self.assertEqual(self.restarts, [])
+        self.assertEqual(len(self.restarts), 1)
 
 
 if __name__ == "__main__":

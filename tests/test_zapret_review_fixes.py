@@ -112,7 +112,7 @@ class PendingRetryTests(TempData):
                 mock.patch.object(app.health, "_check_discord",
                                   return_value={"state": "ok"}), \
                 mock.patch.object(app.xray, "restart",
-                                  side_effect=lambda cfg=None:
+                                  side_effect=lambda cfg=None, **kwargs:
                                   restarts.append(dict(cfg or {})) or {"ok": True}), \
                 mock.patch.object(app.xray, "status",
                                   return_value={"running": True}), \

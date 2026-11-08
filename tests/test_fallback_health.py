@@ -61,7 +61,7 @@ class HealthFallbackTests(unittest.TestCase):
         self.enabled.append(list(services))
         return {"ok": True, "changed": ["youtube.com"], "status": "changed"}
 
-    def _restart(self, cfg=None):
+    def _restart(self, cfg=None, **kwargs):
         self.restarts.append(dict(cfg or {}))
         return {"ok": True}
 

@@ -424,9 +424,11 @@ DEFAULTS: dict = {
     "autoconnect": False,
     # Принудительно вести YouTube/Discord через VPN (если видео застревает).
     "youtube_via_vpn": False,
-    # Перезапускать клиент Discord через прокси при выключении zapret и
-    # возвращать напрямую при включении (Discord игнорирует системный прокси).
-    "discord_switch_on_zapret": True,
+    # Перезапускать клиент Discord с --proxy-server (устарело: теперь Droute
+    # ходит через отдельный SOCKS-inbound Xray). По умолчанию выключено.
+    "discord_switch_on_zapret": False,
+    # Локальный SOCKS5-inbound для Droute (Discord, TCP+UDP).
+    "droute_socks_port": 10819,
     # Сколько часов журнала показывать в панели.
     "activity_hours": 3,
     # Встроенный список заблокированных доменов Re:filter (data/geosite-refilter.dat).

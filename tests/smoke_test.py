@@ -2093,7 +2093,8 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
 
     xray.saved_server = lambda: saved_server
     xray.switch_to = fake_switch
-    xray.start = lambda cfg=None: calls.setdefault("start", {"ok": True})
+    xray.start = lambda cfg=None, **kwargs: calls.setdefault(
+        "start", {"ok": True})
     xray.stop = lambda *args, **kwargs: calls.setdefault("stop", {"ok": True})
     try:
         started = proxy_app.restart_proxy()
@@ -2650,9 +2651,9 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
     priority = xray.build_config(sample_server, 10899, None, False, None,
                                  {"instagram.com": "direct"})
     priority_rules = priority["routing"]["rules"]
-    check("user direct: правило первое",
-          priority_rules[0].get("outboundTag") == "direct"
-          and "domain:instagram.com" in (priority_rules[0].get("domain") or []))
+    check("user direct: первое обычное правило (после droute)",
+          priority_rules[1].get("outboundTag") == "direct"
+          and "domain:instagram.com" in (priority_rules[1].get("domain") or []))
     priority_proxy = next(r for r in priority_rules if r.get("outboundTag") == "proxy")
     check("user direct вычтен из proxy",
           "domain:instagram.com" not in priority_proxy["domain"])
@@ -2673,8 +2674,8 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
                                    ["instagram.com"], {"instagram.com": "proxy"})
     audit_rules = audit_case["routing"]["rules"]
     check("user proxy важнее audit direct",
-          audit_rules[0].get("outboundTag") == "proxy"
-          and "domain:instagram.com" in (audit_rules[0].get("domain") or []))
+          audit_rules[1].get("outboundTag") == "proxy"
+          and "domain:instagram.com" in (audit_rules[1].get("domain") or []))
     check("audit direct не дублирует user proxy",
           not any("instagram.com" in str(d) and rule.get("outboundTag") == "direct"
                   for rule in audit_rules for d in (rule.get("domain") or [])))

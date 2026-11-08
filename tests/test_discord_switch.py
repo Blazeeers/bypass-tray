@@ -155,10 +155,14 @@ class DiscordZapretIntegrationTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         routes.save_overrides({})
+        restart_patcher = mock.patch.object(
+            app.xray, "restart", return_value={"ok": True})
+        restart_patcher.start()
+        self.addCleanup(restart_patcher.stop)
 
     def controller(self) -> app.TrayApp:
         tray = app.TrayApp.__new__(app.TrayApp)
-        tray.cfg = {}
+        tray.cfg = {"discord_switch_on_zapret": True}
         tray.status = {"zapret": {"running": False}}
         tray.proxy = {"running": True, "busy": False, "port": 10818}
         tray.busy = {}
@@ -288,8 +292,8 @@ class DiscordZapretIntegrationTests(unittest.TestCase):
             tray._after_zapret_started()
         self.assertEqual(calls, [])
 
-    def test_config_default_enables_switch(self) -> None:
-        self.assertTrue(config.DEFAULTS["discord_switch_on_zapret"])
+    def test_config_default_disables_manual_discord_switch(self) -> None:
+        self.assertFalse(config.DEFAULTS["discord_switch_on_zapret"])
         self.assertFalse(config.DEFAULTS["youtube_via_vpn"])
 
 
