@@ -270,7 +270,8 @@ def _why(result: dict) -> str:
     return f"HTTP {result.get('status') or '?'}"
 
 
-def _stream_context(cfg: dict, proxy: dict) -> tuple[bool, int | None]:
+def _stream_context(cfg: dict, proxy: dict,
+                    service: str = "") -> tuple[bool, int | None]:
     """Нужно ли проверять YouTube/Discord через VPN и на каком порту.
 
     Через VPN они идут в резервном режиме (``proxy["stream"]``) или когда
@@ -278,6 +279,10 @@ def _stream_context(cfg: dict, proxy: dict) -> tuple[bool, int | None]:
     всё, кроме РФ, — значит, и они тоже: прямая проба дала бы ложный «сбой».
     Если режим выбран, а прокси не запущен — второй элемент ``None``, проверка
     вернёт «нужен VPN».
+
+    ``service`` учитывает оверрайды ``source="zapret_off"``: после ручного
+    выключения zapret сервис уже идёт через VPN, и health должен проверять его
+    через прокси, а не показывать прямой сбой.
     """
     cfg = cfg or {}
     proxy = proxy or {}
@@ -285,6 +290,20 @@ def _stream_context(cfg: dict, proxy: dict) -> tuple[bool, int | None]:
     all_mode = config.normalise_routing_mode(mode) == "all"
     requested = (all_mode or bool(proxy.get("stream"))
                  or bool(cfg.get("youtube_via_vpn")))
+    if not requested and service:
+        try:
+            from . import routes
+
+            overrides = routes.load_overrides()
+            domains = routes.SERVICE_DOMAINS.get(str(service), ())
+            requested = any(
+                str((overrides.get(domain) or {}).get("route") or "") == "proxy"
+                and str((overrides.get(domain) or {}).get("source") or "")
+                == "zapret_off"
+                for domain in domains
+            )
+        except Exception:  # noqa: BLE001
+            requested = False
     if not requested:
         return False, None
     if not proxy.get("running"):
@@ -543,7 +562,7 @@ def _youtube_video(proxy_port: int | None, timeout: float) -> dict:
 
 
 def _check_youtube(cfg: dict, proxy: dict, timeout: float) -> dict:
-    proxied, port = _stream_context(cfg, proxy)
+    proxied, port = _stream_context(cfg, proxy, "youtube")
     if proxied and port is None:
         return _item("youtube", "YouTube", "off", "нужен VPN", 0)
     where = "через VPN: " if proxied else ""
@@ -579,7 +598,7 @@ def _check_youtube(cfg: dict, proxy: dict, timeout: float) -> dict:
 
 
 def _check_discord(cfg: dict, proxy: dict, timeout: float) -> dict:
-    proxied, port = _stream_context(cfg, proxy)
+    proxied, port = _stream_context(cfg, proxy, "discord")
     if proxied:
         if port is None:
             return _item("discord", "Discord", "off", "нужен VPN", 0)

@@ -123,9 +123,13 @@ def _heal_tgws(cfg: dict, status_state: dict) -> list[dict]:
     return [_action("warn", text)]
 
 
-def _heal_zapret(status_state: dict) -> list[dict]:
+def _heal_zapret(status_state: dict, user_off: bool = False) -> list[dict]:
     zapret = status_state.get("zapret") or {}
     if zapret.get("running"):
+        return []
+    if user_off:
+        # Пользователь выключил zapret тумблером: это намеренное состояние,
+        # а не сбой. Иначе предупреждение спорило бы с его выбором.
         return []
     # UAC из фона не поднимаем: winws стартует только от администратора.
     _log_throttled(ZAPRET_WARN)
@@ -334,7 +338,7 @@ def _heal_routes(cfg: dict) -> list[dict]:
 
 
 def heal(cfg: dict, status_state: dict, proxy: dict,
-         health: dict | None = None) -> list[dict]:
+         health: dict | None = None, zapret_off: bool = False) -> list[dict]:
     """Лечит то, что можно вылечить без UAC. Возвращает список действий."""
     if not (cfg or {}).get("guard_enabled", True):
         return []
@@ -355,7 +359,7 @@ def heal(cfg: dict, status_state: dict, proxy: dict,
         lambda: _heal_tgws(cfg or {}, status_state),
         # VPN — по уже собранному отчёту: сервер мёртв, значит нужен другой.
         lambda: _heal_vpn(cfg or {}, proxy, health),
-        lambda: _heal_zapret(status_state),
+        lambda: _heal_zapret(status_state, zapret_off),
         lambda: _heal_routes(cfg or {}),
     ):
         try:

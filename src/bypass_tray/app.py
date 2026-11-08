@@ -79,6 +79,10 @@ class TrayApp:
         self._last_tgws_restart = 0.0
         # Ручная остановка из меню: пока флаг стоит, сами не поднимаем.
         self._tgws_user_off = False
+        # Пользователь выключил zapret сам: надзиратель не должен спорить.
+        # Флаг переживает перезапуск приложения (state.json).
+        self._zapret_user_off = bool((self.state or {}).get("zapret_user_off"))
+        self._zapret_off_pending = self._zapret_user_off
         # Мы уже сказали «упал»: вернуть ok, когда процесс снова слушает.
         self._tgws_down = False
         self.panel = Panel(self)
@@ -557,7 +561,7 @@ class TrayApp:
     # ---- проверки сервисов, надзиратель, обновления ------------------------
     def run_health(self, heal: bool = False) -> bool:
         """Проверяет сервисы в фоне; ``heal`` — заодно дать надзирателю поработать."""
-        if self.health_running:
+        if self.health_running or (self.busy or {}).get("zapret"):
             return False
         try:
             if strategy.trial_active():
@@ -577,11 +581,13 @@ class TrayApp:
         self._signature = None
         snapshot_status = self.status
         snapshot_proxy = dict(self.proxy)
+        zapret_off = self._zapret_user_off
 
         def worker() -> None:
             ok = False
             try:
-                report = health.collect(self.cfg, snapshot_status, snapshot_proxy)
+                report = health.collect(self.cfg, snapshot_status, snapshot_proxy,
+                                        zapret_off=zapret_off)
                 self.health_report = report
                 ok = True
                 self._apply_level(report)
@@ -591,7 +597,7 @@ class TrayApp:
                 # Лечим только по свежим данным: упавшая проверка — не отчёт.
                 if heal and ok:
                     done = guard.heal(self.cfg, snapshot_status, snapshot_proxy,
-                                      self.health_report)
+                                      self.health_report, zapret_off=zapret_off)
                     self._report_guard(done)
             except Exception as exc:  # noqa: BLE001
                 activity.log(f"лечение не удалось: {exc}", kind="warn")
@@ -619,7 +625,8 @@ class TrayApp:
 
     def run_guard(self) -> bool:
         """Даёт надзирателю один проход (только в фоне)."""
-        if self.guard_running or not self.cfg.get("guard_enabled", True):
+        if (self.guard_running or not self.cfg.get("guard_enabled", True)
+                or (self.busy or {}).get("zapret")):
             return False
         try:
             if strategy.trial_active():
@@ -631,6 +638,7 @@ class TrayApp:
         self.busy["guard"] = "надзиратель…"
         snapshot_status = self.status
         snapshot_proxy = dict(self.proxy)
+        zapret_off = self._zapret_user_off
         # Старый отчёт не повод переключать сервер: лечим по свежим данным.
         try:
             health_minutes = max(1, int(self.cfg.get("health_minutes") or 10))
@@ -642,7 +650,8 @@ class TrayApp:
 
         def worker() -> None:
             try:
-                done = guard.heal(self.cfg, snapshot_status, snapshot_proxy, report)
+                done = guard.heal(self.cfg, snapshot_status, snapshot_proxy,
+                                  report, zapret_off=zapret_off)
                 self._report_guard(done)
             except Exception as exc:  # noqa: BLE001
                 # Падение надзирателя раньше пропадало бесследно: без записи
@@ -850,7 +859,8 @@ class TrayApp:
             self._notify_throttled("guard:" + text, text)
 
     def _maybe_health(self) -> None:
-        if self.updates_running or (self.busy or {}).get("updates"):
+        if (self.updates_running or (self.busy or {}).get("updates")
+                or (self.busy or {}).get("zapret")):
             return
         try:
             minutes = max(1, int(self.cfg.get("health_minutes") or 10))
@@ -861,6 +871,8 @@ class TrayApp:
 
     def _maybe_guard(self) -> None:
         if not self.cfg.get("guard_enabled", True):
+            return
+        if (self.busy or {}).get("zapret"):
             return
         try:
             minutes = max(1, int(self.cfg.get("guard_minutes") or 10))
@@ -1329,17 +1341,34 @@ class TrayApp:
         return True
 
     # ---- запуск компонентов из панели -------------------------------------
-    def _run_action_busy(self, key: str, text: str, fn, *args) -> bool:
+    def _run_action_busy(self, key: str, text: str, fn, *args,
+                         after=None) -> bool:
         if self.busy.get(key):
             return False
         self.busy[key] = text
         self._signature = None
 
         def worker() -> None:
+            ok = True
             try:
-                fn(*args)
-            except Exception as exc:  # noqa: BLE001
-                self.notify(str(exc))
+                try:
+                    fn(*args)
+                except Exception as exc:  # noqa: BLE001
+                    ok = False
+                    # Отказ UAC/службы должен остаться в журнале панели: тост
+                    # Windows молча подавляется фокус-ассистом.
+                    activity.log(f"{text} не удалось: {exc}", kind="warn")
+                    self.refresh_activity()
+                    self.notify(str(exc))
+                if ok and after is not None:
+                    # busy не снимаем до конца after(): глубокая проба и
+                    # перезапуск Xray не должны пускать второй тумблер.
+                    self.refresh()
+                    try:
+                        after()
+                    except Exception as exc:  # noqa: BLE001
+                        activity.log(f"{text} проверка не удалась: {exc}",
+                                     kind="warn")
             finally:
                 self.busy.pop(key, None)
                 self._signature = None
@@ -1348,19 +1377,202 @@ class TrayApp:
         threading.Thread(target=worker, daemon=True, name=f"action-{key}").start()
         return True
 
+    def _direct_stream_states(self) -> dict[str, str]:
+        """Проверяет YouTube/Discord напрямую, без учёта VPN-режима."""
+        timeout = 5.0
+        return {
+            "youtube": str(health._check_youtube(
+                {}, {"running": False}, timeout).get("state") or ""),
+            "discord": str(health._check_discord(
+                {}, {"running": False}, timeout).get("state") or ""),
+        }
+
+    def _refresh_after_route_change(self) -> None:
+        self._signature = None
+        proxy = getattr(self, "proxy", None)
+        if isinstance(proxy, dict):
+            try:
+                self.proxy = {**proxy, **xray.status()}
+            except Exception:  # noqa: BLE001
+                pass
+        refresh = getattr(self, "refresh_activity", None)
+        if callable(refresh):
+            refresh()
+        update = getattr(self, "update_icon", None)
+        if callable(update):
+            update()
+
+    def _after_zapret_stopped(self) -> None:
+        """B: после ручного выключения zapret уводит сломанные сервисы в VPN."""
+        if not isinstance(getattr(self, "proxy", None), dict):
+            return
+        if self.proxy.get("busy") or not self.proxy.get("running"):
+            # VPN ещё не поднят: попробуем позже, когда туннель появится.
+            self._zapret_off_pending = True
+            activity.log(
+                "zapret остановлен, VPN не поднят — YouTube/Discord остаются напрямую",
+                kind="warn")
+            self._refresh_after_route_change()
+            return
+        states = self._direct_stream_states()
+        # Только явный сбой: warn/off — неопределённость, не повод менять
+        # маршрут и рвать Xray.
+        broken = sorted(name for name, state in states.items() if state == "bad")
+        self._zapret_off_pending = False
+        if not broken:
+            activity.log("zapret остановлен: YouTube и Discord работают напрямую",
+                         kind="info")
+            self._refresh_after_route_change()
+            return
+        applied = routes.enable_service_proxy(
+            broken, self.cfg, source="zapret_off")
+        if not applied.get("ok"):
+            activity.log(
+                "zapret остановлен, маршрут через VPN не записан: "
+                + str(applied.get("error") or applied.get("status") or "?"),
+                kind="warn")
+            self._refresh_after_route_change()
+            return
+        if not applied.get("changed"):
+            activity.log(
+                f"zapret остановлен: {', '.join(broken)} уже настроены вручную",
+                kind="info")
+            self._refresh_after_route_change()
+            return
+        result = xray.restart(self.cfg)
+        if result.get("ok"):
+            activity.log(
+                f"zapret остановлен: {', '.join(broken)} через VPN", kind="ok")
+        else:
+            routes.remove_by_source("zapret_off", broken)
+            activity.log(
+                "zapret остановлен, но Xray не перезапустился: "
+                + str(result.get("error") or "?"), kind="warn")
+        self._refresh_after_route_change()
+
+    def _maybe_zapret_off_routes(self) -> None:
+        """M5: повтор маршрутов zapret_off, когда VPN наконец поднялся."""
+        if not getattr(self, "_zapret_user_off", False):
+            return
+        if not getattr(self, "_zapret_off_pending", False):
+            return
+        if (self.status.get("zapret") or {}).get("running"):
+            self._zapret_off_pending = False
+            return
+        if self.busy or self.proxy.get("busy") or not self.proxy.get("running"):
+            return
+        # Снимаем флаг до попытки: неудачная запись не должна спамить каждый
+        # тик. Следующее выключение/включение выставит его заново.
+        self._zapret_off_pending = False
+        try:
+            self._after_zapret_stopped()
+        except Exception as exc:  # noqa: BLE001
+            activity.log(f"повтор маршрутов zapret_off не удался: {exc}",
+                         kind="warn")
+            self.refresh_activity()
+
+    def _after_zapret_started(self) -> None:
+        """C: после включения снимает только оверрайды сценария zapret_off."""
+        self._zapret_off_pending = False
+        if not isinstance(getattr(self, "proxy", None), dict):
+            return
+        removed = routes.remove_by_source("zapret_off", ("youtube", "discord"))
+        if not removed.get("ok"):
+            activity.log(
+                "zapret включён, но снять маршруты zapret_off не удалось: "
+                + str(removed.get("error") or removed.get("status") or "?"),
+                kind="warn")
+            self._refresh_after_route_change()
+            return
+        if not removed.get("removed"):
+            return
+        if self.proxy.get("busy") or not self.proxy.get("running"):
+            activity.log(
+                "zapret включён: маршруты zapret_off сняты, применятся при подключении",
+                kind="info")
+            self._refresh_after_route_change()
+            return
+        result = xray.restart(self.cfg)
+        if result.get("ok"):
+            activity.log("zapret включён: YouTube/Discord снова напрямую",
+                         kind="ok")
+        else:
+            activity.log(
+                "zapret включён, но Xray не перезапустился: "
+                + str(result.get("error") or "?"), kind="warn")
+        self._refresh_after_route_change()
+
+    def _persist_zapret_off(self, value: bool) -> None:
+        """m7: флаг ручного выключения переживает перезапуск приложения."""
+        if not isinstance(getattr(self, "state", None), dict):
+            # Лёгкие тестовые контроллеры без state не должны писать APPDATA.
+            return
+        try:
+            state = dict(self.state)
+            state["zapret_user_off"] = bool(value)
+            if config.save_state(state):
+                self.state = state
+        except Exception:  # noqa: BLE001
+            # Состояние — вспомогательное: его сбой не отменяет действие.
+            pass
+
+    def _confirm_zapret(self, enabled: bool) -> None:
+        """Ставит/снимает флаг ручного выключения по фактическому статусу."""
+        running = bool(((self.status or {}).get("zapret") or {}).get("running"))
+        if enabled and running:
+            self._zapret_user_off = False
+            self._zapret_off_pending = False
+            self._persist_zapret_off(False)
+            self._after_zapret_started()
+        elif not enabled and not running:
+            self._zapret_user_off = True
+            self._persist_zapret_off(True)
+            self._after_zapret_stopped()
+
     def start_zapret(self) -> bool:
         if (self.status.get("zapret") or {}).get("as_service"):
             return self._run_action_busy("zapret", "запускаю службу…",
-                                         actions.control_service, "start")
+                                         actions.control_service, "start",
+                                         after=lambda: self._confirm_zapret(True))
         return self._run_action_busy("zapret", "запускаю zapret…",
-                                     actions.start_zapret, self.cfg)
+                                     actions.start_zapret, self.cfg,
+                                     after=lambda: self._confirm_zapret(True))
 
     def restart_zapret(self) -> bool:
         if (self.status.get("zapret") or {}).get("as_service"):
             return self._run_action_busy("zapret", "перезапускаю службу…",
-                                         actions.control_service, "restart")
+                                         actions.control_service, "restart",
+                                         after=lambda: self._confirm_zapret(True))
         return self._run_action_busy("zapret", "перезапускаю zapret…",
-                                     actions.restart_zapret, self.cfg)
+                                     actions.restart_zapret, self.cfg,
+                                     after=lambda: self._confirm_zapret(True))
+
+    def stop_zapret(self) -> bool:
+        """Ручная остановка: флаг ставится, только если winws реально остановлен."""
+        result: dict = {}
+
+        def action() -> dict:
+            result.update(actions.stop_zapret(self.cfg))
+            if str(result.get("windivert") or "") in ("failed", "denied"):
+                activity.log(
+                    "zapret остановлен, но драйвер WinDivert не погашен — "
+                    "CoD/Ricochet могут блокироваться", kind="warn")
+                self.refresh_activity()
+            return result
+
+        return self._run_action_busy("zapret", "останавливаю zapret…", action,
+                                     after=lambda: self._confirm_zapret(False))
+
+    def set_zapret(self, enabled: bool) -> bool:
+        """Тумблер на дашборде: включает/выключает zapret тем же путём, что меню.
+
+        Состояние берётся из статуса (реальный winws/служба), а не из конфига:
+        иначе переключатель спорил бы с тем, что видно в строке сервиса.
+        """
+        enabled = bool(enabled)
+        if enabled == bool((self.status.get("zapret") or {}).get("running")):
+            return True
+        return self.start_zapret() if enabled else self.stop_zapret()
 
     def start_tgws(self) -> bool:
         # Ручной запуск снимает запрет, поставленный «Остановить».
@@ -1489,6 +1701,11 @@ class TrayApp:
                 return
         except Exception:  # noqa: BLE001
             pass
+        if getattr(self, "_zapret_user_off", False):
+            # Пользователь выключил zapret вручную: маршрутами занимается
+            # сценарий zapret_off, глобальный stream-fallback не дублируем.
+            self._stream_since = None
+            return
         if not self.cfg.get("xray_stream_fallback", True):
             return
         if self.cfg.get("youtube_via_vpn"):
@@ -1735,16 +1952,16 @@ class TrayApp:
 
         if service_mode:
             zapret_items = [
-                pystray.MenuItem("Перезапустить службу", lambda icon, item: self.run_action(actions.control_service, "restart")),
-                pystray.MenuItem("Остановить службу", lambda icon, item: self.run_action(actions.control_service, "stop")),
-                pystray.MenuItem("Запустить службу", lambda icon, item: self.run_action(actions.control_service, "start")),
+                pystray.MenuItem("Перезапустить службу", lambda icon, item: self.restart_zapret()),
+                pystray.MenuItem("Остановить службу", lambda icon, item: self.stop_zapret()),
+                pystray.MenuItem("Запустить службу", lambda icon, item: self.start_zapret()),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Сменить стратегию службы…", lambda icon, item: self.run_action(actions.open_service_bat, self.cfg)),
             ]
         else:
             zapret_items = [
-                pystray.MenuItem("Запустить", lambda icon, item: self.run_action(actions.start_zapret, self.cfg)),
-                pystray.MenuItem("Остановить", lambda icon, item: self.run_action(actions.stop_zapret, self.cfg)),
+                pystray.MenuItem("Запустить", lambda icon, item: self.start_zapret()),
+                pystray.MenuItem("Остановить", lambda icon, item: self.stop_zapret()),
             ]
 
         proxy_running = bool(self.proxy.get("running"))
@@ -1991,6 +2208,7 @@ class TrayApp:
                 # лечим повторно: иначе можно оборвать чужой перезапуск Xray.
                 if not self.busy and not self.updates_running:
                     self.check_stream_fallback()
+                    self._maybe_zapret_off_routes()
                     self._maybe_guard()
                 self._maybe_health()
             except Exception:  # noqa: BLE001

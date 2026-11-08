@@ -25,7 +25,7 @@ from .settings_ui import SettingsPage
 from .theme import SPACE, TYPE, Theme, resolve_dark
 from .widgets import (
     ActionTile, AnimatedSection, Card, Chip, Divider, HoverRow, IconButton,
-    PillButton, ScrollBody, StatusDot, Tooltip,
+    PillButton, ScrollBody, StatusDot, ToggleSwitch, Tooltip,
 )
 
 WINDOW_W = 720
@@ -1637,9 +1637,22 @@ class Panel:
                 button.grid(row=0, column=2, rowspan=2, sticky="e")
                 button.grid_remove()
 
+            switch = None
+            if key == "zapret":
+                # Тумблер показывает фактическое состояние winws, а не конфиг:
+                # после неудачного UAC он обязан вернуться к правде.
+                switch = ToggleSwitch(
+                    grid_frame, theme, False, command=self._set_zapret,
+                    tooltip="Zapret: вкл/выкл — запустить или остановить "
+                            "обход DPI (winws.exe)")
+                switch.grid(row=0, column=3, rowspan=2, sticky="e",
+                            padx=(SPACE["sm"], 0))
+                cell.track(switch)
+
             self._services[key] = {
                 "cell": cell, "grid": grid_frame, "dot": dot, "name": name,
                 "detail": detail, "state": state, "button": button,
+                "switch": switch,
             }
             for widget in (dot, name, detail, state):
                 cell.track(widget)
@@ -2055,6 +2068,12 @@ class Panel:
         if callable(select):
             self._call(select, name)
 
+    def _set_zapret(self, value: bool) -> None:
+        """Тумблер строки zapret: действие — у контроллера, панель не ждёт."""
+        set_zapret = getattr(self.controller, "set_zapret", None)
+        if callable(set_zapret):
+            self._call(set_zapret, bool(value))
+
     def _service_fallback(self, key: str, status: dict) -> tuple[str, str]:
         zapret = status.get("zapret") or {}
         tgws = status.get("tgwsproxy") or {}
@@ -2076,6 +2095,11 @@ class Panel:
         self._ensure_services()
         theme = self._theme
         zapret_status = status.get("zapret") or {}
+        zapret_busy = bool(busy.get("zapret"))
+        # Служба Windows ставит zapret без каталога в конфиге:
+        # as_service=True означает «установлен» не хуже, чем dir.
+        installed = bool(zapret_status.get("dir")
+                         or zapret_status.get("as_service"))
         for record in self._services_order:
             key = str(record.get("id") or "")
             row = self._services.get(key)
@@ -2096,6 +2120,16 @@ class Panel:
             row["detail"].configure(text=detail)
             row["state"].configure(text=_STATE_WORDS.get(state, "—"), fg=color)
 
+            switch = row.get("switch")
+            if switch is not None:
+                switch.set_enabled(installed and not zapret_busy
+                                   and not busy.get("health"))
+                # Пока действие идёт, не перебиваем выбор пользователя: после
+                # ответа refresh принесёт фактическое состояние (или вернёт
+                # прежнее, если операция не удалась).
+                if not zapret_busy:
+                    switch.set(bool(zapret_status.get("running")))
+
             button = row["button"]
             if button is None:
                 continue
@@ -2107,16 +2141,12 @@ class Panel:
             button.grid()
 
             if key == "zapret":
-                # Служба Windows ставит zapret без каталога в конфиге:
-                # as_service=True означает «установлен» не хуже, чем dir.
-                installed = bool(zapret_status.get("dir")
-                                 or zapret_status.get("as_service"))
                 restart = bool(zapret_status.get("running"))
                 button.set_text("Перезапустить" if restart else "Запустить")
                 action = (self.controller.restart_zapret if restart
                           else self.controller.start_zapret)
                 button.set_command(lambda a=action: self._call(a))
-                button.set_enabled(installed and not busy.get("zapret")
+                button.set_enabled(installed and not zapret_busy
                                    and not busy.get("health"))
             else:
                 tgws = status.get("tgwsproxy") or {}

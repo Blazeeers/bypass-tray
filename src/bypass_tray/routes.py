@@ -15,6 +15,7 @@ YouTube и Discord аудитом не управляются: их маршру
 from __future__ import annotations
 
 import concurrent.futures
+import functools
 import http.client
 import json
 import os
@@ -54,6 +55,19 @@ SERVICE_DOMAINS: dict[str, tuple[str, ...]] = {
 
 #: Префиксы правил Xray, которые нельзя превращать в имя хоста.
 _KEEP_PREFIXES = ("geosite:", "geoip:", "full:", "regexp:", "keyword:", "ext:")
+
+#: Read-modify-write ``route_overrides.json`` из health/guard/аудита/тумблера.
+#: Один RLock: write читает файл, меняет и пишет поверх — параллельная запись
+#: потеряла бы чужие изменения.
+_OVERRIDE_LOCK = threading.RLock()
+
+
+def _serialised(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _OVERRIDE_LOCK:
+            return fn(*args, **kwargs)
+    return wrapper
 
 
 def clean_domain(value: str) -> str:
@@ -597,6 +611,7 @@ def load_overrides() -> dict:
     return dict(_load_file()["routes"])
 
 
+@_serialised
 def save_overrides(data: dict, at: float | None = None) -> bool:
     """Пишет маршруты и время аудита атомарно.
 
@@ -642,10 +657,10 @@ def _compute_overrides(result: dict, cfg: dict, overrides: dict,
             overrides.pop(domain, None)
             continue
         previous = overrides.get(domain) or {}
-        # Оверрайд эскалации (fallback) — не решение аудита: полный аудит не
-        # должен его перезаписывать или стирать. Снять его может только
-        # пользователь (xray_routes выше) или отдельное восстановление.
-        if str(previous.get("source") or "") == "escalation":
+        # Оверрайд с источником (эскалация, zapret_off) — не решение аудита:
+        # полный аудит не должен его перезаписывать или стирать. Снять его
+        # может только пользователь (xray_routes выше) или отдельный сценарий.
+        if str(previous.get("source") or ""):
             continue
         if route == "broken" and previous.get("route") in ("direct", "proxy"):
             # Один сбой не должен ломать последний рабочий маршрут.
@@ -677,14 +692,15 @@ def _compute_overrides(result: dict, cfg: dict, overrides: dict,
                 continue
             if domain not in audited:
                 info = overrides.get(domain) or {}
-                if str((info or {}).get("source") or "") == "escalation":
-                    # Эскалация живёт вне области аудита: YouTube/Discord
-                    # аудит не проверяет и не должен вычищать их маршрут.
+                if str((info or {}).get("source") or ""):
+                    # Оверрайды с источником живут вне области аудита:
+                    # YouTube/Discord аудит не проверяет и не должен чистить.
                     continue
                 overrides.pop(domain, None)
     return overrides
 
 
+@_serialised
 def apply_audit(result: dict, cfg: dict | None = None,
                 reason: str = "manual") -> dict:
     """Переносит результат аудита в оверрайды.
@@ -866,6 +882,7 @@ def _changed_domains(current: dict, target: dict) -> list[str]:
     return changed
 
 
+@_serialised
 def rollback_last(cfg: dict | None = None) -> dict:
     """Возвращает предыдущий снимок в ``route_overrides.json``.
 
@@ -1072,8 +1089,10 @@ def _manual_covers(service: str, domain: str, manual: set[str]) -> bool:
     return False
 
 
+@_serialised
 def enable_service_proxy(services, cfg: dict | None = None,
-                         reason: str = "override") -> dict:
+                         reason: str = "override",
+                         source: str = "escalation") -> dict:
     """Пишет proxy-оверрайды для сломанных сервисов.
 
     Возвращает ``{"ok", "changed", "status", "error"}``. ``status`` различает
@@ -1082,8 +1101,9 @@ def enable_service_proxy(services, cfg: dict | None = None,
     через VPN».
 
     Ручные правила ``xray_routes`` и подтверждённые аудитом ``direct``-
-    оверрайды не трогаются. Новые записи помечаются ``source: "escalation"``:
-    полный аудит маршрутов их не вычищает, пока маршрут не снят явно.
+    оверрайды не трогаются. Новые записи помечаются ``source`` (по умолчанию
+    ``"escalation"``; тумблер zapret пишет ``"zapret_off"``): полный аудит
+    маршрутов их не вычищает, пока маршрут не снят явно.
     Повреждённый файл не перезаписывается, байты уходят в ``.broken-`` копию.
     Перед записью делается снимок для ``rollback_last``; если запись не
     удалась, осиротевший снимок удаляется. Время аудита (``at``) сохраняется.
@@ -1118,8 +1138,8 @@ def enable_service_proxy(services, cfg: dict | None = None,
                 continue
             overrides[domain] = {
                 "route": "proxy", "since": now, "checked": now,
-                # Метка источника: аудит не должен вычищать эскалацию.
-                "source": "escalation",
+                # Метка источника: аудит не должен вычищать такие оверрайды.
+                "source": str(source or "escalation"),
             }
             changed.append(domain)
     if not changed:
@@ -1140,6 +1160,51 @@ def enable_service_proxy(services, cfg: dict | None = None,
         return {"ok": False, "changed": [], "status": "write",
                 "error": last_write_error() or "маршруты не записались"}
     return {"ok": True, "changed": changed, "status": "changed"}
+
+
+@_serialised
+def remove_by_source(source: str, services=None,
+                     reason: str = "override") -> dict:
+    """Снимает оверрайды заданного источника (например ``zapret_off``).
+
+    ``services`` ограничивает набор доменов сервисами (``youtube``/``discord``/
+    ``telegram``); ``None`` — все записи этого источника. Ручные
+    ``xray_routes`` и оверрайды других источников не трогаются. Атомарно,
+    со снимком и сохранением времени аудита.
+    """
+    wanted: set[str] | None = None
+    if services is not None:
+        wanted = set()
+        for service in services:
+            wanted.update(SERVICE_DOMAINS.get(str(service or "").lower(), ()))
+    current_file, read_error = _read_state()
+    if read_error:
+        copy = _preserve_broken()
+        return {"ok": False, "removed": [], "status": "broken",
+                "error": read_error, "broken_copy": copy}
+    overrides = dict(current_file["routes"])
+    removed = [
+        domain for domain, info in overrides.items()
+        if str((info or {}).get("source") or "") == str(source)
+        and (wanted is None or domain in wanted)
+    ]
+    if not removed:
+        return {"ok": True, "removed": [], "status": "unchanged"}
+    for domain in removed:
+        overrides.pop(domain, None)
+    snapshot = _snapshot_save(reason)
+    if snapshot is None:
+        return {"ok": False, "removed": [], "status": "snapshot",
+                "error": last_write_error() or "снимок не сохранился"}
+    if not save_overrides(overrides, at=float(current_file.get("at") or 0)):
+        try:
+            snapshot.unlink()
+        except OSError:
+            pass
+        _snapshot_cache_reset()
+        return {"ok": False, "removed": [], "status": "write",
+                "error": last_write_error() or "маршруты не записались"}
+    return {"ok": True, "removed": sorted(removed), "status": "removed"}
 
 
 def due(minutes: int) -> bool:
