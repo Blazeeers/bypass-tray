@@ -869,7 +869,9 @@ class TrayApp:
         except (TypeError, ValueError):
             minutes = 10
         if not self.health_running and time.time() - self.health_at >= minutes * 60:
-            self.run_health()
+            # heal вместе с проверкой: надзиратель получает СВЕЖИЙ отчёт, а не
+            # кэш двадцатиминутной давности (иначе переключал по устаревшим данным).
+            self.run_health(heal=True)
 
     def _maybe_guard(self) -> None:
         if not self.cfg.get("guard_enabled", True):
@@ -1600,6 +1602,57 @@ class TrayApp:
                 kind="warn")
         self.refresh_activity()
 
+    def _verify_tunnel_after_restart(self, result: dict, reason: str) -> None:
+        """После рестарта Xray проверяет туннель и меняет мёртвый сервер.
+
+        ``restart`` поднимает ядро на том же сервере: если он проходит TCP, но
+        REALITY-хендшейк оборван, порт открыт, а туннель мёртв. Поэтому — запрос
+        через прокси, а при провале — ``switch_server``: он выбирает сервер,
+        который доказал живость тем же запросом (TCP-открытый не в счёт).
+        Без ``port`` в ответе (заглушка/сбой) проверять нечего.
+
+        Текущий сервер берём из ``result`` (``restart``/``_start`` отдают
+        фактический ``server``), ``xray.status()`` — только запасной источник:
+        ``self.proxy`` мог устареть, и тогда исключение не сработало бы.
+        Бюджет здесь короткий (2 кандидата, без повторного чтения подписки):
+        это реакция на рестарт, а не полный перебор.
+        """
+        if not isinstance(result, dict) or not result.get("ok") or not result.get("port"):
+            return
+        try:
+            probe = xray.verify(target=xray.TUNNEL_VERIFY_TARGET, timeout=5.0)
+        except Exception as exc:  # noqa: BLE001
+            probe = {"ok": False, "error": type(exc).__name__}
+        if probe.get("ok"):
+            return
+        failed = set(getattr(self, "_failed_servers", set()))
+        current_server = result.get("server")
+        if not isinstance(current_server, dict) or not current_server:
+            try:
+                current_server = xray.status()
+            except Exception:  # noqa: BLE001
+                current_server = {}
+        current = {str(current_server.get(key) or "")
+                   for key in ("host", "name", "server")} - {""}
+        try:
+            switched = xray.switch_server(failed | current, self.cfg,
+                                          limit=2, rescan=False, timeout=5.0)
+        except Exception as exc:  # noqa: BLE001
+            switched = {"ok": False, "error": str(exc)}
+        if switched.get("ok"):
+            server = switched.get("server") or {}
+            name = str(server.get("name") or server.get("host") or "другой")
+            self.server_selected = str(server.get("name") or "")
+            self._reset_health()
+            activity.log(f"{reason}: сервер заменён на проверенный ({name})",
+                         kind="ok")
+            self.proxy = {**self.proxy, "busy": False, **xray.status()}
+        else:
+            activity.log(
+                f"{reason}: туннель не поднялся, рабочий сервер не найден: "
+                + str(switched.get("error") or "?"), kind="warn")
+        self.refresh_activity()
+
     def _rebuild_xray_for_discord(self, via_proxy: bool) -> bool:
         """Пересобирает конфиг Xray ради правила droute (proxy/direct)."""
         if self.proxy.get("busy") or not self.proxy.get("running"):
@@ -1614,6 +1667,7 @@ class TrayApp:
                 "Xray не пересобрался для Droute: "
                 + str(result.get("error") or "?"), kind="warn")
             return False
+        self._verify_tunnel_after_restart(result, "перезапуск Xray")
         return True
 
     def _after_zapret_stopped(self) -> None:
@@ -1663,6 +1717,8 @@ class TrayApp:
         if result.get("ok"):
             activity.log(
                 f"zapret остановлен: {', '.join(broken)} через VPN", kind="ok")
+            self._verify_tunnel_after_restart(
+                result, "zapret остановлен: перезапуск Xray")
         else:
             routes.remove_by_source("zapret_off", broken)
             activity.log(
@@ -1722,6 +1778,8 @@ class TrayApp:
         if result.get("ok"):
             activity.log("zapret включён: YouTube/Discord снова напрямую",
                          kind="ok")
+            self._verify_tunnel_after_restart(
+                result, "zapret включён: перезапуск Xray")
         else:
             activity.log(
                 "zapret включён, но Xray не перезапустился: "
@@ -2438,6 +2496,9 @@ class TrayApp:
                     self.check_stream_fallback()
                     self._maybe_zapret_off_routes()
                     self._maybe_guard()
+                # Проверку не прячем в блок занятости: иначе во время долгой
+                # операции отчёт стареет, и guard лечит по кэшу. run_health(
+                # heal=True) сам лечит уже по свежему отчёту.
                 self._maybe_health()
             except Exception:  # noqa: BLE001
                 pass

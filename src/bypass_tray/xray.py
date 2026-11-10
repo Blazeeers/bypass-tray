@@ -59,6 +59,15 @@ SUPPORTED_SCHEMES = ("vless", "vmess", "trojan", "ss")
 PROBE_TIMEOUT = 5.0
 SEARCH_BUDGET = 25.0
 
+#: Живость проверяется запросом через поднятый туннель, а не TCP-коннектом:
+#: у мёртвого сервера порт 443 открыт, но REALITY-хендшейк обрывается.
+TUNNEL_VERIFY_TARGET = "api.telegram.org"
+TUNNEL_VERIFY_TIMEOUT = 8.0
+#: Сколько кандидатов проверяем за один вызов переключения (суммарно на оба
+#: прохода). Каждый — перезапуск ядра и запрос через туннель, поэтому длинный
+#: список не гоняем целиком: следующий вызов начнёт с ещё не проверенных.
+SWITCH_VERIFY_LIMIT = 3
+
 #: Файлы ядра, которые держим рядом с приложением.
 CORE_FILES = ("xray.exe", "geoip.dat", "geosite.dat")
 #: Официальный релиз Xray-core для Windows x64 — если своих файлов нет.
@@ -738,7 +747,11 @@ def parse_link(link: str) -> dict:
 
 
 def probe_server(server: dict, timeout: float = 5.0) -> int:
-    """TCP-доступность сервера. Возвращает задержку в мс или -1."""
+    """TCP-доступность сервера. Возвращает задержку в мс или -1.
+
+    Это только предварительный фильтр: открытый порт не значит, что
+    REALITY-хендшейк проходит. Живость подтверждает ``probe_tunnel``.
+    """
     started = time.perf_counter()
     try:
         with socket.create_connection((server["host"], server["port"]), timeout=timeout):
@@ -1846,6 +1859,11 @@ def verify(target: str = "www.instagram.com", timeout: float = 10.0) -> dict:
 
     Запрос идёт на заблокированный сайт, то есть обязательно через сервер, —
     так проверяется именно туннель, а не просто «порт открыт».
+
+    Успех — любой HTTP-ответ ниже 500. Код 4xx не ошибка туннеля: TLS до
+    цели уже состоялся, а ``api.telegram.org/`` на корень штатно отдаёт 404.
+    Прежнее условие 200–399 объявляло рабочий туннель мёртвым, и трей
+    переключал живые серверы по кругу.
     """
     import http.client
     import ssl
@@ -1862,7 +1880,7 @@ def verify(target: str = "www.instagram.com", timeout: float = 10.0) -> dict:
         connection.request("GET", "/", headers={"User-Agent": "Mozilla/5.0"})
         response = connection.getresponse()
         response.read(512)
-        return {"ok": 200 <= response.status < 400, "status": response.status,
+        return {"ok": 0 < response.status < 500, "status": response.status,
                 "ms": round((time.perf_counter() - started) * 1000)}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": type(exc).__name__,
@@ -1873,6 +1891,42 @@ def verify(target: str = "www.instagram.com", timeout: float = 10.0) -> dict:
                 connection.close()
             except Exception:  # noqa: BLE001
                 pass
+
+
+def _apply_verified(server: dict, cfg: dict | None = None,
+                    target: str = TUNNEL_VERIFY_TARGET,
+                    timeout: float = TUNNEL_VERIFY_TIMEOUT) -> dict:
+    """Применяет сервер и подтверждает живость запросом через туннель.
+
+    ``switch_to`` сообщает ``ok`` уже по открытому порту; у мёртвого сервера
+    порт тоже открыт. Поэтому здесь дополнительно идёт ``verify``. Без
+    ``port`` в ответе (заглушка в тестах, чужой контракт) проверять нечего —
+    доверяем флагу ``switch_to``. Как и в health, первый провал ещё не
+    приговор: живой медленный сервер может один раз не ответить, поэтому
+    повторяем запрос, и только два провала означают «мёртв».
+    """
+    result = switch_to(server, cfg)
+    if not result.get("ok") or not result.get("port"):
+        return result
+    probe = verify(target=target, timeout=timeout)
+    if not probe.get("ok"):
+        time.sleep(0.5)
+        probe = verify(target=target, timeout=timeout)
+    result = dict(result)
+    result["verify"] = probe
+    result["ok"] = bool(probe.get("ok"))
+    if not result["ok"]:
+        result["error"] = ("сервер открыт, но запрос через туннель не прошёл: "
+                           + str(probe.get("error")
+                                 or f"HTTP {probe.get('status') or '?'}"))
+    return result
+
+
+def probe_tunnel(server: dict, cfg: dict | None = None,
+                 target: str = TUNNEL_VERIFY_TARGET,
+                 timeout: float = TUNNEL_VERIFY_TIMEOUT) -> bool:
+    """Живой ли сервер: применяет его и проверяет запрос через туннель."""
+    return bool(_apply_verified(server, cfg, target, timeout).get("ok"))
 
 
 def switch_to(server: dict, cfg: dict | None = None) -> dict:
@@ -1895,31 +1949,97 @@ def _switch_to(server: dict, cfg: dict | None = None) -> dict:
                  stream_via_proxy=stream)
 
 
-def switch_server(exclude: set[str] | None = None, cfg: dict | None = None) -> dict:
-    """Подбирает другой сервер (кроме тех, что уже подвели) и переключается."""
-    with _LOCK:
-        return _switch_server(exclude, cfg)
+def switch_server(exclude: set[str] | None = None, cfg: dict | None = None,
+                  limit: int = SWITCH_VERIFY_LIMIT, rescan: bool = True,
+                  timeout: float = TUNNEL_VERIFY_TIMEOUT) -> dict:
+    """Подбирает другой сервер (кроме тех, что уже подвели) и переключается.
+
+    Замок на весь перебор не держим: ``switch_to`` берёт его коротко на
+    применение одного кандидата, а ``scan_servers`` и проверки идут без него.
+    ``limit`` — бюджет кандидатов суммарно, ``rescan=False`` отключает
+    повторное чтение подписки, ``timeout`` — предел одного запроса.
+    """
+    return _switch_server(exclude, cfg, limit, rescan, timeout)
 
 
-def _switch_server(exclude: set[str] | None = None, cfg: dict | None = None) -> dict:
-    """Тело ``switch_server`` — вызывается под замком."""
-    exclude = exclude or set()
+def _server_row_ids(row: dict) -> set[str]:
+    """Опознание сервера из списка: и ``host``, и ``name`` (guard пишет оба)."""
+    row = row or {}
+    return {str(row.get(key) or "").strip()
+            for key in ("host", "name")} - {""}
+
+
+def _switch_candidates(rows: list[dict], exclude: set[str], cfg: dict | None,
+                       limit: int,
+                       timeout: float = TUNNEL_VERIFY_TIMEOUT
+                       ) -> tuple[dict, set[str], int]:
+    """Проверяет кандидатов по порядку, пока один не пройдёт туннель.
+
+    Возвращает результат первого живого сервера, опознание всех, кого успели
+    применить, и сколько кандидатов реально проверено: это общий бюджет.
+    """
+    candidates = [r for r in rows if not (_server_row_ids(r) & exclude)]
+    if not candidates:
+        # Все серверы уже подвели: не оставляем пользователя без попытки.
+        candidates = list(rows)
+    candidates.sort(key=lambda r: float(r.get("latency") or 9999))
+    attempted: set[str] = set()
+    used = 0
+    last: dict = {"ok": False, "error": "нет доступных серверов"}
+    for chosen in candidates[:max(1, int(limit))]:
+        used += 1
+        attempted |= _server_row_ids(chosen)
+        try:
+            server = parse_link(chosen["link"])
+        except Exception as exc:  # noqa: BLE001
+            last = {"ok": False, "error": f"сервер не разобран: {type(exc).__name__}"}
+            continue
+        server["latency"] = chosen.get("latency", -1)
+        result = _apply_verified(server, cfg, timeout=timeout)
+        if result.get("ok"):
+            return result, attempted, used
+        last = result
+    return last, attempted, used
+
+
+def _switch_server(exclude: set[str] | None = None, cfg: dict | None = None,
+                   limit: int = SWITCH_VERIFY_LIMIT, rescan: bool = True,
+                   timeout: float = TUNNEL_VERIFY_TIMEOUT) -> dict:
+    """Тело ``switch_server``: ``limit`` кандидатов суммарно на оба прохода.
+
+    Сервер считается подходящим только после запроса через туннель: открытый
+    TCP-порт у мёртвого сервера ничего не доказывает. Перебор идёт по
+    задержке; если бюджет не исчерпан и список кэша не подошёл — один раз
+    перечитываем подписку (``scan_servers``), вдруг он устарел.
+    """
+    exclude = set(exclude or ())
+    limit = max(1, int(limit))
     rows = cached_servers()
+    scanned = False
     if not rows:
-        rows = scan_servers()
-    # Исключение может прийти и как имя, и как хост: guard пишет оба.
-    candidates = [r for r in rows
-                  if not ({str(r.get("host") or ""),
-                           str(r.get("name") or "")} & exclude)]
-    if not candidates:
-        candidates = rows
-    if not candidates:
-        return {"ok": False, "error": "нет доступных серверов"}
-    candidates.sort(key=lambda r: r.get("latency", 9999))
-    chosen = candidates[0]
-    server = parse_link(chosen["link"])
-    server["latency"] = chosen.get("latency", -1)
-    return switch_to(server, cfg)
+        try:
+            rows = scan_servers()
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"серверы недоступны: {type(exc).__name__}"}
+        scanned = True
+    result, attempted, used = _switch_candidates(
+        rows, exclude, cfg, limit, timeout)
+    if result.get("ok") or scanned or not rescan or used >= limit:
+        return result
+    try:
+        fresh = scan_servers()
+    except Exception as exc:  # noqa: BLE001
+        # Сеть/подписка подвели — отдаём настоящую причину последнего сервера.
+        result = dict(result)
+        result.setdefault("error", f"список серверов не обновился: {type(exc).__name__}")
+        return result
+    # Уже проверенных в этом вызове не гоняем повторно.
+    fresh = [r for r in fresh if not (_server_row_ids(r) & (exclude | attempted))]
+    if not fresh:
+        return result
+    retried, _, _ = _switch_candidates(
+        fresh, exclude | attempted, cfg, limit - used, timeout)
+    return retried
 
 
 # ---- системный прокси -----------------------------------------------------
@@ -2020,6 +2140,13 @@ def _proxy_bypass_list(stream_via_proxy: bool | None = None) -> str:
         cfg = {}
     user_direct, user_proxy = routes.user_routes(cfg)
     proxy_set = set(user_proxy)
+    try:
+        # audit-эскалация (source=escalation) уже ведёт домен через Xray:
+        # такой домен нельзя исключать из системного прокси, иначе браузер
+        # пойдёт direct и минует рабочий маршрут через VPN.
+        proxy_set |= {str(d).strip().lower() for d in routes.proxy_domains() if d}
+    except Exception:  # noqa: BLE001
+        pass
     try:
         audit_direct = routes.direct_domains()
     except Exception:  # noqa: BLE001
