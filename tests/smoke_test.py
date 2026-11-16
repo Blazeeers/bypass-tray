@@ -32,6 +32,7 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+import winreg
 from pathlib import Path
 
 from PIL import Image
@@ -55,6 +56,90 @@ LIVE = os.environ.get("BYPASS_TRAY_LIVE") == "1"
 
 RESULTS: list[tuple[bool, str]] = []
 SKIPPED: list[tuple[str, str]] = []
+
+#: Настоящий реестр: нужен только для проверки «smoke его не меняет».
+REAL_WINREG = winreg
+_INTERNET_SETTINGS = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+
+
+class _FakeRegKey:
+    def __init__(self, values: dict) -> None:
+        self.values = values
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def Close(self) -> None:
+        pass
+
+
+class _FakeWinreg:
+    """Подмена winreg на время smoke: HKCU/HKLM тест не трогает."""
+
+    HKEY_CURRENT_USER = object()
+    HKEY_LOCAL_MACHINE = object()
+    KEY_QUERY_VALUE = 1
+    KEY_SET_VALUE = 2
+    REG_DWORD = 4
+    REG_SZ = 1
+
+    def __init__(self) -> None:
+        self.values: dict = {}
+        self.writes = 0
+
+    def CreateKeyEx(self, *_args, **_kwargs):
+        return _FakeRegKey(self.values)
+
+    def OpenKey(self, *_args, **_kwargs):
+        return _FakeRegKey(self.values)
+
+    def QueryValueEx(self, key, name):
+        if name not in key.values:
+            raise FileNotFoundError(name)
+        return key.values[name], self.REG_SZ
+
+    def SetValueEx(self, key, name, _reserved, _kind, value) -> None:
+        key.values[name] = value
+        self.writes += 1
+
+    def DeleteValue(self, key, name) -> None:
+        key.values.pop(name, None)
+
+    def EnumKey(self, *_args, **_kwargs):
+        raise OSError(259, "no more data")
+
+    def EnumValue(self, *_args, **_kwargs):
+        raise OSError(259, "no more data")
+
+    def CloseKey(self, _key) -> None:
+        pass
+
+
+class _ReadOnlyWinreg:
+    """Прокси winreg: чтения — настоящие, записи заблокированы."""
+
+    def __getattr__(self, name):
+        return getattr(REAL_WINREG, name)
+
+    def SetValueEx(self, *args, **kwargs):
+        return None
+
+    def DeleteValue(self, *args, **kwargs):
+        return None
+
+
+def _real_override() -> str | None:
+    """Текущий ProxyOverride из настоящего HKCU (только чтение)."""
+    try:
+        with REAL_WINREG.OpenKey(REAL_WINREG.HKEY_CURRENT_USER,
+                                 _INTERNET_SETTINGS) as key:
+            return str(REAL_WINREG.QueryValueEx(key, "ProxyOverride")[0] or "")
+    except OSError:
+        return None
+
 
 
 def check(name: str, condition: bool, detail: str = "") -> bool:
@@ -235,8 +320,15 @@ class FakeController:
 
 def main() -> int:
     print("=" * 68)
-    print("bypass-tray: дымовые проверки")
+    print("bypass-tray: смоук проверка")
     print("=" * 68)
+
+    # Smoke не имеет права читать/писать настоящий реестр: TrayApp.refresh ->
+    # sync_proxy_state иначе трогает HKCU. Модули импортируют winreg лениво,
+    # поэтому подмены в sys.modules достаточно. Настоящий модуль остаётся в
+    # REAL_WINREG — им проверим, что реестр не изменился.
+    real_before = _real_override()
+    sys.modules["winreg"] = _ReadOnlyWinreg()
 
     cfg = config.load_config()
 
@@ -774,15 +866,33 @@ def main() -> int:
           not any(("youtube" in d or "discord" in d) for d in proxy_rule["domain"]))
     check("Instagram в прокси", any("instagram" in d for d in proxy_rule["domain"]))
 
-    stream_cfg = xray.build_config(sample, 10899, None, True)
+    stream_cfg = xray.build_config(sample, 10899, None, False,
+                                   stream_fallback=True)
     stream_rule = next(r for r in stream_cfg["routing"]["rules"]
-                       if r.get("outboundTag") == "proxy")
+                       if r.get("outboundTag") == "proxy" and r.get("domain"))
     check("резервный режим: YouTube/Discord уходят в прокси",
           any("youtube" in d for d in stream_rule["domain"])
           and any("discord" in d for d in stream_rule["domain"]))
     check("резервный режим: россияне всё равно напрямую",
-          all(r.get("outboundTag") == "direct"
-              for r in stream_cfg["routing"]["rules"][:2]))
+          any(r.get("outboundTag") == "direct"
+              and "geosite:category-ru" in (r.get("domain") or [])
+              for r in stream_cfg["routing"]["rules"]))
+    fallback_droute = next(r for r in stream_cfg["routing"]["rules"]
+                           if r.get("inboundTag") == ["droute"])
+    check("резервный режим: droute тоже в прокси",
+          fallback_droute.get("outboundTag") == "proxy",
+          str(fallback_droute))
+
+    youtube_cfg = xray.build_config(sample, 10899, None, True)
+    youtube_proxy = next(r for r in youtube_cfg["routing"]["rules"]
+                         if r.get("outboundTag") == "proxy" and r.get("domain"))
+    youtube_direct = [d for r in youtube_cfg["routing"]["rules"]
+                      if r.get("outboundTag") == "direct"
+                      for d in (r.get("domain") or [])]
+    check("youtube_via_vpn: только YouTube в прокси, Discord напрямую",
+          any("youtube" in d for d in youtube_proxy["domain"])
+          and not any("discord" in d for d in youtube_proxy["domain"])
+          and any("discord" in d for d in youtube_direct))
 
     if LIVE:
         links = xray.fetch_subscription()
@@ -812,11 +922,14 @@ def main() -> int:
         shutil.rmtree(tmp, ignore_errors=True)
 
     # --- итог -------------------------------------------------------------
+    real_after = _real_override()
+    check("smoke не меняет настоящий реестр", real_after == real_before,
+          f"{real_before!r} -> {real_after!r}")
     failed = [name for ok, name in RESULTS if not ok]
     print("\n" + "=" * 68)
     print(f"Пройдено: {len(RESULTS) - len(failed)} из {len(RESULTS)}")
     if SKIPPED:
-        print(f"Пропущено (нужна сеть): {len(SKIPPED)}")
+        print(f"Пропущено: {len(SKIPPED)}")
         for name, reason in SKIPPED:
             print(f"  - {name}: {reason}")
     if failed:
@@ -1394,9 +1507,16 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
         routes._certificate_issuer = real_issuer
         routes._issuer_is_local = real_local
 
-    # Реальный cmd: копия run.bat с start→echo под cp866.
+    # Реальный cmd: run.bat предпочитает исходники, а dist берёт без них.
     run_bat_text = (ROOT / "run.bat").read_text(encoding="ascii")
-    variant = run_bat_text.replace('start "" "%%~f"', 'echo FOUND "%%~f"')
+    check("run.bat: исходники проверяются раньше dist",
+          run_bat_text.find("src\\bypass_tray\\__main__.py")
+          < run_bat_text.find("dist\\*")
+          and "pythonw.exe" in run_bat_text)
+    check("run.bat: проверяет, что процесс поднялся",
+          "Win32_Process" in run_bat_text and "BYPASS_TRAY_EXE" in run_bat_text)
+    variant = (run_bat_text.replace('start "" "%%~ff"', 'echo FOUND "%%~ff"')
+               .replace("goto verify", "exit /b 0"))
     bat_project = tmp / "runbat"
     (bat_project / "dist" / "Test").mkdir(parents=True)
     (bat_project / "dist" / "Test" / "Test.exe").write_bytes(b"")
@@ -1404,7 +1524,7 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
     bat_run = subprocess.run(["cmd", "/c", str(bat_project / "run.bat")],
                              cwd=str(bat_project), capture_output=True,
                              text=True, encoding="cp866", errors="replace")
-    check("run.bat реально находит exe (cmd/cp866)",
+    check("run.bat реально находит dist exe без исходников (cmd/cp866)",
           "FOUND" in bat_run.stdout and "Test.exe" in bat_run.stdout,
           repr(bat_run.stdout[-200:]))
 
@@ -1448,14 +1568,21 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
     class MutexCall:
         restype = None
         argtypes = None
+        def __init__(self, kernel):
+            self.kernel = kernel
         def __call__(self, *args):
+            # Имитация существующего мьютекса: WinAPI ставит 183.
+            self.kernel.error = 183
             return 123
     class FakeKernel:
         def __init__(self):
-            self.CreateMutexW = MutexCall()
+            self.error = 0
+            self.CreateMutexW = MutexCall(self)
             self.closed = False
+        def SetLastError(self, value):
+            self.error = value
         def GetLastError(self):
-            return 183
+            return self.error
         def CloseHandle(self, handle):
             self.closed = True
     class FakeUser:
@@ -1466,8 +1593,7 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
     fake_kernel = FakeKernel(); fake_user = FakeUser()
     mutex, first = main_module._acquire_single_instance(fake_kernel, fake_user)
     check("single-instance: второй экземпляр отклонён",
-          first is False and mutex is None and fake_kernel.closed
-          and bool(fake_user.messages))
+          first is False and mutex is None and fake_kernel.closed)
 
     lifecycle_app = TrayApp()
     lifecycle_app.proxy = {**lifecycle_app.proxy, "running": True}
@@ -1518,7 +1644,7 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
         xray.system_proxy_server = real_server
         xray.set_system_proxy = real_set
     check("sync running: ProxyEnable=0 включает наш",
-          sync_calls == [(True, 10818, False)], str(sync_calls))
+          sync_calls == [(True, 10818, False, False)], str(sync_calls))
 
     sync_calls.clear()
     xray.status = lambda: {"running": True, "port": 10818, "stream": False}
@@ -2247,7 +2373,8 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
     real_set_proxy = xray.set_system_proxy
     proxy_calls = []
     xray.is_running = lambda: True
-    xray.status = lambda: {"running": True, "port": 10818}
+    xray.status = lambda: {"running": True, "port": 10818, "stream": True,
+                           "youtube_proxy": True, "discord_proxy": False}
     xray.set_system_proxy = lambda *args: proxy_calls.append(args)
     try:
         already = xray.start({"xray_system_proxy": True, "xray_port": 10818})
@@ -2256,7 +2383,8 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
         xray.status = real_status
         xray.set_system_proxy = real_set_proxy
     check("xray.start already включает системный прокси",
-          already.get("already") is True and proxy_calls == [(True, 10818, False)],
+          already.get("already") is True
+          and proxy_calls == [(True, 10818, True, False)],
           str(proxy_calls))
 
     # --- проверка доменов и пользовательские правила --------------------
@@ -2463,8 +2591,9 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
           f"{idx_user_direct},{idx_user_proxy},{idx_audit},{idx_stream},"
           f"{idx_blocked},{idx_ru},{idx_builtin}")
 
-    stream_conf = xray.build_config(sample_server, 10899, None, True, None, {},
-                                    "ext:blocked:REFILTER")
+    stream_conf = xray.build_config(sample_server, 10899, None, False, None, {},
+                                    "ext:blocked:REFILTER",
+                                    stream_fallback=True)
     stream_rules = stream_conf["routing"]["rules"]
     check("в резервном режиме нет stream direct",
           not any(rule.get("outboundTag") == "direct"
@@ -2510,9 +2639,16 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
           "youtube.com" in direct_bypass and "*.youtube.com" in direct_bypass
           and "*.googlevideo.com" in direct_bypass
           and "discord.com" in direct_bypass and "*.discord.com" in direct_bypass)
-    stream_bypass = set(xray._proxy_bypass_list(True).split(";"))
-    check("bypass stream=True: stream-домены не добавлены",
-          "youtube.com" not in stream_bypass and "discord.com" not in stream_bypass)
+    stream_bypass = set(xray._proxy_bypass_list(True, False).split(";"))
+    check("bypass youtube_via_vpn: YouTube нет, Discord есть",
+          "youtube.com" not in stream_bypass
+          and "*.youtube.com" not in stream_bypass
+          and "discord.com" in stream_bypass
+          and "*.discord.com" in stream_bypass)
+    fallback_bypass = set(xray._proxy_bypass_list(True, True).split(";"))
+    check("bypass резерв: stream-домены не добавлены",
+          "youtube.com" not in fallback_bypass
+          and "discord.com" not in fallback_bypass)
     config.save_config({**original_cfg, "xray_routes": {"youtube.com": "proxy"}})
     user_bypass = set(xray._proxy_bypass_list(False).split(";"))
     check("user proxy исключает YouTube из bypass",
@@ -2546,14 +2682,20 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
           not any("youtube" in str(d) for d in no_stream_proxy["domain"]))
     with_stream_cfg = xray.build_config(sample_server, 10899, None, True)
     with_stream_rules = with_stream_cfg["routing"]["rules"]
-    check("stream=True: direct-правила YouTube нет",
+    check("youtube_via_vpn: direct-правила YouTube нет",
           not any(rule.get("outboundTag") == "direct"
                   and "geosite:youtube" in (rule.get("domain") or [])
                   for rule in with_stream_rules))
     with_stream_proxy = next(rule for rule in with_stream_rules
-                             if rule.get("outboundTag") == "proxy")
-    check("stream=True: YouTube в proxy",
+                             if rule.get("outboundTag") == "proxy"
+                             and rule.get("domain"))
+    check("youtube_via_vpn: YouTube в proxy",
           any("youtube.com" in str(d) for d in with_stream_proxy["domain"]))
+    check("youtube_via_vpn: Discord остаётся direct",
+          any(rule.get("outboundTag") == "direct"
+              and "geosite:discord" in (rule.get("domain") or [])
+              for rule in with_stream_rules)
+          and not any("discord" in str(d) for d in with_stream_proxy["domain"]))
     check("youtube_via_vpn включает stream",
           xray._effective_stream({"youtube_via_vpn": True}, False) is True
           and xray._effective_stream({"youtube_via_vpn": True}, True) is True

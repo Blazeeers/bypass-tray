@@ -290,6 +290,7 @@ def _xray_test(data_path: Path) -> tuple[bool, str]:
             completed = subprocess.run(
                 [str(exe), "-test", "-c", str(config_path)],
                 cwd=str(exe.parent), env=env, capture_output=True, timeout=60,
+                close_fds=True,
                 creationflags=CREATE_NO_WINDOW,
             )
             output = ((completed.stdout or b"") + (completed.stderr or b""))

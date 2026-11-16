@@ -497,6 +497,17 @@ class TrayApp:
             self._mark_service("tgwsproxy", "bad", f"порт {port} не слушает")
         self.refresh_activity()
 
+    def _stream_groups(self, state: dict | None = None) -> tuple[bool, bool]:
+        """Фактические маршруты YouTube/Discord: (через VPN?, через VPN?).
+
+        Новое состояние ядра хранит флаги по группам. Старая запись знает
+        только общий ``stream`` — тогда он, как и раньше, означал обе группы.
+        """
+        state = self.proxy if state is None else state
+        stream = bool(state.get("stream"))
+        return (bool(state.get("youtube_proxy", stream)),
+                bool(state.get("discord_proxy", stream)))
+
     def sync_proxy_state(self) -> None:
         """Синхронизирует состояние прокси и наш системный прокси."""
         try:
@@ -509,7 +520,7 @@ class TrayApp:
             port = int(state.get("port") or self.cfg.get("xray_port") or 10818)
         except (TypeError, ValueError):
             port = 10818
-        stream = bool(state.get("stream") or self.cfg.get("youtube_via_vpn"))
+        youtube_proxy, discord_proxy = self._stream_groups(state)
         if state.get("running"):
             if self.cfg.get("xray_system_proxy", True):
                 try:
@@ -517,7 +528,8 @@ class TrayApp:
                     server = xray.system_proxy_server()
                     own = f"127.0.0.1:{port}"
                     if not enabled:
-                        outcome = xray.set_system_proxy(True, port, stream)
+                        outcome = xray.set_system_proxy(
+                            True, port, youtube_proxy, discord_proxy)
                         outcome = outcome if isinstance(outcome, dict) else {}
                         if outcome.get("ok"):
                             self.proxy["system_proxy_owned"] = "ours"
@@ -528,6 +540,22 @@ class TrayApp:
                                 + str(outcome.get("error") or "нет ответа"))
                     elif server.strip() == own:
                         self.proxy["system_proxy_owned"] = "ours"
+                        # Прокси уже наш, но список обхода мог остаться от
+                        # старой версии. Сверяем с фактическим маршрутом групп
+                        # и пишем только при реальном расхождении.
+                        try:
+                            outcome = xray.refresh_system_proxy_bypass(
+                                youtube_proxy, discord_proxy, self.cfg)
+                            outcome = outcome if isinstance(outcome, dict) else {}
+                            if not outcome.get("ok"):
+                                self._log_throttled(
+                                    "system-proxy-bypass",
+                                    "список обхода не обновился: "
+                                    + str(outcome.get("error") or "нет ответа"))
+                        except Exception as exc:  # noqa: BLE001
+                            self._log_throttled(
+                                "system-proxy-bypass",
+                                f"список обхода не обновился: {type(exc).__name__}")
                     else:
                         # Чужой прокси не перезаписываем, только отмечаем.
                         self.proxy["system_proxy_owned"] = "foreign"
@@ -1993,19 +2021,19 @@ class TrayApp:
             return
         if not self.cfg.get("xray_stream_fallback", True):
             return
-        if self.cfg.get("youtube_via_vpn"):
-            # Пользователь сам выбрал VPN для YouTube/Discord — прямой режим
-            # возвращать не нужно.
-            self._stream_since = None
-            return
         if self.proxy.get("busy") or not self.proxy.get("running"):
             # Туннеля нет — fallback некуда включать.
             self._stream_since = None
             return
 
         zapret_ok = bool(((self.status or {}).get("zapret") or {}).get("running"))
+        youtube_proxy, discord_proxy = self._stream_groups()
         broken = self._broken_stream_services() if zapret_ok else set()
-        if broken and not self.proxy.get("stream"):
+        # Сервис, который уже ведётся через VPN, лечить оверрайдом не нужно:
+        # у групп свои флаги, и «сломан» может быть только Discord.
+        broken = {name for name in broken
+                  if not (youtube_proxy if name == "youtube" else discord_proxy)}
+        if broken:
             # zapret запущен, но сервис не работает — уже не «после
             # восстановления», а честный повод увести только проблемные
             # домены. Перезапуск Xray — не чаще кулдауна.
@@ -2049,7 +2077,9 @@ class TrayApp:
             return
 
         need = not zapret_ok
-        if need == bool(self.proxy.get("stream")):
+        # fallback переводит в VPN обе группы; если одна уже там по своему
+        # флагу, сравнение идёт по факту «обе группы в VPN».
+        if need == (youtube_proxy and discord_proxy):
             self._stream_since = None
             return
 

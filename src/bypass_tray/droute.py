@@ -313,7 +313,8 @@ def _run_installer(executable: Path, args: list[str]) -> tuple[bool, str]:
     try:
         completed = subprocess.run(
             [str(executable), *args], capture_output=True, timeout=120,
-            cwd=str(executable.parent), creationflags=_CREATE_NO_WINDOW)
+            cwd=str(executable.parent), close_fds=True,
+            creationflags=_CREATE_NO_WINDOW)
     except Exception as exc:  # noqa: BLE001
         return False, f"{type(exc).__name__}: {exc}"
     output = (completed.stdout or b"") + (completed.stderr or b"")

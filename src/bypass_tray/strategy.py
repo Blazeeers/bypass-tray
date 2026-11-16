@@ -24,7 +24,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import actions, config, status
+from . import actions, config, health, status
 
 PROBE_MARKER = "ZAPRET_CMD"
 PROBE_PREFIX = "_bypass_probe_"
@@ -96,8 +96,11 @@ def trial_active(now: float | None = None) -> bool:
 
 #: Что считаем признаком рабочего обхода. Контрольный адрес должен открываться
 #: всегда — если он не открывается, сеть недоступна и замер недействителен.
+#: YouTube проверяется видео-путём (watch-страница → googlevideo): открытая
+#: страница без потока не доказывает, что видео идёт.
 TARGETS: tuple[tuple[str, str], ...] = (
-    ("youtube", "https://www.youtube.com/"),
+    ("youtube", health.YOUTUBE_WATCH_URL.format(
+        video_id=health.YOUTUBE_VIDEO_ID)),
     ("discord", "https://discord.com/"),
 )
 CONTROL: tuple[str, str] = ("control", "https://ya.ru/")
@@ -149,7 +152,8 @@ def extract_command(bat_path: Path, timeout: int = 40) -> str:
         completed = subprocess.run(
             ["cmd.exe", "/c", str(probe_path)],
             capture_output=True, timeout=timeout, cwd=str(bat_path.parent),
-            stdin=subprocess.DEVNULL, creationflags=actions.CREATE_NO_WINDOW,
+            stdin=subprocess.DEVNULL, close_fds=True,
+            creationflags=actions.CREATE_NO_WINDOW,
         )
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -299,13 +303,65 @@ def _rank_candidates(candidates: list[dict]) -> list[dict]:
     )
 
 
+def _probe_youtube(timeout: float, budget: float | None = None) -> dict:
+    """Цель «YouTube»: страница watch плюс реальные байты с googlevideo.
+
+    Общая проба живёт в ``health``: перебор и панель не должны расходиться
+    в том, что считать работающим видео. Успех здесь — только прошедшие
+    байты (``stream``): 4xx googlevideo без PO-token панели достаточно, а
+    перебору нет — он ищет стратегию, которая тянет видео.
+
+    Запросов внутри пробы до трёх: watch-страница (с одним повтором при
+    нулевом статусе) и Range-GET к googlevideo. Бюджет делится на три, чтобы
+    вся видео-проба уложилась в один общий бюджет ``measure``.
+    """
+    cap = (float(budget) if budget is not None
+           else max(float(timeout) * 2.0, 4.0))
+    started = time.perf_counter()
+    video = health.probe_youtube_video(
+        timeout=timeout, budget=max(1.0, cap / 3.0))
+    elapsed = max(time.perf_counter() - started, 1e-6)
+    data = int(video.get("bytes") or 0)
+    if video.get("signature"):
+        note = "cdn-signature"
+    elif video.get("error") == "timeout" or video.get("expired"):
+        note = "timeout"
+    elif not video.get("status"):
+        note = "no-answer"
+    elif video.get("warn"):
+        note = f"page-4xx (HTTP {video.get('status')})"
+    elif not video.get("stream"):
+        note = f"no-stream (HTTP {video.get('status')})"
+    else:
+        note = ""
+    return {
+        "ok": bool(video.get("stream")) and bool(video.get("ok")),
+        "status": int(video.get("status") or 0),
+        "ms": int(video.get("ms") or round(elapsed * 1000)),
+        "bytes": data,
+        "kbps": round(data * 8 / 1000 / elapsed),
+        "error": str(video.get("error") or ""),
+        # Что именно помешало: таймаут/нет ответа или 4xx от CDN. Поле
+        # попадает в отчёт перебора, формат остальных ключей не меняется.
+        "note": note,
+    }
+
+
+def _probe_target(name: str, url: str, timeout: float,
+                  budget: float | None = None) -> dict:
+    if name == "youtube":
+        return _probe_youtube(timeout, budget)
+    return probe_url(url, timeout, budget=budget)
+
+
 def measure(timeout: float = 6.0, budget: float | None = None) -> dict:
     """Проверяет целевые адреса и контрольный, измеряя реальную загрузку.
 
     ``budget`` ограничивает каждый замер по времени (см. ``probe_url``):
     суммарно один ``measure`` не может тянуться дольше трёх бюджетов.
     """
-    targets = {name: probe_url(url, timeout, budget=budget) for name, url in TARGETS}
+    targets = {name: _probe_target(name, url, timeout, budget)
+               for name, url in TARGETS}
     control_name, control_url = CONTROL
     control = probe_url(control_url, timeout, budget=budget)
     score = sum(1 for result in targets.values() if _target_ok(result))
@@ -335,7 +391,8 @@ def install_service(command: str, name: str = status.ZAPRET_SERVICE) -> bool:
         args += ["DisplayName=", "zapret", "start=", "auto"]
     if actions.is_admin():
         completed = subprocess.run(
-            args, capture_output=True, timeout=30, creationflags=actions.CREATE_NO_WINDOW
+            args, capture_output=True, timeout=30, close_fds=True,
+            creationflags=actions.CREATE_NO_WINDOW
         )
         return completed.returncode == 0
     return actions.run_elevated(args)
@@ -412,6 +469,7 @@ def _launch(command: str, zapret_dir: Path) -> subprocess.Popen | None:
         return subprocess.Popen(
             command, cwd=str(cwd), stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            close_fds=True,
             creationflags=actions.CREATE_NO_WINDOW,
         )
     except OSError:
@@ -518,9 +576,11 @@ def sweep(
                 "started": bool(process),
             }
             report["results"].append(entry)
+            youtube_note = (entry["targets"].get("youtube") or {}).get("note")
             emit(
                 f"[{index}/{total}] {name}: {entry['score']}/{entry['total']}"
                 + (" ✓" if entry["working"] else "")
+                + (f" · YouTube: {youtube_note}" if youtube_note else "")
             )
 
         candidates = [r for r in report["results"] if r.get("working")]

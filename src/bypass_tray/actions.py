@@ -32,6 +32,7 @@ def _popen(args: list[str], cwd: str | None = None) -> subprocess.Popen:
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        close_fds=True,
         creationflags=CREATE_NO_WINDOW,
     )
 
@@ -140,6 +141,7 @@ def _run_capture(args: list[str], timeout: int = 10) -> str:
     try:
         completed = subprocess.run(
             args, capture_output=True, timeout=timeout,
+            close_fds=True,
             creationflags=CREATE_NO_WINDOW,
         )
     except (OSError, subprocess.SubprocessError):
@@ -285,6 +287,7 @@ def restart_discord(via_proxy: bool, port: int) -> dict:
         subprocess.Popen(
             command, cwd=str(base), stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            close_fds=True,
             creationflags=CREATE_NO_WINDOW,
         )
     except OSError as exc:

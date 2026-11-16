@@ -159,6 +159,7 @@ def _xray_version() -> str:
     try:
         completed = subprocess.run(
             [_xray_binary(), "-version"], capture_output=True, timeout=5,
+            close_fds=True,
             creationflags=actions.CREATE_NO_WINDOW,
         )
     except (OSError, subprocess.SubprocessError):

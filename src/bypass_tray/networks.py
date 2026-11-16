@@ -109,7 +109,8 @@ def parse_ipconfig_gateway(text: str) -> str:
 def _run(args: list[str], timeout: float = _RUN_TIMEOUT) -> str:
     try:
         completed = subprocess.run(
-            args, capture_output=True, timeout=timeout, creationflags=CREATE_NO_WINDOW
+            args, capture_output=True, timeout=timeout, close_fds=True,
+            creationflags=CREATE_NO_WINDOW
         )
     except (OSError, subprocess.SubprocessError):
         return ""

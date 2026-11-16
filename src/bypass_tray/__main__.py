@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -77,20 +78,17 @@ def run_setup(autostart: bool = True) -> int:
     print("Ссылку на подписку VPN укажите в «Настройки» → «VPN».")
     print("=" * 62)
 
-    from .app import TrayApp
-
-    mutex, first = _acquire_single_instance()
-    if not first:
-        return 0
-    try:
-        TrayApp().start()
-    finally:
-        _release_single_instance(mutex)
-    return 0
+    return _run_tray()
 
 
 def _acquire_single_instance(kernel32=None, user32=None) -> tuple[object | None, bool]:
-    """Мьютекс на GUI-экземпляр; False — уже запущен."""
+    """Мьютекс — вспомогательный признак; окончательно решает PID-файл.
+
+    ``first=False`` значит лишь, что объект с таким именем существует. Это
+    может быть и настоящий второй экземпляр, и «залипший» handle, унаследованный
+    дочерним процессом. Поэтому main() сверяет PID-файл, а MessageBox здесь не
+    показывается — второй экземпляр выходит тихо.
+    """
     if sys.platform != "win32":
         return None, True
     try:
@@ -98,22 +96,29 @@ def _acquire_single_instance(kernel32=None, user32=None) -> tuple[object | None,
         from ctypes import wintypes
 
         if kernel32 is None:
-            kernel32 = ctypes.windll.kernel32
-        if user32 is None:
-            user32 = ctypes.windll.user32
+            # use_last_error=True: иначе GetLastError() может вернуть чужой
+            # код от предыдущего вызова WinAPI.
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            injected = False
+        else:
+            injected = True
         kernel32.CreateMutexW.restype = ctypes.c_void_p
         kernel32.CreateMutexW.argtypes = [
             wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.SetLastError(0)
+        # lpMutexAttributes=NULL: handle не наследуется дочерними процессами
+        # (в том числе парой «venv-лаунчер → базовый pythonw»).
+        # Имя v2: у старого имени мог остаться унаследованный handle от
+        # предыдущих версий («залипший» мьютекс), новый объект стартует чисто.
         handle = kernel32.CreateMutexW(None, False,
-                                       "Local\\Blazeeers.BypassTray")
+                                       "Local\\Blazeeers.BypassTray.v2")
         if not handle:
+            # Провал создания — не признак занятости: не блокируем запуск.
             return None, True
-        if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        error = (kernel32.GetLastError() if injected
+                 else ctypes.get_last_error())
+        if error == 183:  # ERROR_ALREADY_EXISTS
             kernel32.CloseHandle(ctypes.c_void_p(handle))
-            try:
-                user32.MessageBoxW(0, "Обходы уже запущены", "Обходы", 0x40)
-            except Exception:  # noqa: BLE001
-                pass
             return None, False
         return handle, True
     except Exception:  # noqa: BLE001
@@ -129,6 +134,73 @@ def _release_single_instance(handle) -> None:
         ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(handle))
     except Exception:  # noqa: BLE001
         pass
+
+
+def _tray_pid_path() -> Path:
+    from . import config
+
+    return config.config_dir() / "tray.pid"
+
+
+def _read_tray_pid() -> int | None:
+    try:
+        return int(_tray_pid_path().read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _tray_pid_alive(pid: int | None) -> bool:
+    """PID-файл указывает на живой процесс именно трея."""
+    if not pid:
+        return False
+    try:
+        import psutil
+
+        cmdline = " ".join(psutil.Process(pid).cmdline() or []).lower()
+        # В исходниках — «-m bypass_tray», в PyInstaller-сборке — имя exe
+        # («Обходы.exe»). Имя exe проверяем только для сборки, иначе под него
+        # попадёт любой чужой pythonw с тем же PID.
+        exe = Path(sys.executable).name.lower()
+        frozen = bool(getattr(sys, "frozen", False))
+        return "bypass_tray" in cmdline or (frozen and bool(exe) and exe in cmdline)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _write_tray_pid(pid: int) -> None:
+    from . import config
+
+    config.atomic_write(_tray_pid_path(), str(pid))
+
+
+def _clear_tray_pid(pid: int) -> None:
+    path = _tray_pid_path()
+    try:
+        if path.read_text(encoding="utf-8").strip() == str(pid):
+            path.unlink()
+    except OSError:
+        pass
+
+
+def _run_tray() -> int:
+    """Запускает GUI-трей, не давая стартовать второму живому экземпляру."""
+    from .app import TrayApp
+
+    pid = _read_tray_pid()
+    if _tray_pid_alive(pid):
+        return 0
+    mutex, first = _acquire_single_instance()
+    if not first:
+        # Настоящий второй экземпляр (или честный ERROR_ALREADY_EXISTS):
+        # выходим тихо, без MessageBox.
+        return 0
+    _write_tray_pid(os.getpid())
+    try:
+        TrayApp().start()
+    finally:
+        _clear_tray_pid(os.getpid())
+        _release_single_instance(mutex)
+    return 0
 
 
 def _set_app_user_model_id() -> None:
@@ -386,16 +458,7 @@ def main() -> int:
         write_progress()
         return 0
 
-    from .app import TrayApp
-
-    mutex, first = _acquire_single_instance()
-    if not first:
-        return 0
-    try:
-        TrayApp().start()
-    finally:
-        _release_single_instance(mutex)
-    return 0
+    return _run_tray()
 
 
 if __name__ == "__main__":

@@ -270,13 +270,34 @@ def _why(result: dict) -> str:
     return f"HTTP {result.get('status') or '?'}"
 
 
+def _proxied_groups(cfg: dict, proxy: dict) -> tuple[bool, bool]:
+    """Фактический маршрут YouTube и Discord: (YouTube?, Discord?) через VPN.
+
+    Флаги берутся из статуса ядра (``youtube_proxy``/``discord_proxy``).
+    Старая запись состояния знает только общий ``stream``: для Discord он
+    означает резервный режим, а не включённый пользователем YouTube.
+    """
+    cfg = cfg or {}
+    proxy = proxy or {}
+    mode = str(proxy.get("routing_mode") or cfg.get("routing_mode") or "")
+    if config.normalise_routing_mode(mode) == "all":
+        return True, True
+    stream = bool(proxy.get("stream"))
+    fallback = stream and not bool(cfg.get("youtube_via_vpn"))
+    youtube = (bool(proxy.get("youtube_proxy", stream))
+               or bool(cfg.get("youtube_via_vpn")))
+    discord = bool(proxy.get("discord_proxy", fallback))
+    return youtube, discord
+
+
 def _stream_context(cfg: dict, proxy: dict,
                     service: str = "") -> tuple[bool, int | None]:
     """Нужно ли проверять YouTube/Discord через VPN и на каком порту.
 
-    Через VPN они идут в резервном режиме (``proxy["stream"]``) или когда
-    пользователь включил ``youtube_via_vpn``. В режиме ``all`` через VPN идёт
-    всё, кроме РФ, — значит, и они тоже: прямая проба дала бы ложный «сбой».
+    Через VPN группа идёт только по своему флагу: YouTube — по потоку
+    (резервный режим или ``youtube_via_vpn``), Discord — по
+    ``discord_via_proxy``/резервному режиму. В режиме ``all`` через VPN идёт
+    всё, кроме РФ, — значит, и обе группы.
     Если режим выбран, а прокси не запущен — второй элемент ``None``, проверка
     вернёт «нужен VPN».
 
@@ -286,10 +307,13 @@ def _stream_context(cfg: dict, proxy: dict,
     """
     cfg = cfg or {}
     proxy = proxy or {}
-    mode = str(proxy.get("routing_mode") or cfg.get("routing_mode") or "")
-    all_mode = config.normalise_routing_mode(mode) == "all"
-    requested = (all_mode or bool(proxy.get("stream"))
-                 or bool(cfg.get("youtube_via_vpn")))
+    youtube, discord = _proxied_groups(cfg, proxy)
+    if service == "youtube":
+        requested = youtube
+    elif service == "discord":
+        requested = discord
+    else:
+        requested = youtube or discord
     if not requested and service:
         try:
             from . import routes
@@ -339,10 +363,11 @@ def _content_encoding(headers) -> str:
 
 
 def _fetch_page(url: str, proxy_port: int | None, timeout: float,
-                limit: int) -> dict:
+                limit: int, budget: float | None = None) -> dict:
     """GET страницы с браузерным UA, gzip и ограничением тела/бюджета."""
     started = time.perf_counter()
-    expire = started + max(float(timeout) * 1.5, 3.0)
+    expire = started + (float(budget) if budget is not None
+                        else max(float(timeout) * 1.5, 3.0))
     if proxy_port:
         proxy = f"http://127.0.0.1:{int(proxy_port)}"
         opener = urllib.request.build_opener(
@@ -422,7 +447,8 @@ def _video_url(body: str) -> str:
     return _decode_js_url(match.group(0))
 
 
-def _fetch_range(url: str, proxy_port: int | None, timeout: float) -> dict:
+def _fetch_range(url: str, proxy_port: int | None, timeout: float,
+                 budget: float | None = None) -> dict:
     """Range-GET к googlevideo; возвращает диагностику, а не вердикт.
 
     Бюджет общий на весь запрос (как у ``strategy.probe_url``): при троттлинге
@@ -430,7 +456,8 @@ def _fetch_range(url: str, proxy_port: int | None, timeout: float) -> dict:
     весь ``collect``.
     """
     started = time.perf_counter()
-    expire = started + max(float(timeout) * 1.5, 3.0)
+    expire = started + (float(budget) if budget is not None
+                        else max(float(timeout) * 1.5, 3.0))
     parts = urllib.parse.urlsplit(url)
     host = parts.hostname or ""
     secure = parts.scheme != "http"
@@ -498,11 +525,12 @@ def _fetch_range(url: str, proxy_port: int | None, timeout: float) -> dict:
                 pass
 
 
-def _youtube_video(proxy_port: int | None, timeout: float) -> dict:
+def _youtube_video(proxy_port: int | None, timeout: float,
+                   budget: float | None = None) -> dict:
     """Проверяет видео-путь: watch-страница, playability и googlevideo.
 
     Возвращает диагностику с ``ok``/``checked``:
-    * ``stream=True`` — поток реально качается;
+    * ``stream=True`` — поток реально качается (``bytes`` — сколько пришло);
     * ``ok=True, stream=False, signature=True`` — googlevideo ответил 4xx
       (нет PO-token): это штатно, страница и плеер работают;
     * ``ok=True, stream=None`` — playability OK, ссылки на поток нет;
@@ -510,10 +538,10 @@ def _youtube_video(proxy_port: int | None, timeout: float) -> dict:
     * ``checked=False`` — не удалось извлечь ни playability, ни поток.
     """
     page_url = YOUTUBE_WATCH_URL.format(video_id=YOUTUBE_VIDEO_ID)
-    page = _fetch_page(page_url, proxy_port, timeout, WATCH_BODY_LIMIT)
+    page = _fetch_page(page_url, proxy_port, timeout, WATCH_BODY_LIMIT, budget)
     if int(page.get("status") or 0) == 0:
         # Один повтор, как у лёгкой проверки: обрыв/tail-таймаут не приговор.
-        page = _fetch_page(page_url, proxy_port, timeout, WATCH_BODY_LIMIT)
+        page = _fetch_page(page_url, proxy_port, timeout, WATCH_BODY_LIMIT, budget)
     status = int(page.get("status") or 0)
     if not 200 <= status < 300:
         if 400 <= status < 500:
@@ -534,29 +562,44 @@ def _youtube_video(proxy_port: int | None, timeout: float) -> dict:
                 "ms": page["ms"], "error": reason}
     url = _video_url(body)
     if url:
-        stream = _fetch_range(url, proxy_port, timeout)
+        stream = _fetch_range(url, proxy_port, timeout, budget)
         status = int(stream.get("status") or 0)
+        data = int(stream.get("bytes") or 0)
+        seconds = max(stream.get("ms", 0) / 1000.0, 1e-6)
         if (status in (200, 206) and not stream.get("expired")
-                and int(stream.get("bytes") or 0) >= VIDEO_MIN_BYTES):
+                and data >= VIDEO_MIN_BYTES):
             return {"ok": True, "checked": True, "page": True, "stream": True,
                     "playability": playability, "status": status,
+                    "bytes": data, "kbps": round(data * 8 / 1000 / seconds),
                     "ms": stream["ms"]}
         if status in SIGNATURE_ERRORS:
             # 4xx без PO-token — не блокировка: плеер и страница живы.
             return {"ok": True, "checked": True, "page": True, "stream": False,
                     "signature": True, "playability": playability,
-                    "status": status, "ms": stream["ms"]}
+                    "status": status, "bytes": data, "ms": stream["ms"]}
         return {"ok": False, "checked": True, "page": True, "stream": False,
                 "playability": playability, "status": status,
-                "ms": stream["ms"],
+                "bytes": data, "ms": stream["ms"],
                 "error": stream.get("error") or f"HTTP {status}"}
     if playability in ("OK", "PLAYING"):
         # Плеер жив, но ссылку из HTML не достали — это не сбой.
         return {"ok": True, "checked": True, "page": True, "stream": None,
-                "playability": playability, "ms": page["ms"]}
+                "playability": playability, "bytes": 0, "ms": page["ms"]}
     return {"ok": False, "checked": False, "page": True,
-            "playability": playability, "ms": page["ms"],
+            "playability": playability, "bytes": 0, "ms": page["ms"],
             "error": "playability и поток не найдены"}
+
+
+def probe_youtube_video(timeout: float = 6.0,
+                        proxy_port: int | None = None,
+                        budget: float | None = None) -> dict:
+    """Общая видео-проба YouTube для health и перебора стратегий.
+
+    Перебирающему нужен реальный проход байтов, а не открытая страница:
+    ``stream=True`` и ``bytes`` — единственный признак, что googlevideo
+    отдаёт видео. ``budget`` ограничивает каждый запрос по времени.
+    """
+    return _youtube_video(proxy_port, timeout, budget)
 
 
 def _check_youtube(cfg: dict, proxy: dict, timeout: float) -> dict:
@@ -663,14 +706,14 @@ def _check_zapret(status_state: dict, cfg: dict | None = None,
         return _item("zapret", "zapret", "off", "выключен вручную", 0)
     cfg = cfg or {}
     proxy = proxy or {}
-    mode = str(proxy.get("routing_mode") or cfg.get("routing_mode") or "")
-    reserved = bool(proxy.get("running")) and (
-        bool(proxy.get("stream")) or bool(cfg.get("youtube_via_vpn"))
-        or config.normalise_routing_mode(mode) == "all")
+    youtube, discord = _proxied_groups(cfg, proxy)
+    reserved = bool(proxy.get("running")) and (youtube or discord)
     if reserved:
         prefix = "остановлен" if zapret.get("dir") else "не найден"
+        where = ("YouTube и Discord" if youtube and discord
+                 else "YouTube" if youtube else "Discord")
         return _item("zapret", "zapret", "warn",
-                     f"{prefix}, YouTube/Discord через VPN", 0)
+                     f"{prefix}, {where} через VPN", 0)
     # Папка найдена, но winws не запущен — это «остановлен», а не «не найден».
     detail = "остановлен" if zapret.get("dir") else "winws.exe не найден"
     return _item("zapret", "zapret", "bad", detail, 0)

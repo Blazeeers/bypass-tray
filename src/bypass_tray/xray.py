@@ -96,16 +96,22 @@ PROXY_DOMAINS = [
 ]
 
 #: YouTube и Discord: по умолчанию идут напрямую — их закрывает zapret.
-#: В прокси попадают только когда zapret не работает (резервный режим).
-STREAM_DOMAINS = [
-    "geosite:youtube", "geosite:discord",
+#: Флаги у групп разные (``youtube_via_vpn`` и ``discord_via_proxy``),
+#: поэтому и списки раздельные: одна группа может уйти в VPN, вторая остаться.
+YOUTUBE_STREAM_DOMAINS = [
+    "geosite:youtube",
     "domain:youtube.com", "domain:youtu.be", "domain:ytimg.com",
     "domain:googlevideo.com", "domain:youtube-nocookie.com",
     "domain:youtube.googleapis.com",
+]
+DISCORD_STREAM_DOMAINS = [
+    "geosite:discord",
     "domain:discord.com", "domain:discord.gg", "domain:discordapp.com",
     "domain:discordapp.net", "domain:discord.media", "domain:discordcdn.com",
     "domain:gateway.discord.gg",
 ]
+#: Обе группы вместе — для аудита маршрутов и списка обхода системного прокси.
+STREAM_DOMAINS = YOUTUBE_STREAM_DOMAINS + DISCORD_STREAM_DOMAINS
 
 YOUTUBE_GROUP = (
     "youtube.com", "youtu.be", "ytimg.com", "googlevideo.com",
@@ -1004,7 +1010,8 @@ def build_config(server: dict, port: int, extra_domains: list[str] | None = None
                  dns_hosts: dict | None = None,
                  priority_proxy_domains: list[str] | None = None,
                  droute_port: int = 10819,
-                 discord_via_proxy: bool = False) -> dict:
+                 discord_via_proxy: bool = False,
+                 stream_fallback: bool = False) -> dict:
     """Конфиг Xray: локальный прокси + маршрутизация.
 
     Маршрут по умолчанию задаёт **первый outbound** — catch-all правила в
@@ -1021,6 +1028,10 @@ def build_config(server: dict, port: int, extra_domains: list[str] | None = None
     5) YouTube/Discord напрямую (если не резервный режим и не ``all``),
     6) встроенный список заблокированных ``blocked_rule`` через прокси,
     7) РФ/private напрямую.
+
+    ``stream_via_proxy`` уводит в прокси только YouTube, ``discord_via_proxy`` —
+    только Discord. ``stream_fallback`` — резервный режим (zapret не работает):
+    тогда в прокси идут обе группы.
 
     Preset перебивает РФ-direct (среди заблокированных есть российские
     домены), но пользовательские правила и YouTube/Discord остаются выше.
@@ -1051,8 +1062,14 @@ def build_config(server: dict, port: int, extra_domains: list[str] | None = None
         rules_map, current_server or server, servers)
 
     proxy_domains = list(PROXY_DOMAINS)
-    if stream_via_proxy:
-        proxy_domains += STREAM_DOMAINS
+    # YouTube и Discord решаются своими флагами: включённый YouTube не должен
+    # утягивать за собой Discord. Резервный режим отправляет в прокси обе группы.
+    youtube_proxied = bool(stream_via_proxy or stream_fallback)
+    discord_proxied = bool(discord_via_proxy or stream_fallback)
+    if youtube_proxied:
+        proxy_domains += YOUTUBE_STREAM_DOMAINS
+    if discord_proxied:
+        proxy_domains += DISCORD_STREAM_DOMAINS
     proxy_domains += [d for d in (extra_domains or []) if d]
     user_direct_set = set(user_direct)
     user_proxy_set = set(user_proxy)
@@ -1068,11 +1085,16 @@ def build_config(server: dict, port: int, extra_domains: list[str] | None = None
         audit_direct = []
     audit_direct_set = set(audit_direct)
     stream_direct = []
-    if not stream_via_proxy and mode != "all":
+    if mode != "all":
         # В режиме "all" YouTube/Discord не исключение: иначе «всё, кроме РФ»
         # оставляло бы их на прямом канале мимо VPN.
+        direct_stream = []
+        if not youtube_proxied:
+            direct_stream += YOUTUBE_STREAM_DOMAINS
+        if not discord_proxied:
+            direct_stream += DISCORD_STREAM_DOMAINS
         stream_direct = [
-            d for d in _normalise_domains(STREAM_DOMAINS)
+            d for d in _normalise_domains(direct_stream)
             if d not in user_direct_set and d not in user_proxy_set
             and d not in audit_direct_set
         ]
@@ -1096,8 +1118,9 @@ def build_config(server: dict, port: int, extra_domains: list[str] | None = None
     rules = [{
         # Droute (Discord) — отдельный SOCKS-inbound. При выключенном
         # пользователем zapret его TCP+UDP идут в туннель, иначе напрямую.
+        # В резервном режиме — тоже в туннель, как и доменный маршрут Discord.
         "type": "field", "inboundTag": ["droute"],
-        "outboundTag": "proxy" if discord_via_proxy else "direct",
+        "outboundTag": "proxy" if discord_proxied else "direct",
     }]
     if user_direct:
         rules.append({
@@ -1286,14 +1309,20 @@ def is_running() -> bool:
 
 
 def _save_state(server: dict, port: int, stream: bool = False,
-                routing_mode: str = "blocked") -> None:
+                routing_mode: str = "blocked", youtube_proxy: bool | None = None,
+                discord_proxy: bool | None = None) -> None:
+    stream = bool(stream)
     config.atomic_write(state_path(), json.dumps({
         "name": server.get("name", ""),
         "host": server.get("host", ""),
         "latency": server.get("latency", -1),
         "port": port,
         "since": time.time(),
-        "stream": bool(stream),
+        "stream": stream,
+        # Фактический маршрут каждой группы: по нему health и обход системного
+        # прокси отличают «YouTube через VPN» от «обе группы через VPN».
+        "youtube_proxy": stream if youtube_proxy is None else bool(youtube_proxy),
+        "discord_proxy": stream if discord_proxy is None else bool(discord_proxy),
         # Фактический режим, на котором поднято ядро: конфиг может
         # измениться уже после запуска, а status() должен не врать.
         "routing_mode": config.normalise_routing_mode(routing_mode),
@@ -1341,8 +1370,17 @@ def status() -> dict:
         "port": RUNNING.get("port") or saved.get("port") or DEFAULT_PORT,
         "system_proxy": system_proxy_enabled(),
         "since": RUNNING.get("since") or saved.get("since", 0),
-        # True = YouTube/Discord тоже через прокси (zapret не работает).
+        # True = поток через прокси (youtube_via_vpn или резервный режим).
+        # Конкретные группы — в ``youtube_proxy``/``discord_proxy`` ниже.
         "stream": bool(RUNNING.get("stream", saved.get("stream", False))),
+        # Фактические маршруты групп: status() отдаёт их и для старой записи
+        # состояния, где есть только общий ``stream``.
+        "youtube_proxy": bool(RUNNING.get(
+            "youtube_proxy", saved.get("youtube_proxy",
+                                       RUNNING.get("stream", saved.get("stream", False))))),
+        "discord_proxy": bool(RUNNING.get(
+            "discord_proxy", saved.get("discord_proxy",
+                                       RUNNING.get("stream", saved.get("stream", False))))),
         "blocked_list": _blocked_available(),
         # Режим маршрутизации: фактический у работающего ядра, иначе из конфига.
         "routing_mode": _routing_mode(saved),
@@ -1471,8 +1509,16 @@ def _restart_with_stream(enable: bool, cfg: dict | None = None) -> dict:
         return {"ok": False, "error": "прокси не подключён"}
 
     saved = _saved_state()
-    if bool(saved.get("stream", False)) == bool(enable):
-        return {"ok": True, "unchanged": True, "stream": bool(enable)}
+    current_stream = bool(saved.get("stream", False))
+    current_youtube = bool(saved.get("youtube_proxy", current_stream))
+    current_discord = bool(saved.get("discord_proxy", current_stream))
+    # Резерв уводит в VPN обе группы. Выключение возвращает YouTube к его
+    # флагу, а Discord — напрямую. Сравнение только общего ``stream``
+    # пропускало переход «YouTube уже через VPN, Discord ещё нет».
+    want_youtube = True if enable else bool(cfg.get("youtube_via_vpn"))
+    want_discord = bool(enable)
+    if (current_youtube, current_discord) == (want_youtube, want_discord):
+        return {"ok": True, "unchanged": True, "stream": current_stream}
 
     port = int(saved.get("port") or cfg.get("xray_port") or DEFAULT_PORT)
     server = None
@@ -1537,6 +1583,24 @@ def _desired_stream(cfg: dict, saved_stream: bool = False) -> bool:
         return bool(saved_stream)
 
 
+def _fallback_active(cfg: dict) -> bool:
+    """Идёт ли резервный режим: zapret включён в настройках, но не запущен.
+
+    В резервном режиме в прокси уходят обе группы — без zapret и YouTube,
+    и Discord напрямую не открываются. Ошибку статуса считаем «не резервом»:
+    лишний VPN для Discord хуже, чем прямой маршрут под работающий zapret.
+    """
+    if not (cfg or {}).get("xray_stream_fallback", True):
+        return False
+    try:
+        from . import status as status_module
+
+        zapret = (status_module.collect(cfg).get("zapret") or {})
+        return not bool(zapret.get("running"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _blocked_preset(cfg: dict) -> tuple[str | None, bool]:
     """Правило встроенного списка Re:filter и признак «файл на месте».
 
@@ -1562,13 +1626,18 @@ def _start(cfg: dict | None = None, extra_domains: list[str] | None = None,
            discord_via_proxy: bool | None = None) -> dict:
     """Тело ``start`` — вызывается под замком."""
     cfg = cfg or config.load_config()
-    stream = _effective_stream(cfg, stream_via_proxy)
+    fallback = _fallback_active(cfg)
+    stream = bool(_effective_stream(cfg, stream_via_proxy) or fallback)
     if discord_via_proxy is None:
         try:
             discord_via_proxy = bool(
                 config.load_state().get("zapret_user_off"))
         except Exception:  # noqa: BLE001
             discord_via_proxy = False
+    # Фактические маршруты: YouTube — по потоку, Discord — по своему флагу или
+    # по резервному режиму. Эти же значения уходят в состояние и системный прокси.
+    youtube_proxy = bool(stream)
+    discord_proxy = bool(discord_via_proxy or fallback)
     try:
         droute_port = int(cfg.get("droute_socks_port") or 10819)
     except (TypeError, ValueError):
@@ -1582,11 +1651,14 @@ def _start(cfg: dict | None = None, extra_domains: list[str] | None = None,
         # Фактический режим потока, а не из конфига: конфиг мог измениться
         # уже после запуска ядра.
         actual_stream = bool(info.get("stream", stream))
+        actual_youtube = bool(info.get("youtube_proxy", actual_stream))
+        actual_discord = bool(info.get("discord_proxy", actual_stream))
         if cfg.get("xray_system_proxy", True):
             # Ядро уже работает, но системный прокси мог остаться выключенным
             # после падения/перезапуска — браузеры не должны ходить мимо.
             try:
-                set_system_proxy(True, actual_port, actual_stream)
+                set_system_proxy(True, actual_port, actual_youtube,
+                                 actual_discord)
             except Exception:  # noqa: BLE001
                 pass
         # Контракт один для обеих веток: ``server`` — словарь, порт и stream
@@ -1652,7 +1724,8 @@ def _start(cfg: dict | None = None, extra_domains: list[str] | None = None,
                          current_server=server, dns_hosts=dns_hosts,
                          priority_proxy_domains=priority_proxy,
                          droute_port=droute_port,
-                         discord_via_proxy=bool(discord_via_proxy))
+                         discord_via_proxy=bool(discord_via_proxy),
+                         stream_fallback=fallback)
     for warning in built.warnings:
         _warn_once(warning, warning)
     payload = json.dumps(built, ensure_ascii=False, indent=2)
@@ -1677,6 +1750,7 @@ def _start(cfg: dict | None = None, extra_domains: list[str] | None = None,
             [str(exe), "-c", str(config_path)],
             cwd=str(exe.parent), env=env,
             stdin=subprocess.DEVNULL, stdout=log_handle, stderr=subprocess.STDOUT,
+            close_fds=True,
             creationflags=actions.CREATE_NO_WINDOW,
         )
     except OSError as exc:
@@ -1686,8 +1760,11 @@ def _start(cfg: dict | None = None, extra_domains: list[str] | None = None,
     RUNNING.update({"process": process, "server": server, "port": port,
                     "since": time.time(), "config": str(config_path),
                     "stream": bool(stream), "routing_mode": mode,
+                    "youtube_proxy": youtube_proxy,
+                    "discord_proxy": discord_proxy,
                     "log": log_handle})
-    _save_state(server, port, stream, mode)
+    _save_state(server, port, stream, mode,
+                youtube_proxy=youtube_proxy, discord_proxy=discord_proxy)
 
     # Ждём, пока порт начнёт слушать.
     deadline = time.time() + 15
@@ -1705,8 +1782,9 @@ def _start(cfg: dict | None = None, extra_domains: list[str] | None = None,
                     "log": _read_log()}
         if _port_open(port):
             if cfg.get("xray_system_proxy", True):
-                # При stream=False домены YouTube/Discord уйдут в обход прокси.
-                set_system_proxy(True, port, stream)
+                # Обход системного прокси — по фактическому маршруту групп:
+                # Discord при своём выключенном флаге остаётся в обходе.
+                set_system_proxy(True, port, youtube_proxy, discord_proxy)
             return {"ok": True, "server": server, "port": port,
                     "latency": server.get("latency", -1),
                     "blocked_list": blocked_ok}
@@ -2122,22 +2200,29 @@ def _group_is_proxied(group: tuple[str, ...], proxy_set: set[str]) -> bool:
     return False
 
 
-def _proxy_bypass_list(stream_via_proxy: bool | None = None) -> str:
+def _proxy_bypass_list(stream_via_proxy: bool | None = None,
+                       discord_via_proxy: bool | None = None,
+                       cfg: dict | None = None) -> str:
     """Исключения системного прокси.
 
-    Базовые сети, пользовательские и аудиторские direct-домены. Когда
-    YouTube/Discord идут напрямую под zapret (``stream_via_proxy`` ложно),
-    их домены тоже добавляются в обход системного прокси — иначе браузер
-    гонит TCP через локальный Xray лишним хопом. Если домен явно отправлен
-    в VPN пользовательским правилом, он в обход не попадает.
+    Базовые сети, пользовательские и аудиторские direct-домены. Домены группы,
+    которая идёт напрямую под zapret, тоже добавляются в обход системного
+    прокси — иначе браузер гонит TCP через локальный Xray лишним хопом.
+    Группы считаются раздельно: ``stream_via_proxy`` — YouTube,
+    ``discord_via_proxy`` — Discord (``None`` — как у YouTube, для старых
+    вызовов). Если домен явно отправлен в VPN пользовательским правилом,
+    он в обход не попадает.
     """
     from . import routes
 
     parts = ["localhost", "127.*", "10.*", "172.16.*", "192.168.*", "<local>"]
-    try:
-        cfg = config.load_config()
-    except Exception:  # noqa: BLE001
-        cfg = {}
+    if cfg is None:
+        # Без готового cfg path-поиск zapret (autodetect) обходит диски;
+        # в цикле трея это недопустимо, поэтому вызывающий передаёт cfg.
+        try:
+            cfg = config.load_config()
+        except Exception:  # noqa: BLE001
+            cfg = {}
     user_direct, user_proxy = routes.user_routes(cfg)
     proxy_set = set(user_proxy)
     try:
@@ -2167,15 +2252,17 @@ def _proxy_bypass_list(stream_via_proxy: bool | None = None) -> str:
         name = routes.clean_domain(raw)
         if name and name not in proxy_set:
             entries.append((name, raw.strip().startswith("*.")))
-    if not bool(stream_via_proxy) and config.normalise_routing_mode(
-            (cfg or {}).get("routing_mode")) != "all":
+    if config.normalise_routing_mode((cfg or {}).get("routing_mode")) != "all":
         # В режиме "all" YouTube/Discord идут через VPN, поэтому в обход
         # системного прокси их не добавляем: иначе браузер ходил бы мимо.
-        # YouTube/Discord закрывает zapret: браузер должен идти мимо Xray.
-        # Если пользователь отправил в VPN хотя бы один домен группы, из
-        # обхода убираем всю группу — иначе часть трафика пойдёт напрямую.
-        youtube_proxied = _group_is_proxied(YOUTUBE_GROUP, proxy_set)
-        discord_proxied = _group_is_proxied(DISCORD_GROUP, proxy_set)
+        # Домены группы, которая реально идёт напрямую под zapret, остаются
+        # в обходе: у YouTube и Discord теперь разные флаги.
+        youtube_proxied = (bool(stream_via_proxy)
+                           or _group_is_proxied(YOUTUBE_GROUP, proxy_set))
+        discord_proxied = (
+            bool(stream_via_proxy) if discord_via_proxy is None
+            else bool(discord_via_proxy)
+        ) or _group_is_proxied(DISCORD_GROUP, proxy_set)
         for raw in STREAM_DOMAINS:
             name = routes.clean_domain(raw)
             if not name or name.startswith("geosite:"):
@@ -2194,6 +2281,76 @@ def _proxy_bypass_list(stream_via_proxy: bool | None = None) -> str:
         if wildcard and alias not in parts:
             parts.append(alias)
     return ";".join(parts)
+
+
+def _bypass_items(value) -> list[str]:
+    """Элементы ProxyOverride: строка из реестра или готовый список."""
+    if isinstance(value, str):
+        parts = value.split(";")
+    else:
+        parts = list(value or [])
+    return [str(part).strip() for part in parts if str(part or "").strip()]
+
+
+def _is_stream_entry(name: str) -> bool:
+    """Относится ли запись обхода к группам YouTube/Discord."""
+    text = str(name or "").strip().lower()
+    if text.startswith("*."):
+        text = text[2:]
+    for group in (YOUTUBE_GROUP, DISCORD_GROUP):
+        for member in group:
+            if text == member or text.endswith("." + member):
+                return True
+    return False
+
+
+def _merge_bypass(desired: list[str], actual: list[str]) -> list[str]:
+    """Желаемый обход плюс чужие записи, не относящиеся к нашим группам.
+
+    Записи YouTube/Discord — наши: если группа ушла в VPN, её домены должны
+    исчезнуть из исключений. Остальные записи (старые Steam, корпоративные,
+    добавленные вручную) сохраняем: мы не знаем, кто их поставил.
+    """
+    wanted = {item.lower() for item in desired}
+    merged = list(desired)
+    for item in actual:
+        key = item.lower()
+        if key in wanted or _is_stream_entry(item):
+            continue
+        merged.append(item)
+        wanted.add(key)
+    return merged
+
+
+def refresh_system_proxy_bypass(youtube_proxy: bool = False,
+                                discord_proxy: bool | None = None,
+                                cfg: dict | None = None) -> dict:
+    """Обновляет ProxyOverride, только если он разошёлся с желаемым списком.
+
+    Нужен, когда системный прокси уже включён и указывает на нас: иначе
+    после смены маршрута (например, включения ``youtube_via_vpn``) в реестре
+    остаётся старый обход до перезапуска ядра. Сравнение идёт по
+    нормализованным записям, поэтому при совпадении реестр не трогаем.
+    """
+    if not sys.platform.startswith("win"):
+        return {"ok": False, "error": "только Windows"}
+    desired = _bypass_items(_proxy_bypass_list(youtube_proxy, discord_proxy,
+                                               cfg))
+    actual = _bypass_items(system_proxy_bypass())
+    merged = _merge_bypass(desired, actual)
+    if {item.lower() for item in merged} == {item.lower() for item in actual}:
+        return {"ok": True, "changed": False}
+    try:
+        import winreg
+
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, _INTERNET_SETTINGS, 0,
+                                winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, "ProxyOverride", 0, winreg.REG_SZ,
+                              ";".join(merged))
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+    _refresh_wininet()
+    return {"ok": True, "changed": True, "count": len(merged)}
 
 
 def proxy_backup_path() -> Path:
@@ -2254,13 +2411,15 @@ def _write_proxy_values(key, values: dict) -> None:
 
 
 def set_system_proxy(enable: bool, port: int = DEFAULT_PORT,
-                     stream_via_proxy: bool = False) -> dict:
+                     stream_via_proxy: bool = False,
+                     discord_via_proxy: bool | None = None) -> dict:
     """Включает/выключает системный прокси (только HKCU — права не нужны).
 
-    Перед первой модификацией прежние значения (например, корпоративный
-    прокси) кладутся в ``proxy_backup.json`` рядом с конфигом: раньше включение
-    затирало ProxyServer/ProxyOverride, а выключение просто удаляло их, и
-    настройки пользователя терялись навсегда.
+    ``stream_via_proxy`` и ``discord_via_proxy`` — фактические маршруты групп:
+    по ним строится список обхода. Перед первой модификацией прежние значения
+    (например, корпоративный прокси) кладутся в ``proxy_backup.json`` рядом с
+    конфигом: раньше включение затирало ProxyServer/ProxyOverride, а выключение
+    просто удаляло их, и настройки пользователя терялись навсегда.
     """
     if not sys.platform.startswith("win"):
         return {"ok": False}
@@ -2286,7 +2445,7 @@ def set_system_proxy(enable: bool, port: int = DEFAULT_PORT,
                 winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, own)
                 winreg.SetValueEx(
                     key, "ProxyOverride", 0, winreg.REG_SZ,
-                    _proxy_bypass_list(stream_via_proxy),
+                    _proxy_bypass_list(stream_via_proxy, discord_via_proxy),
                 )
             else:
                 own = f"127.0.0.1:{int(port)}"

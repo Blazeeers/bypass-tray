@@ -92,7 +92,8 @@ def enable() -> bool:
     try:
         completed = subprocess.run(
             ["powershell", "-NoProfile", "-Command", script],
-            capture_output=True, timeout=30, creationflags=CREATE_NO_WINDOW,
+            capture_output=True, timeout=30, close_fds=True,
+            creationflags=CREATE_NO_WINDOW,
         )
     except (OSError, subprocess.SubprocessError):
         _discard(temp)

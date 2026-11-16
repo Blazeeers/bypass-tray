@@ -134,6 +134,54 @@ class HealthFallbackTests(unittest.TestCase):
         self.assertEqual(len(self.rolled), 1)
         self.assertTrue(any("откатаны" in text for text, _kind in self.logs))
 
+    def test_youtube_flag_keeps_discord_fallback(self) -> None:
+        # YouTube уже в VPN по своему флагу, но при падении zapret Discord
+        # тоже должен уйти в VPN: общий stream больше не блокирует решение.
+        controller = _controller(broken=None)
+        controller.cfg["youtube_via_vpn"] = True
+        controller.proxy = {"running": True, "busy": False, "stream": True,
+                            "youtube_proxy": True, "discord_proxy": False,
+                            "server": "s1"}
+        controller.status = {"zapret": {"running": False}}
+        controller._stream_since = time.time() - 46
+        with mock.patch.object(xray, "restart_with_stream",
+                               return_value={"ok": True}) as restart:
+            controller.check_stream_fallback()
+        restart.assert_called_once_with(True, controller.cfg)
+
+    def test_discord_broken_escalates_when_youtube_proxied(self) -> None:
+        # Сломан Discord, YouTube уже в VPN: оверрайд нужен только Discord.
+        controller = _controller(broken=None)
+        controller.cfg["youtube_via_vpn"] = True
+        controller.proxy = {"running": True, "busy": False, "stream": True,
+                            "youtube_proxy": True, "discord_proxy": False,
+                            "server": "s1"}
+        controller.status = {"zapret": {"running": True}}
+        controller.health_report = {"items": [
+            {"id": "youtube", "state": "ok"},
+            {"id": "discord", "state": "bad"}]}
+        controller.check_stream_fallback()
+        self.assertEqual(self.enabled, [["discord"]])
+
+    def test_partial_fallback_is_not_unchanged(self) -> None:
+        # YouTube уже в VPN, Discord ещё нет: это не «unchanged», нужен рестарт.
+        saved = {"stream": True, "youtube_proxy": True, "discord_proxy": False,
+                 "port": 10818, "link": "vless://x@y:443", "extra": []}
+        with mock.patch.object(xray, "is_running", return_value=True), \
+                mock.patch.object(xray, "_saved_state", return_value=saved), \
+                mock.patch.object(xray, "parse_link",
+                                  return_value={"host": "y", "port": 443,
+                                                "outbound": {}}), \
+                mock.patch.object(xray, "_kill_process"), \
+                mock.patch.object(xray.time, "sleep"), \
+                mock.patch.object(xray, "start",
+                                  return_value={"ok": True}) as start:
+            result = xray._restart_with_stream(
+                True, {"youtube_via_vpn": True})
+        self.assertNotIn("unchanged", result)
+        self.assertTrue(result.get("ok"))
+        start.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
