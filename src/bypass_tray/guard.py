@@ -22,7 +22,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from . import actions, activity, networks, routes, status
+from . import actions, activity, config, networks, routes, status
 
 ZAPRET_WARN = "zapret остановлен — запустите вручную"
 #: Одно и то же предупреждение — не чаще раза в час.
@@ -89,6 +89,9 @@ def _tgws_port(cfg: dict) -> int:
 
 
 def _heal_tgws(cfg: dict, status_state: dict) -> list[dict]:
+    # Маршрут Telegram через Xray: tg-ws-proxy выключен намеренно, а не упал.
+    if config.normalise_telegram_mode(cfg.get("telegram_mode")) != "tgws":
+        return []
     info = status_state.get("tgwsproxy") or {}
     if info.get("listening") or info.get("running"):
         return []

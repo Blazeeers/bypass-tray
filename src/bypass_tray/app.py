@@ -15,7 +15,7 @@ except ImportError:  # pragma: no cover
 
 from . import (
     actions, activity, autostart, config, diagnose, droute, guard, health, history,
-    icons, networks, routes, secrets, status, strategy, updates, xray,
+    icons, networks, routes, secrets, status, strategy, telegram, updates, xray,
 )
 from .theme import STATE_COLORS
 from .ui import Panel, clean_server_name, report_level
@@ -87,6 +87,11 @@ class TrayApp:
         self._droute_warned = False
         # Мы уже сказали «упал»: вернуть ok, когда процесс снова слушает.
         self._tgws_down = False
+        # Маршрут Telegram применяется один раз после старта, когда стихнут
+        # автоподключение и обновления.
+        self._telegram_applied = False
+        self._telegram_next_try = 0.0
+        self._started_at = time.time()
         self.panel = Panel(self)
         self._icon = None
         self._signature = None
@@ -452,6 +457,12 @@ class TrayApp:
         (``_tgws_user_off``) сторожа выключает — с пользователем не воюем.
         """
         if self._tgws_user_off or self._shutting_down:
+            return
+        # В режиме xray tg-ws-proxy выключен намеренно: сторож не должен
+        # возвращать 1443 против выбора пользователя.
+        if self._telegram_mode() != "tgws":
+            return
+        if (self.busy or {}).get("telegram"):
             return
         # Эти проходы сами поднимают tgws (надзиратель, обновление, кнопка):
         # второй параллельный запуск нам не нужен.
@@ -1538,7 +1549,7 @@ class TrayApp:
 
     # ---- запуск компонентов из панели -------------------------------------
     def _run_action_busy(self, key: str, text: str, fn, *args,
-                         after=None) -> bool:
+                         after=None, silent_errors: bool = False) -> bool:
         if self.busy.get(key):
             return False
         self.busy[key] = text
@@ -1555,7 +1566,8 @@ class TrayApp:
                     # Windows молча подавляется фокус-ассистом.
                     activity.log(f"{text} не удалось: {exc}", kind="warn")
                     self.refresh_activity()
-                    self.notify(str(exc))
+                    if not silent_errors:
+                        self.notify(str(exc))
                 if ok and after is not None:
                     # busy не снимаем до конца after(): глубокая проба и
                     # перезапуск Xray не должны пускать второй тумблер.
@@ -1889,6 +1901,10 @@ class TrayApp:
 
     def start_tgws(self) -> bool:
         # Ручной запуск снимает запрет, поставленный «Остановить».
+        if self._telegram_mode() != "tgws":
+            activity.log("tg-ws-proxy запущен вручную: режим Telegram остаётся Xray",
+                         kind="warn")
+            self.refresh_activity()
         self._tgws_user_off = False
         self._tgws_down = False
         return self._run_action_busy("tgws", "запускаю tg-ws-proxy…",
@@ -1896,6 +1912,10 @@ class TrayApp:
 
     def stop_tgws(self) -> bool:
         """Ручная остановка: авто-перезапуск выключается до следующего запуска."""
+        if self._telegram_mode() == "tgws":
+            activity.log("tg-ws-proxy остановлен вручную: режим Telegram "
+                         "остаётся tg-ws-proxy", kind="warn")
+            self.refresh_activity()
         self._tgws_user_off = True
         return self._run_action_busy("tgws", "останавливаю tg-ws-proxy…",
                                      actions.stop_tgws)
@@ -1910,6 +1930,84 @@ class TrayApp:
             actions.start_tgws(self.cfg)
 
         return self._run_action_busy("tgws", "перезапускаю tg-ws-proxy…", action)
+
+    # ---- маршрут Telegram ---------------------------------------------------
+    def _telegram_mode(self) -> str:
+        return config.normalise_telegram_mode(self.cfg.get("telegram_mode"))
+
+    def set_telegram_mode(self, mode: str) -> bool:
+        """Пункт трея: применяет режим, и только затем сохраняет его.
+
+        При отказе конфиг не меняется: приложение остаётся на прежнем
+        маршруте, а причина уходит в тост и журнал.
+        """
+        mode = config.normalise_telegram_mode(mode)
+        if self.busy.get("telegram") or self.proxy.get("busy"):
+            return False
+        text = ("переключаю Telegram на Xray…" if mode == "xray"
+                else "переключаю Telegram на tg-ws-proxy…")
+
+        def action() -> dict:
+            result = self._apply_telegram_mode(mode)
+            updated = {**self.cfg, "telegram_mode": mode}
+            if not config.save_config(updated):
+                raise RuntimeError("не удалось сохранить режим в config.json")
+            self.cfg["telegram_mode"] = mode
+            self._signature = None
+            return result
+
+        return self._run_action_busy("telegram", text, action)
+
+    def _apply_telegram_mode(self, mode: str, notify: bool = True,
+                             start_xray: bool = True) -> dict:
+        result = telegram.apply(self.cfg, mode, start_xray=start_xray)
+        if not result.get("ok"):
+            raise RuntimeError(str(result.get("error") or "не удалось"))
+        changed = bool(result.get("changed"))
+        if result.get("stopped_tgws"):
+            activity.log("Telegram: tg-ws-proxy остановлен — маршрут через Xray",
+                         kind="ok")
+        elif changed:
+            endpoint = str(result.get("endpoint") or "")
+            label = "Xray" if result.get("mode") == "xray" else "tg-ws-proxy"
+            activity.log(f"Telegram: маршрут через {label} ({endpoint})", kind="ok")
+        if changed:
+            self.refresh_activity()
+        if notify:
+            hint = str(result.get("hint") or "")
+            if hint:
+                self.notify(hint)
+        return result
+
+    def _maybe_apply_telegram(self) -> None:
+        """Однократно приводит маршрут Telegram к сохранённому режиму.
+
+        Ждёт, пока стихнут автоподключение и обновления. В режиме xray сам
+        Xray не поднимает: это делает автоподключение, а трей не должен
+        включать VPN против воли пользователя. При ошибке повторяет попытку
+        не чаще раза в минуту.
+        """
+        if self._telegram_applied or self._shutting_down:
+            return
+        if time.time() - getattr(self, "_started_at", 0.0) < 8.0:
+            return
+        if time.time() < getattr(self, "_telegram_next_try", 0.0):
+            return
+        if self.busy or self.proxy.get("busy") or self.updates_running:
+            return
+        if self.health_running or self.guard_running:
+            return
+        self._telegram_next_try = time.time() + 60.0
+        mode = self._telegram_mode()
+
+        def done() -> None:
+            self._telegram_applied = True
+
+        self._run_action_busy(
+            "telegram", "применяю маршрут Telegram…",
+            lambda: self._apply_telegram_mode(mode, notify=False,
+                                              start_xray=False),
+            after=done, silent_errors=True)
 
     # ---- сеть --------------------------------------------------------------
     def check_network(self) -> None:
@@ -2179,7 +2277,9 @@ class TrayApp:
             zapret.get("strategy"),
             tuple(zapret.get("bats") or ()),
             tgws.get("listening"),
+            self.cfg.get("telegram_mode"),
             self.proxy.get("running"),
+            self.proxy.get("busy"),
             self.proxy.get("server"),
             self.state.get("updates_note"),
             (self.updates_report or {}).get("app") or {},
@@ -2286,6 +2386,24 @@ class TrayApp:
         else:
             proxy_text = self.proxy.get("message") or "выключен"
 
+        telegram_busy = bool(self.busy.get("telegram") or self.proxy.get("busy"))
+        telegram_items = [
+            pystray.MenuItem(
+                f"через Xray (SOCKS5 {telegram.xray_port(self.cfg)})",
+                lambda icon, item: self.set_telegram_mode("xray"),
+                radio=True,
+                checked=lambda item: self._telegram_mode() == "xray",
+                enabled=not telegram_busy,
+            ),
+            pystray.MenuItem(
+                f"через tg-ws-proxy ({telegram.tgws_port(self.cfg)})",
+                lambda icon, item: self.set_telegram_mode("tgws"),
+                radio=True,
+                checked=lambda item: self._telegram_mode() == "tgws",
+                enabled=not telegram_busy,
+            ),
+        ]
+
         return pystray.Menu(
             pystray.MenuItem(f"zapret: {zapret_text}", None, enabled=False),
             pystray.MenuItem(f"tg-ws-proxy: {tgws_text}", None, enabled=False),
@@ -2315,6 +2433,8 @@ class TrayApp:
                 lambda icon, item: self.set_proxy(False),
                 enabled=proxy_running and not proxy_busy,
             ),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Telegram", pystray.Menu(*telegram_items)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("tg-ws-proxy: запустить", lambda icon, item: self.start_tgws()),
             pystray.MenuItem("tg-ws-proxy: остановить", lambda icon, item: self.stop_tgws()),
@@ -2520,6 +2640,7 @@ class TrayApp:
                 self.refresh()
                 self._maybe_droute_startup()
                 self.check_proxy_health()
+                self._maybe_apply_telegram()
                 # Во время обновления/лечения не трогаем режим потока и не
                 # лечим повторно: иначе можно оборвать чужой перезапуск Xray.
                 if not self.busy and not self.updates_running:

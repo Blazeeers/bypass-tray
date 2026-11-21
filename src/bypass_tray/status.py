@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .config import normalise_routing_mode
+from .config import normalise_routing_mode, normalise_telegram_mode
 
 try:
     import psutil
@@ -199,6 +199,13 @@ def collect(cfg: dict) -> dict:
     except (TypeError, ValueError):
         # Кривой порт в конфиге не должен ронять сбор статусов целиком.
         port = 1443
+    try:
+        xray_port = int(cfg.get("xray_port") or 10818)
+    except (TypeError, ValueError):
+        xray_port = 10818
+    telegram_mode = normalise_telegram_mode(cfg.get("telegram_mode"))
+    telegram_endpoint = (f"127.0.0.1:{xray_port}" if telegram_mode == "xray"
+                         else f"127.0.0.1:{port}")
 
     raw_dir = cfg.get("zapret_dir") or ""
     # Пустой путь нельзя превращать в Path("") — это текущий каталог, и он
@@ -247,6 +254,8 @@ def collect(cfg: dict) -> dict:
             "as_service": bool(service_cmd),
         },
         "tgwsproxy": {"running": bool(tgws), "port": port, "listening": port_open(port)},
+        # Выбранный маршрут Telegram и адрес, который нужно указать в клиенте.
+        "telegram": {"mode": telegram_mode, "endpoint": telegram_endpoint},
         "admin": is_admin(),
         # Что реально покрыто прокси: режим, включён ли системный прокси и
         # какие домены из него исключены (ProxyOverride из реестра).

@@ -372,6 +372,9 @@ DEFAULTS: dict = {
     "zapret_bat": "general (ALT).bat",
     "tgws_exe": "",
     "tgws_port": 1443,
+    # Куда вести Telegram: "xray" — SOCKS5 локального Xray, "tgws" — MTProto
+    # tg-ws-proxy. Клиент выбирает прокси сам; ключ задаёт серверную сторону.
+    "telegram_mode": "xray",
     "refresh_seconds": 5,
     "update_check_hours": 24,
     # Тема панели: auto — по системной теме Windows, либо принудительно
@@ -449,6 +452,9 @@ ROUTING_MODES = ("blocked", "all")
 #: не распознано, тоже становится ``auto``.
 THEME_MODES = ("auto", "light", "dark")
 
+#: Маршрут Telegram: через Xray (SOCKS5) или через tg-ws-proxy (MTProto).
+TELEGRAM_MODES = ("xray", "tgws")
+
 
 def normalise_theme_mode(value) -> str:
     """Значение ``theme_mode`` из конфига; неизвестное — ``auto``."""
@@ -473,6 +479,12 @@ def normalise_routing_mode(value) -> str:
     """Значение ``routing_mode`` из конфига; неизвестное — ``blocked``."""
     mode = str(value).strip().lower() if isinstance(value, str) else ""
     return mode if mode in ROUTING_MODES else "blocked"
+
+
+def normalise_telegram_mode(value) -> str:
+    """Маршрут Telegram; без ключа и при мусоре — ``xray``."""
+    mode = str(value).strip().lower() if isinstance(value, str) else ""
+    return mode if mode in TELEGRAM_MODES else "xray"
 
 
 def _home(*parts: str) -> Path:
@@ -567,6 +579,24 @@ def autodetect_tgws() -> str:
     return ""
 
 
+def tgws_already_used(cfg: dict) -> bool:
+    """Работал ли tg-ws-proxy сам по себе — признак для миграции режима.
+
+    Нужен только старому конфигу без ``telegram_mode``: если MTProto-прокси
+    уже запущен или настроен и слушает, молча гасить его при первом старте
+    новой версии нельзя.
+    """
+    try:
+        from . import actions  # локально: actions импортирует status, а тот config
+
+        if actions.tgws_running():
+            return True
+        return bool(str((cfg or {}).get("tgws_exe") or "").strip()) \
+            and actions.port_open(actions.tgws_port(cfg))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _migrate_routes(cfg: dict) -> None:
     """Однократно переносит старые списки доменов в ``xray_routes``.
 
@@ -658,6 +688,18 @@ def load_config() -> dict:
     # Старые config.json читаются как раньше: без ключа режим — "blocked",
     # неизвестное значение тоже сводится к нему (без записи файла).
     cfg["routing_mode"] = normalise_routing_mode(cfg.get("routing_mode"))
+    # Как и routing_mode: отсутствие ключа — "xray" без перезаписи файла,
+    # неизвестное значение сводится к "xray" и сохраняется нормализованным.
+    cfg["telegram_mode"] = normalise_telegram_mode(cfg.get("telegram_mode"))
+    # Старый конфиг без ключа: если tg-ws-proxy уже работает сам по себе,
+    # сохраняем привычный маршрут — иначе первое обновление погасило бы 1443.
+    # Тесты подменяют каталог данных и миграцию не запускают: опрос процессов
+    # на чужой машине делает их недетерминированными.
+    telegram_migrated = False
+    if (isinstance(data, dict) and "telegram_mode" not in data
+            and _OVERRIDE_DIR is None and tgws_already_used(cfg)):
+        cfg["telegram_mode"] = "tgws"
+        telegram_migrated = True
     # Прежний ключ ``theme`` (до появления ``theme_mode``) продолжает
     # работать: если нового ключа в файле нет, значение берётся из старого и
     # файл переписывается с новым именем.
@@ -677,12 +719,14 @@ def load_config() -> dict:
         normalised = (
             ("routing_mode" in data
              and data.get("routing_mode") != cfg["routing_mode"])
+            or ("telegram_mode" in data
+                and data.get("telegram_mode") != cfg["telegram_mode"])
             or ("xray_links" in data
                 and data.get("xray_links") != cfg["xray_links"])
             or ("theme_mode" in data
                 and data.get("theme_mode") != cfg["theme_mode"])
             or legacy_theme)
-    changed = raw is None
+    changed = raw is None or telegram_migrated
     migrated = False
     if "xray_routes" not in cfg:
         _migrate_routes(cfg)

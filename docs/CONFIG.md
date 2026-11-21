@@ -17,6 +17,7 @@
 | `zapret_bat` | Какую стратегию запускать | `general (ALT).bat` |
 | `tgws_exe` | Путь к `TgWsProxy_windows.exe` | автопоиск |
 | `tgws_port` | Порт локального MTProto-прокси | `1443` |
+| `telegram_mode` | Маршрут Telegram: `xray` (SOCKS5 локального Xray) или `tgws` (MTProto tg-ws-proxy). Клиент выбирает прокси сам; ключ задаёт серверную сторону | `xray` |
 | `refresh_seconds` | Период обновления статусов, с | `5` |
 | `update_check_hours` | Период проверки обновлений, ч | `24` |
 | `theme` | Оформление панели: `auto` (по системе), `light`, `dark` | `auto` |

@@ -1027,7 +1027,8 @@ def build_config(server: dict, port: int, extra_domains: list[str] | None = None
     (только вне ``all``), 4) proxy-оверрайды сервисов и аудита,
     5) YouTube/Discord напрямую (если не резервный режим и не ``all``),
     6) встроенный список заблокированных ``blocked_rule`` через прокси,
-    7) РФ/private напрямую.
+    7) IP-подсети Telegram (``geoip:telegram``) через прокси — выше РФ,
+    8) РФ/private напрямую.
 
     ``stream_via_proxy`` уводит в прокси только YouTube, ``discord_via_proxy`` —
     только Discord. ``stream_fallback`` — резервный режим (zapret не работает):
@@ -1163,6 +1164,14 @@ def build_config(server: dict, port: int, extra_domains: list[str] | None = None
             "type": "field", "outboundTag": "proxy",
             "domain": [str(blocked_rule)],
         })
+    rules.append({
+        # Telegram Desktop в MTProto ходит на IP дата-центров без домена,
+        # поэтому доменные правила (в том числе geosite:telegram) его не ловят
+        # и трафик уходит в direct, где DPI рвёт соединение. Правило по IP
+        # обязано стоять выше geoip:ru: часть подсетей Telegram — российские.
+        "type": "field", "outboundTag": "proxy",
+        "ip": ["geoip:telegram"],
+    })
     rules += [
         # Российские сервисы и локальная сеть — всегда напрямую.
         {"type": "field", "outboundTag": "direct",
@@ -1272,6 +1281,30 @@ def _domain_rule(domain: str) -> str:
 
 def config_path() -> Path:
     return config.config_dir() / "xray-config.json"
+
+
+def has_rule(outbound: str = "proxy", ip: str = "geoip:telegram") -> bool:
+    """Есть ли в сгенерированном конфиге правило ``ip`` через ``outbound``.
+
+    Проверяется именно файл, с которым запущено ядро: правило Telegram по IP
+    (``geoip:telegram``) не видно по доменным спискам, а конфиг мог быть
+    собран до его появления.
+    """
+    try:
+        data = json.loads(config_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    routing = data.get("routing") if isinstance(data, dict) else None
+    rules = (routing or {}).get("rules") if isinstance(routing, dict) else None
+    for rule in rules or []:
+        if not isinstance(rule, dict) or rule.get("outboundTag") != outbound:
+            continue
+        ips = rule.get("ip") or []
+        if isinstance(ips, str):
+            ips = [ips]
+        if ip in ips:
+            return True
+    return False
 
 
 def state_path() -> Path:

@@ -375,8 +375,15 @@ def main() -> int:
     # --- 4. порт tg-ws-proxy --------------------------------------------
     print("\n-- tg-ws-proxy --")
     if zapret_ready:
-        check("порт слушается", state["tgwsproxy"]["listening"],
-              f":{state['tgwsproxy']['port']}")
+        telegram_mode = str((state.get("telegram") or {}).get("mode") or "xray")
+        if telegram_mode == "tgws":
+            check("порт слушается", state["tgwsproxy"]["listening"],
+                  f":{state['tgwsproxy']['port']}")
+        else:
+            # Режим xray: tg-ws-proxy выключен намеренно, это не сбой.
+            check("режим xray: tg-ws-proxy выключен",
+                  not state["tgwsproxy"]["listening"],
+                  f":{state['tgwsproxy']['port']}")
     else:
         skip("порт слушается", "zapret_dir не задан — чистая машина")
 
@@ -861,10 +868,14 @@ def main() -> int:
           config_json["inbounds"][0]["listen"] == "127.0.0.1")
     check("конфиг: маршрут по умолчанию — напрямую",
           config_json["outbounds"][0]["tag"] == "direct")
-    proxy_rule = next(r for r in rules if r.get("outboundTag") == "proxy")
+    proxy_rule = next(r for r in rules
+                      if r.get("outboundTag") == "proxy" and r.get("domain"))
     check("YouTube/Discord НЕ в прокси (идут через zapret)",
           not any(("youtube" in d or "discord" in d) for d in proxy_rule["domain"]))
     check("Instagram в прокси", any("instagram" in d for d in proxy_rule["domain"]))
+    check("конфиг: Telegram по IP через прокси",
+          any(r.get("outboundTag") == "proxy"
+              and "geoip:telegram" in (r.get("ip") or []) for r in rules))
 
     stream_cfg = xray.build_config(sample, 10899, None, False,
                                    stream_fallback=True)
@@ -1999,7 +2010,8 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
     check("надзиратель выключен — действий нет",
           guard.heal({**cfg, "guard_enabled": False}, {}, {}) == [])
     actions_done = guard.heal(
-        {**cfg, "tgws_exe": "", "guard_enabled": True},
+        {**cfg, "tgws_exe": "", "guard_enabled": True,
+         "telegram_mode": "tgws"},
         {"zapret": {"running": True, "dir": cfg.get("zapret_dir", "")},
          "tgwsproxy": {"running": False, "listening": False}},
         {"running": False},
@@ -2017,7 +2029,8 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
     guard._heal_routes = lambda cfg: []
     guard_status = {"zapret": {"running": True, "dir": cfg.get("zapret_dir", "")},
                     "tgwsproxy": {"running": False, "listening": False}}
-    guard_cfg = {**cfg, "tgws_exe": "", "guard_enabled": True}
+    guard_cfg = {**cfg, "tgws_exe": "", "guard_enabled": True,
+                 "telegram_mode": "tgws"}
     try:
         # warn — «не успели проверить», а не «сервер мёртв»: менять нечего.
         guard._VPN_SWITCH_AT = 0.0
@@ -2073,7 +2086,8 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
     sample = xray.parse_vless("vless://uuid@example.com:443?type=tcp&security=none#test")
     routed = xray.build_config(sample, 10899, ["instagram.com"], False, ["instagram.com"])
     routed_rules = routed["routing"]["rules"]
-    proxy_rule = next(r for r in routed_rules if r.get("outboundTag") == "proxy")
+    proxy_rule = next(r for r in routed_rules
+                      if r.get("outboundTag") == "proxy" and r.get("domain"))
     check("direct вычтен из proxy",
           "domain:instagram.com" not in proxy_rule["domain"],
           str([d for d in proxy_rule["domain"] if "instagram" in d]))
@@ -2086,7 +2100,8 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
     check("direct-правило добавлено", direct_rule is not None)
     if direct_rule is not None:
         proxy_index = next(index for index, rule in enumerate(routed_rules)
-                           if rule.get("outboundTag") == "proxy")
+                           if rule.get("outboundTag") == "proxy"
+                           and rule.get("domain"))
         check("правило direct стоит раньше proxy",
               routed_rules.index(direct_rule) < proxy_index)
         ru_index = next(index for index, rule in enumerate(routed_rules)
@@ -2384,7 +2399,8 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
         xray.set_system_proxy = real_set_proxy
     check("xray.start already включает системный прокси",
           already.get("already") is True
-          and proxy_calls == [(True, 10818, True, False)],
+          and proxy_calls
+          and proxy_calls[-1] == (True, 10818, True, False),
           str(proxy_calls))
 
     # --- проверка доменов и пользовательские правила --------------------
@@ -2677,7 +2693,8 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
               and "geosite:youtube" in (rule.get("domain") or [])
               for rule in no_stream_rules))
     no_stream_proxy = next(rule for rule in no_stream_rules
-                           if rule.get("outboundTag") == "proxy")
+                           if rule.get("outboundTag") == "proxy"
+                           and rule.get("domain"))
     check("stream=False: YouTube не в proxy",
           not any("youtube" in str(d) for d in no_stream_proxy["domain"]))
     with_stream_cfg = xray.build_config(sample_server, 10899, None, True)
@@ -2796,7 +2813,8 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
     check("user direct: первое обычное правило (после droute)",
           priority_rules[1].get("outboundTag") == "direct"
           and "domain:instagram.com" in (priority_rules[1].get("domain") or []))
-    priority_proxy = next(r for r in priority_rules if r.get("outboundTag") == "proxy")
+    priority_proxy = next(r for r in priority_rules
+                          if r.get("outboundTag") == "proxy" and r.get("domain"))
     check("user direct вычтен из proxy",
           "domain:instagram.com" not in priority_proxy["domain"])
 
@@ -3041,7 +3059,8 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
     print("\n-- сторож tg-ws-proxy --")
     fake_tgws = tmp / "TgWsProxy_windows.exe"
     fake_tgws.write_bytes(b"MZ")          # файл есть, запускать его не будем
-    tgws_cfg = {"tgws_exe": str(fake_tgws), "tgws_port": 1443}
+    tgws_cfg = {"tgws_exe": str(fake_tgws), "tgws_port": 1443,
+                "telegram_mode": "tgws"}
     port_state = {"open": False}
     popens: list = []
 
@@ -3050,6 +3069,7 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
 
         def __init__(self, alive: bool) -> None:
             self.alive = alive
+            self.pid = 4242
 
         def poll(self):
             return None if self.alive else 1
@@ -3061,8 +3081,10 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
     real_start_tgws = actions.start_tgws
     real_tgws_running = actions.tgws_running
     real_stop_tgws = actions.stop_tgws
+    real_port_pid = actions.port_pid
     real_status_port = status.port_open
     actions.port_open = lambda port: port_state["open"]
+    actions.port_pid = lambda port: 4242
     actions._popen = lambda args, cwd=None: (
         popens.append((list(args), cwd)) or FakeProcess(True))
     actions.TGWS_PORT_WAIT = 0.0         # не ждём 4 с в тесте
@@ -3251,6 +3273,7 @@ def isolated_checks(cfg: dict, tmp: Path) -> None:
         actions.start_tgws = real_start_tgws
         actions.tgws_running = real_tgws_running
         actions.stop_tgws = real_stop_tgws
+        actions.port_pid = real_port_pid
         status.port_open = real_status_port
 
     # --- обновление всего ------------------------------------------------

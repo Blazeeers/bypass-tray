@@ -2088,6 +2088,10 @@ class Panel:
             port = tgws.get("port", 1443)
             if tgws.get("listening"):
                 return "ok", f"порт {port} слушает"
+            mode = config.normalise_telegram_mode(
+                (getattr(self.controller, "cfg", {}) or {}).get("telegram_mode"))
+            if mode == "xray" and not tgws.get("running"):
+                return "off", "выключен: маршрут Telegram через Xray"
             return ("bad" if tgws.get("running") else "off"), f"порт {port} закрыт"
         return "off", "нет данных"
 

@@ -75,6 +75,49 @@ def kill_process(name_prefix: str) -> dict:
     return {"killed": killed, "denied": denied}
 
 
+def port_pid(port: int) -> int | None:
+    """PID процесса, слушающего ``port``; ``None`` — владелец неизвестен."""
+    if psutil is None:
+        return None
+    listen = getattr(psutil, "CONN_LISTEN", "LISTEN")
+    try:
+        for conn in psutil.net_connections(kind="inet"):
+            if getattr(conn, "status", "") != listen or not conn.laddr:
+                continue
+            if conn.laddr.port == port:
+                return conn.pid
+    except (psutil.AccessDenied, OSError):  # type: ignore[union-attr]
+        return None
+    return None
+
+
+def _pid_name(pid: int) -> str:
+    if psutil is None:
+        return ""
+    try:
+        return psutil.Process(pid).name()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _descends_from(pid: int, ancestor: int) -> bool:
+    """Является ли ``pid`` потомком ``ancestor`` (лаунчер → рабочий процесс)."""
+    if psutil is None or pid is None or ancestor is None:
+        return False
+    try:
+        current = psutil.Process(pid)
+        for _ in range(5):
+            parent = current.ppid()
+            if parent == ancestor:
+                return True
+            if parent <= 1:
+                return False
+            current = psutil.Process(parent)
+    except Exception:  # noqa: BLE001
+        return False
+    return False
+
+
 def hide_console_windows(name_prefix: str = "winws") -> int:
     """Скрывает окна консоли процессов с указанным префиксом имени.
 
@@ -864,12 +907,14 @@ def tgws_port(cfg: dict) -> int:
         return 1443
 
 
-def start_tgws(cfg: dict) -> bool:
+def start_tgws(cfg: dict, timeout: float | None = None) -> bool:
     """Запускает tg-ws-proxy и дожидается открытия порта.
 
-    ``True`` — только если порт действительно слушает. Раньше успехом
-    считался сам факт ``Popen``, поэтому упавший сразу после старта прокси
-    отрапортовал «запустил» и в панели, и в надзирателе.
+    ``True`` — только если порт слушает именно запущенный нами процесс.
+    Открытый порт сам по себе ничего не значит: чужой сервис на 1443 или
+    упавший сразу после старта прокси раньше давали ложный «успех».
+    ``timeout`` — предел ожидания порта; по умолчанию ``TGWS_PORT_WAIT``.
+    ``RuntimeError`` — порт занял другой процесс (текст пригоден для тоста).
     """
     if tgws_running():
         return False
@@ -879,11 +924,25 @@ def start_tgws(cfg: dict) -> bool:
     port = tgws_port(cfg)
     process = _popen([exe], cwd=str(Path(exe).parent))
     poll = getattr(process, "poll", None)
-    deadline = time.monotonic() + TGWS_PORT_WAIT
+    pid = getattr(process, "pid", None)
+    wait = TGWS_PORT_WAIT if timeout is None else float(timeout)
+    deadline = time.monotonic() + max(0.0, wait)
     while True:
+        alive = poll is None or poll() is None
         if port_open(port):
-            return True
-        if poll is not None and poll() is not None:
+            owner = port_pid(port)
+            if owner is None:
+                # Владельца не видно (права/psutil): достаточно, что процесс жив.
+                if alive:
+                    return True
+            elif pid is not None and (owner == pid or _descends_from(owner, pid)):
+                # TgWsProxy_windows.exe — лаунчер: порт держит его потомок.
+                return True
+            else:
+                name = _pid_name(owner) or "неизвестный"
+                raise RuntimeError(
+                    f"порт {port} занят другим процессом ({name} pid {owner})")
+        if not alive:
             # Процесс умер: ждать нечего, порт уже не откроется.
             return False
         if time.monotonic() >= deadline:
@@ -892,4 +951,10 @@ def start_tgws(cfg: dict) -> bool:
 
 
 def stop_tgws() -> dict:
-    return kill_process("TgWsProxy")
+    """Гасит tg-ws-proxy под обоими именами, которые ищет ``tgws_running``."""
+    first = kill_process("TgWsProxy")
+    second = kill_process("tg-ws-proxy")
+    return {
+        "killed": int(first.get("killed") or 0) + int(second.get("killed") or 0),
+        "denied": int(first.get("denied") or 0) + int(second.get("denied") or 0),
+    }

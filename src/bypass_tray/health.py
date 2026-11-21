@@ -731,6 +731,10 @@ def _check_tgws(status_state: dict, cfg: dict) -> dict:
         return _item("tgwsproxy", "tg-ws-proxy", "off", "не установлен", 0)
     if info.get("listening"):
         return _item("tgwsproxy", "tg-ws-proxy", "ok", f"порт {port} слушает", 0)
+    if config.normalise_telegram_mode(cfg.get("telegram_mode")) == "xray":
+        # Намеренно выключен: Telegram идёт через SOCKS5 Xray, это не поломка.
+        return _item("tgwsproxy", "tg-ws-proxy", "off",
+                     "выключен: маршрут Telegram через Xray", 0)
     return _item("tgwsproxy", "tg-ws-proxy", "bad", f"порт {port} закрыт", 0)
 
 
