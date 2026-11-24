@@ -452,6 +452,11 @@ def main() -> int:
             log=log,
             progress=progress,
         )
+        if report.get("skipped"):
+            # Чужой перебор уже идёт: своего результата нет. Ни отчёт, ни
+            # прогресс не пишем — оба файла принадлежат живому перебору.
+            print(report.get("error") or "Перебор уже идёт", flush=True)
+            return 0
         strategy.write_report(report, out)
         progress_state["message"] = "Готово"
         progress_state["done"] = True

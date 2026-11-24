@@ -455,6 +455,37 @@ class Panel:
         self._queue.put("settings")
         self.open()
 
+    def ask_yesno(self, title: str, question: str, *,
+                  timeout: float = 120.0) -> bool:
+        """Подтверждение в UI-потоке панели (можно звать из любого потока).
+
+        Из UI-потока (мастер настроек) окно показывается сразу, из фонового —
+        через очередь команд: Tk трогает только поток панели, а вызывающий
+        ждёт ответа. Так pystray и фоновые действия не создают второй Tk.
+        """
+        if (self._thread is not None
+                and threading.current_thread() is self._thread):
+            return self._ask_yesno_now(title, question)
+        reply: queue.Queue[bool] = queue.Queue(maxsize=1)
+        self._queue.put(("ask_yesno", (title, question, reply)))
+        thread = self._thread
+        if thread is None or not thread.is_alive():
+            self.open()
+        try:
+            return bool(reply.get(timeout=timeout))
+        except queue.Empty:
+            return False
+
+    def _ask_yesno_now(self, title: str, question: str) -> bool:
+        """Сам диалог: вызывать только в UI-потоке панели."""
+        root = self._root
+        if root is None:
+            return False
+        try:
+            return bool(messagebox.askyesno(title, question, parent=root))
+        except tk.TclError:
+            return False
+
     def _open_settings(self) -> None:
         root = self._root
         if root is None or self._settings_page is None:
@@ -727,6 +758,10 @@ class Panel:
         elif kind == "routes_plan":
             # Сухой прогон вернулся из фонового потока: диалог — здесь.
             self._ask_routes(payload)
+        elif kind == "ask_yesno":
+            # Запрос подтверждения из фонового потока/трея: диалог — здесь.
+            title, question, reply = payload
+            reply.put(self._ask_yesno_now(title, question))
         elif kind == "failed":
             self._report_action_failed(str(payload))
         elif kind == "error":

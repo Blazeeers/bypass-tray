@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import time
@@ -53,6 +54,21 @@ class TrialMarkerTests(unittest.TestCase):
         self.assertEqual(len(report.get("items") or []), 1)
         self.assertIn("перебор", report["items"][0]["detail"])
         self.assertEqual(guard.heal({"guard_enabled": True}, {}, {}), [])
+
+    def test_own_marker_is_not_foreign(self) -> None:
+        strategy.start_trial()
+        self.assertFalse(strategy._trial_owned_by_other())
+
+    def test_sweep_refuses_while_other_process_sweeps(self) -> None:
+        # Живой чужой маркер: второй перебор гасил бы тот же zapret.
+        now = time.time()
+        other = {"pid": os.getpid() + 1, "started": now, "heartbeat": now}
+        strategy._write_trial(other)
+        report = strategy.sweep(self.data, [], log=lambda message: None)
+        self.assertTrue(report.get("skipped"))
+        self.assertIn("идёт", report.get("error", ""))
+        # Чужой маркер не снят и не перезаписан своим pid.
+        self.assertEqual(strategy.trial_info().get("pid"), other["pid"])
 
 
 if __name__ == "__main__":

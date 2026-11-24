@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sys
 import threading
 import time
 from pathlib import Path
@@ -15,7 +14,8 @@ except ImportError:  # pragma: no cover
 
 from . import (
     actions, activity, autostart, config, diagnose, droute, guard, health, history,
-    icons, networks, routes, secrets, status, strategy, telegram, updates, xray,
+    icons, networks, routes, scheduled_task, secrets, status, strategy, telegram,
+    updates, xray,
 )
 from .theme import STATE_COLORS
 from .ui import Panel, clean_server_name, report_level
@@ -1618,6 +1618,11 @@ class TrayApp:
 
     def _switch_discord(self, via_proxy: bool) -> None:
         """Перезапускает Discord с прокси (или без) при переключении zapret."""
+        if strategy.trial_active() or bool(
+                (getattr(self, "sweep", None) or {}).get("running")):
+            # Перебор сам гасит/поднимает zapret: рестарт Discord здесь дал бы
+            # второй обрыв, в том числе голосового звонка.
+            return
         if not (self.cfg or {}).get("discord_switch_on_zapret", False):
             return
         port = self._discord_proxy_port()
@@ -2416,7 +2421,9 @@ class TrayApp:
             pystray.MenuItem("Стратегия zapret", pystray.Menu(*strategy_items)),
             pystray.MenuItem(
                 "Подобрать лучшую стратегию…",
-                lambda icon, item: self.start_sweep(),
+                lambda icon, item: threading.Thread(
+                    target=self.start_sweep, daemon=True,
+                    name="sweep-start").start(),
                 enabled=not self.sweep.get("running"),
             ),
             pystray.Menu.SEPARATOR,
@@ -2478,17 +2485,40 @@ class TrayApp:
 
     # ---- автоподбор стратегии ---------------------------------------------
     def sweep_files(self) -> tuple:
-        base = config.config_dir()
-        return base / "sweep-result.json", base / "sweep-progress.json"
+        return scheduled_task.sweep_files()
+
+    def _confirm_sweep_discord(self) -> bool:
+        """Спрашивает про Discord перед перебором — в UI-потоке панели."""
+        ask = getattr(getattr(self, "panel", None), "ask_yesno", None)
+        if not callable(ask):
+            return True
+        return bool(ask(
+            "Тест стратегий",
+            "Discord запущен. Тест стратегий остановит обход и может "
+            "оборвать голосовой звонок. Продолжить?",
+        ))
 
     def start_sweep(self) -> bool:
-        """Запускает перебор стратегий в отдельном процессе с UAC.
+        """Запускает перебор стратегий без повторных запросов UAC.
 
-        Само приложение работает без прав администратора, а перебору нужно
-        останавливать и перенастраивать службу zapret, поэтому запускается
-        дочерний процесс с повышением прав (один запрос UAC).
+        Задача Планировщика с ``/rl HIGHEST`` регистрируется через UAC один
+        раз; дальше перебор запускается из неё молча. Если регистрация не
+        удалась, откатываемся к прежнему запуску дочернего процесса с UAC,
+        чтобы не сломать основной сценарий.
         """
         if self.sweep.get("running"):
+            return False
+        # Маркер перебора ставит сам процесс (pid + heartbeat): он ловит и
+        # вторую копию трея, о которой ``self.sweep`` ничего не знает.
+        if strategy.trial_active():
+            self.sweep = {"running": False, "message": "Перебор уже идёт"}
+            activity.log("перебор уже идёт — второй не запускаю", kind="warn")
+            return False
+        if actions.discord_pids() and not self._confirm_sweep_discord():
+            self.sweep = {"running": False,
+                          "message": "Тест отменён: запущен Discord"}
+            activity.log("Тест стратегий отменён: запущен Discord", kind="warn")
+            self._signature = None
             return False
         result_path, progress_path = self.sweep_files()
         for path in (result_path, progress_path):
@@ -2497,29 +2527,24 @@ class TrayApp:
             except OSError:
                 pass
 
-        self.sweep = {"running": True, "message": "Запрос прав администратора…", "index": 0}
+        self.sweep = {"running": True, "message": "Запускаю перебор…", "index": 0}
         self.busy["sweep"] = "подбираю стратегию…"
         self._signature = None
 
-        if getattr(sys, "frozen", False):
-            command = [sys.executable, "--sweep-strategies",
-                       "--out", str(result_path), "--report", str(progress_path)]
-        else:
-            command = [
-                sys.executable, "-m", "bypass_tray", "--sweep-strategies",
-                "--out", str(result_path), "--report", str(progress_path),
-            ]
+        command = scheduled_task.task_command()
 
         def launch() -> None:
-            # ``run_elevated`` блокирует поток до ответа на UAC, поэтому
-            # запускаем его вне message-loop трея.
+            # UAC и ожидание регистрации задачи блокируют поток, поэтому
+            # уводим их из message-loop трея.
             try:
-                launched = actions.run_elevated(command)
+                outcome = scheduled_task.launch(command)
             except Exception as exc:  # noqa: BLE001
                 activity.log(f"автоподбор не запустился: {exc}", kind="warn")
-                launched = False
-            if not launched:
-                self.sweep = {"running": False, "message": "Запрос прав отклонён"}
+                outcome = "failed"
+            if outcome == "failed":
+                self.sweep = {"running": False,
+                              "message": scheduled_task.last_error()
+                              or "Не удалось запустить перебор"}
                 self.busy.pop("sweep", None)
                 self._signature = None
                 self.update_icon()
@@ -2547,7 +2572,11 @@ class TrayApp:
                     self._signature = None
                     self.update_icon()
                 if result_path.exists():
-                    break
+                    # Отчёт с skipped — не результат: чужой перебор ещё идёт,
+                    # ждём свой отчёт или дедлайн.
+                    seen = strategy.read_report(result_path)
+                    if seen and not seen.get("skipped"):
+                        break
 
             report = strategy.read_report(result_path)
             self.sweep["running"] = False

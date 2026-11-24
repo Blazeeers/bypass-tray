@@ -94,6 +94,12 @@ def trial_active(now: float | None = None) -> bool:
     current = time.time() if now is None else float(now)
     return 0 <= current - heartbeat <= TRIAL_TTL
 
+
+def _trial_owned_by_other() -> bool:
+    """Живой маркер перебора, поставленный не этим процессом."""
+    info = trial_info()
+    return trial_active() and info.get("pid") not in (None, os.getpid())
+
 #: Что считаем признаком рабочего обхода. Контрольный адрес должен открываться
 #: всегда — если он не открывается, сеть недоступна и замер недействителен.
 #: YouTube проверяется видео-путём (watch-страница → googlevideo): открытая
@@ -525,6 +531,13 @@ def sweep(
 
     total = len(bats)
     restored = False
+    # Чужой живой маркер: два перебора разом гасят и поднимают один и тот
+    # же zapret, и результаты обоих превращаются в мусор. Не начинаем.
+    if _trial_owned_by_other():
+        report["error"] = "перебор уже идёт"
+        report["skipped"] = True
+        report["finished"] = time.time()
+        return report
     # Маркер ставится до первого гашения winws: health и guard должны знать
     # о переборе уже с этого момента, а не после первого замера.
     start_trial()
@@ -667,4 +680,9 @@ def run_sweep(path: Path, zapret_dir: Path, bats: list[str] | None = None) -> in
                   "results": [], "best": "", "installed": False,
                   "restored": False, "error": f"{type(exc).__name__}: {exc}"}
         print(f"Перебор не выполнен: {exc}", flush=True)
+    if report.get("skipped"):
+        # Пропуск из-за чужого перебора — не результат: файла быть не должно,
+        # иначе наблюдатель посчитает перебор завершённым.
+        print(report.get("error") or "Перебор уже идёт", flush=True)
+        return 0
     return 0 if write_report(report, path) else 1

@@ -18,7 +18,7 @@ from tkinter import filedialog, messagebox
 
 from . import (
     activity, blocked, components, config, droute, health, presets, routes,
-    status, transfer, xray,
+    scheduled_task, status, transfer, xray,
 )
 from .theme import SPACE, Theme
 from .widgets import (
@@ -2207,10 +2207,17 @@ class SettingsPage(tk.Frame):
                                        + type(exc).__name__ + ")")
             return False
         if started:
-            self._wizard_sweep_note = ("стратегия: подбор запущен — Windows "
-                                       "спросит разрешение администратора")
+            # UAC нужен только при первой регистрации задачи: с готовым
+            # отпечатком перебор идёт из планировщика без запроса.
+            if scheduled_task.signature_matches():
+                self._wizard_sweep_note = "стратегия: запускаю через планировщик"
+            else:
+                self._wizard_sweep_note = ("стратегия: подбор запущен — Windows "
+                                           "спросит разрешение администратора")
         else:
-            self._wizard_sweep_note = "стратегия: подбор уже идёт"
+            state = getattr(self.controller, "sweep", None) or {}
+            message = str(state.get("message") or "") if isinstance(state, dict) else ""
+            self._wizard_sweep_note = "стратегия: " + (message or "подбор уже идёт")
         return bool(started)
 
     def _run_wizard(self) -> None:
